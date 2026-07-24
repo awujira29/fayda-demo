@@ -58,6 +58,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_active_chain_address
 CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_identity_chain
     ON wallet_bindings (identity_id, chain) WHERE status = 'pending';
 
+-- One PENDING claim per address per chain, across identities. The app-level
+-- sybil check covers pending rows but is check-then-insert; two identities
+-- racing that window could each park a pending row on the same address, and
+-- the loser would then hit ux_active_chain_address inside promote_due on every
+-- read. Close the window at the DB layer, like the active tier.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_chain_address
+    ON wallet_bindings (chain, address) WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS auth_nonces (
     nonce       TEXT PRIMARY KEY,
     address     TEXT NOT NULL,
@@ -280,16 +288,34 @@ def promote_due(identity_id: str | None = None) -> int:
         for p in c.execute(q, args).fetchall():
             if parse(p["activates_at"]) > now():
                 continue
-            c.execute(
-                """UPDATE wallet_bindings SET status='archived', archived_at=?
-                   WHERE identity_id=? AND chain=? AND status='active'""",
-                (iso(now()), p["identity_id"], p["chain"]),
-            )
-            c.execute(
-                "UPDATE wallet_bindings SET status='active', activated_at=? WHERE id=?",
-                (iso(now()), p["id"]),
-            )
-            promoted += 1
+            # Savepoint per promotion: a pending row that raced past the app
+            # checks can still collide with ux_active_chain_address here (its
+            # address went active for another identity while it cooled). This
+            # runs on every /api/me and /api/registry read, so an uncaught
+            # IntegrityError would 500 every read forever. Roll back just this
+            # promotion — keeping the loser's incumbent active — and cancel the
+            # conflicting row so it never retries.
+            c.execute("SAVEPOINT promote_one")
+            try:
+                c.execute(
+                    """UPDATE wallet_bindings SET status='archived', archived_at=?
+                       WHERE identity_id=? AND chain=? AND status='active'""",
+                    (iso(now()), p["identity_id"], p["chain"]),
+                )
+                c.execute(
+                    "UPDATE wallet_bindings SET status='active', activated_at=? WHERE id=?",
+                    (iso(now()), p["id"]),
+                )
+            except sqlite3.IntegrityError:
+                c.execute("ROLLBACK TO promote_one")
+                c.execute(
+                    "UPDATE wallet_bindings SET status='cancelled', archived_at=? WHERE id=?",
+                    (iso(now()), p["id"]),
+                )
+            else:
+                promoted += 1
+            finally:
+                c.execute("RELEASE promote_one")
     return promoted
 
 

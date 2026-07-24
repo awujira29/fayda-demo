@@ -9,19 +9,21 @@ Status: todo / doing / blocked / review / done
 
 ## Now
 
-### M2 - Cross-identity pending race wedges the registry
+### M4 - New pending index aborts startup on a DB that already hit M2
 **Status:** todo
-**Severity:** high (promoted from medium)
-**Why:** ux_pending_identity_chain is scoped per-identity, so two identities can hold
-pending bindings on the same address. When both cooling periods elapse, promote_due
-hits the active-tier unique index and raises IntegrityError. Because promote_due runs
-inside every /api/me and /api/registry read, the registry then returns 500 for
-everyone, permanently, with no self-healing path.
+**Severity:** medium (auditor finding, 2026-07-24, from the M2 fix review)
+**Why:** ux_pending_chain_address is created with CREATE UNIQUE INDEX IF NOT EXISTS,
+which is evaluated against existing rows. A database that suffered M2 before the fix
+still contains two pending rows on one (chain, address); index creation then raises
+IntegrityError inside store.init() at import time and the app refuses to boot. For
+exactly the population the fix targets, this trades a per-read 500 for a hard-down.
+Irrelevant to fresh/throwaway DBs, which is why t.py passes.
 
 **Do:**
-- Scope the pending unique index across identities, not per-identity
-- Catch IntegrityError inside promote_due so a conflicting row cannot wedge reads
-- Test that reproduces the race and asserts reads stay healthy
+- Before creating the index, cancel duplicate pending rows (keep the oldest per
+  (chain, address), cancel the rest) as a one-time cleanup in init()
+- Test: plant duplicate pendings in a DB without the index, re-init, assert boot
+  succeeds and the duplicates are cancelled
 
 ### M1 - IntegrityError surfaces as 500 instead of 409
 **Status:** todo
@@ -58,7 +60,10 @@ wallet and cannot manage a seed phrase. Adding it later should be additive.
 ### L1-L4 - Deferred
 - L1 auth_nonces never pruned. Add periodic delete.
 - L2 Solana addresses compared case-insensitively. base58 is case-sensitive; only EVM
-  hex is case-insensitive. Normalise per chain.
+  hex is case-insensitive. Normalise per chain. Auditor note (2026-07-24): the unique
+  indexes (active tier and the new pending tier) are case-SENSITIVE while the app
+  check lowercases, so case-variant EVM addresses can slip both — normalising at
+  write time fixes the index gap too.
 - L3 OIDC nonce generated but never validated. Dead scaffolding that reads as protection.
 - L4 promote_due runs lazily on read. Should be a scheduled job.
 
@@ -82,6 +87,21 @@ Ethiopian data-protection rules. Unanswered. Do not integrate before it is.
 ---
 
 ## Done
+
+### M2 - Cross-identity pending race wedges the registry - resolved 2026-07-24
+Was: ux_pending_identity_chain scoped per-identity let two identities hold pending
+bindings on one address; promotion then raised IntegrityError inside promote_due,
+which runs on every /api/me and /api/registry read → permanent 500 for everyone.
+Fix: (1) new partial unique index ux_pending_chain_address on (chain, address)
+WHERE status='pending' closes the pending-vs-pending race at the DB layer;
+(2) promote_due wraps each promotion in a SAVEPOINT — on IntegrityError it rolls
+back (the loser's incumbent stays active) and cancels the conflicting pending row
+so it never re-detonates. Tests 15 and 16 in t.py: 15 plants the un-indexable
+active-vs-pending raced state and asserts reads stay 200, the loser is cancelled,
+and both incumbents survive (verified to fail with a wedged 500 against pre-fix
+store.py); 16 asserts the index rejects a duplicate cross-identity pending.
+Auditor review of the diff: 0 new criticals, 0 new highs; one new medium (M4,
+migration hazard on already-wedged DBs) and one low folded into L2.
 
 ### C1 - Raw FIN sent to the browser (critical) - resolved 2026-07-24
 Whitelist at the callback boundary. Note the residual: name, birthdate, gender and

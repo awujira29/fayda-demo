@@ -154,4 +154,45 @@ assert p.returncode!=0, "app started in production with no secrets"
 assert "refusing to start" in out, out[-300:]
 print("  production start without secrets refused: ok")
 
+step("15. M2: raced cross-identity pending cannot wedge the registry")
+# The app-level sybil check is check-then-insert, so two identities racing the
+# window can both park a claim on one address. The index (step 16) closes the
+# pending-vs-pending case; the un-indexable variant — active for one identity,
+# pending for another — must survive promotion without wedging every read.
+# Plant that state directly through the store, as the race would.
+import secrets, sqlite3
+import store as st
+def rnd_addr(): return "0x"+secrets.token_hex(20)
+A=st.upsert_identity(secrets.token_hex(16), "Race Winner", "")
+Bi=st.upsert_identity(secrets.token_hex(16), "Race Loser", "")
+X=rnd_addr(); W=rnd_addr()
+st.create_binding(A["id"], "evm", X, secrets.token_hex(8), "sig", "msg", 72)   # A: active on X
+st.create_binding(Bi["id"], "evm", W, secrets.token_hex(8), "sig", "msg", 72)  # B: incumbent on W
+st.create_binding(Bi["id"], "evm", X, secrets.token_hex(8), "sig", "msg", 72)  # B: raced pending on X
+st.force_due(Bi["id"], "evm")
+# Before the fix the first read after cooling elapsed raised IntegrityError
+# inside promote_due and every subsequent read 500'd. Reads must stay healthy.
+for _ in range(3):
+    r=c.get(f"{B}/api/registry"); assert r.status_code==200, ("registry wedged", r.status_code)
+r=c.get(f"{B}/api/me"); assert r.status_code==200, ("api/me wedged", r.status_code)
+assert st.active_binding(A["id"], "evm")["address"]==X, "winner's active binding lost"
+inc=st.active_binding(Bi["id"], "evm")
+assert inc and inc["address"]==W, "loser's incumbent was archived by the failed promotion"
+assert any(b["address"]==X and b["status"]=="cancelled" for b in st.history(Bi["id"])), \
+    "conflicting pending row not cancelled — it would re-detonate on every read"
+print("  reads healthy, loser cancelled, both incumbents intact: ok")
+
+step("16. M2: DB refuses a second cross-identity pending on one address")
+Ci=st.upsert_identity(secrets.token_hex(16), "Race C", "")
+Di=st.upsert_identity(secrets.token_hex(16), "Race D", "")
+Y=rnd_addr()
+st.create_binding(Ci["id"], "evm", rnd_addr(), secrets.token_hex(8), "s", "m", 72)
+st.create_binding(Di["id"], "evm", rnd_addr(), secrets.token_hex(8), "s", "m", 72)
+st.create_binding(Ci["id"], "evm", Y, secrets.token_hex(8), "s", "m", 72)  # C: pending on Y
+try:
+    st.create_binding(Di["id"], "evm", Y, secrets.token_hex(8), "s", "m", 72)
+    raise AssertionError("second cross-identity pending on one address was accepted")
+except sqlite3.IntegrityError:
+    print("  ux_pending_chain_address rejects the duplicate pending: ok")
+
 print("\n\nALL CHECKS PASSED")
