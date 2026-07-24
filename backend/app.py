@@ -12,7 +12,6 @@ import secrets
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import base58
 import httpx
@@ -22,9 +21,9 @@ import uvicorn
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
-from starlette.middleware.sessions import SessionMiddleware
+from starlette.datastructures import Headers, MutableHeaders
 
 import mock_esignet
 import store
@@ -32,12 +31,22 @@ import verify as vf
 
 # --------------------------------------------------------------------- config
 
+# Two base URLs, split on who talks to them. BASE is where THIS process is
+# reachable for server-to-server calls (token exchange, userinfo). PUBLIC is
+# the origin the BROWSER must stay on for the whole OIDC dance: the session
+# cookie is set during /callback, and if the browser ever touches the backend
+# origin directly, the cookie lands there and every later API call from the
+# frontend origin is unauthenticated. In two-process dev, PUBLIC is the Vite
+# server (http://localhost:5173), which proxies /authorize and /callback here.
+# Defaults keep the single-process case (t.py, no frontend) working: both
+# collapse to the same origin.
 BASE = os.getenv("BASE_URL", "http://127.0.0.1:8000")
+PUBLIC = os.getenv("PUBLIC_URL", BASE)
 CLIENT_ID = os.getenv("FAYDA_CLIENT_ID", "fayda-wallet-demo")
-AUTHORIZE_URL = os.getenv("FAYDA_AUTHORIZE_URL", f"{BASE}/authorize")
+AUTHORIZE_URL = os.getenv("FAYDA_AUTHORIZE_URL", f"{PUBLIC}/authorize")
 TOKEN_URL = os.getenv("FAYDA_TOKEN_URL", f"{BASE}/v1/esignet/oauth/v2/token")
 USERINFO_URL = os.getenv("FAYDA_USERINFO_URL", f"{BASE}/v1/esignet/oidc/userinfo")
-REDIRECT_URI = f"{BASE}/callback"
+REDIRECT_URI = f"{PUBLIC}/callback"
 
 COOLING_HOURS = int(os.getenv("COOLING_HOURS", "72"))
 NONCE_TTL = 300
@@ -52,12 +61,14 @@ NONCE_TTL = 300
 APP_ENV = os.getenv("APP_ENV", "production")
 DEV_MODE = APP_ENV == "dev"
 
-# Session signing key and FIN pepper must survive restarts. If either changes,
-# every session cookie is invalidated (secret) and — worse — every FIN re-hashes
-# to a new value (pepper), so upsert_identity can no longer find the existing
-# row and mints a duplicate identity, while the still-live sybil index blocks the
-# user from re-binding their own wallet. In production both MUST be pinned from a
-# secret manager, so we refuse to start without them.
+# Session-id signing key and FIN pepper must survive restarts. If the secret
+# changes, every session cookie's HMAC stops verifying (users logged out; the
+# server-side session rows survive but become unreachable). If the pepper
+# changes — worse — every FIN re-hashes to a new value, so upsert_identity can
+# no longer find the existing row and mints a duplicate identity, while the
+# still-live sybil index blocks the user from re-binding their own wallet. In
+# production both MUST be pinned from a secret manager, so we refuse to start
+# without them.
 SESSION_SECRET = os.getenv("SESSION_SECRET")
 _PEPPER_HEX = os.getenv("FIN_PEPPER")
 
@@ -87,8 +98,89 @@ mock_esignet.CLIENT_PUBLIC_KEY = CLIENT_PUBLIC_KEY
 mock_esignet.TOKEN_ENDPOINT = TOKEN_URL
 mock_esignet.EXPECTED_CLIENT_ID = CLIENT_ID
 
+SESSION_TTL_HOURS = 12
+
+
+def _sign_sid(sid: str) -> str:
+    return hmac.new(SESSION_SECRET.encode(), sid.encode(), hashlib.sha256).hexdigest()
+
+
+class ServerSideSessionMiddleware:
+    """
+    Sessions live in the database; the cookie carries only an opaque random id
+    plus an HMAC over it.
+
+    Starlette's SessionMiddleware signs but does not encrypt: everything in the
+    session is client-readable base64. The claims now include address.kebele
+    and address.woreda — neighbourhood-level location for a real person — which
+    must never be decodable from a cookie. The official fayda-auth-python
+    library keeps sessions in Redis for the same reason; SQLite fills that role
+    here without a new dependency. The 256-bit random sid is the capability;
+    the HMAC only lets forged or truncated ids be rejected without a DB hit.
+    """
+    COOKIE = "session"
+
+    def __init__(self, app):
+        self.app = app
+
+    def _sid_from_cookie(self, header: str) -> str | None:
+        token = ""
+        for part in header.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == self.COOKIE:
+                token = v
+        if not token or "." not in token:
+            return None
+        sid, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig, _sign_sid(sid)):
+            return None
+        return sid
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        sid = self._sid_from_cookie(Headers(scope=scope).get("cookie", ""))
+        session = store.load_session(sid) if sid else None
+        if session is None:
+            sid = None
+            session = {}
+        scope["session"] = session
+
+        async def send_wrapper(message):
+            nonlocal sid
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                # Session fixation: a pre-auth sid planted in a victim's
+                # browser must not survive authentication. A handler that
+                # elevates the session (login callback) requests rotation; the
+                # old row dies and a fresh sid is minted below.
+                if session.pop("__rotate__", None) and sid is not None:
+                    store.delete_session(sid)
+                    sid = None
+                if session:
+                    if sid is None:
+                        sid = secrets.token_urlsafe(32)
+                    store.save_session(sid, session, SESSION_TTL_HOURS)
+                    headers.append(
+                        "set-cookie",
+                        f"{self.COOKIE}={sid}.{_sign_sid(sid)}; Path=/; HttpOnly; "
+                        f"SameSite=Lax; Max-Age={SESSION_TTL_HOURS * 3600}",
+                    )
+                elif sid is not None:
+                    store.delete_session(sid)
+                    headers.append(
+                        "set-cookie",
+                        f"{self.COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                    )
+                    sid = None
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
 app = FastAPI(title="Fayda wallet registry")
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
+app.add_middleware(ServerSideSessionMiddleware)
 
 # The mock IdP is part of the dev surface — it must not exist in production.
 if DEV_MODE:
@@ -102,14 +194,19 @@ def hash_fin(fin: str) -> str:
     return hmac.new(FIN_PEPPER, fin.encode(), hashlib.sha256).hexdigest()
 
 
-# Non-negotiable #1: the raw FIN never reaches the browser. userinfo carries the
-# FIN in both `sub` and `fayda_fin`, plus a `phone_number` we have no use for.
-# We whitelist the claims the UI actually displays rather than blocklisting the
-# sensitive ones, so a newly-added sensitive claim is dropped by default instead
-# of leaking until someone remembers to extend a denylist.
+# Non-negotiable #1: the raw FIN never reaches the browser. In the confirmed
+# schema (github.com/National-ID-Program-Ethiopia/fayda-auth-python) the FIN
+# travels only in `sub`. We whitelist rather than blocklist so a newly-added
+# sensitive claim is dropped by default. Deliberately excluded: `sub` (the
+# FIN), `phone`, and `picture` (a face image — biometric-adjacent PII with no
+# use here).
+#
+# residenceStatus is whitelisted and surfaced: Fayda covers legally resident
+# foreign nationals, so this claim is the most likely home for the
+# citizenship-vs-residency distinction B2 is blocked on. Its VALUE SET IS
+# UNCONFIRMED — check with NIDP before gating any feature on it.
 SAFE_CLAIMS = frozenset({
-    "name", "given_name", "family_name", "birthdate",
-    "gender", "address", "auth_method", "auth_time",
+    "name", "birthdate", "gender", "address", "residenceStatus",
 })
 
 
@@ -174,16 +271,22 @@ async def callback(request: Request, code: str = "", state: str = ""):
             raise HTTPException(502, f"userinfo failed: {ur.text}")
         claims = ur.json()
 
-    fin = claims.get("fayda_fin") or claims.get("sub")
+    # `sub` is the only identifier in the confirmed schema — no fayda_fin claim.
+    fin = claims.get("sub")
+    if not fin:
+        raise HTTPException(502, "userinfo returned no sub")
     ident = store.upsert_identity(
         fin_hmac=hash_fin(fin),
         display_name=claims.get("name", "Unknown"),
         birthdate=claims.get("birthdate", ""),
     )
     request.session["identity_id"] = ident["id"]
-    # Strip the raw FIN (sub, fayda_fin) and phone_number before anything touches
-    # the session: SessionMiddleware signs but does not encrypt, so whatever lands
-    # here is client-readable, and /api/me echoes it to the browser.
+    # Privilege change: rotate the session id so a fixated pre-auth sid cannot
+    # ride into the authenticated session.
+    request.session["__rotate__"] = True
+    # The session is server-side now, but /api/me still echoes claims to the
+    # browser and the DOM — so sub, phone and picture are stripped here, at the
+    # boundary, before anything stores them.
     request.session["claims"] = safe_claims(claims)
     return RedirectResponse("/")
 
@@ -259,9 +362,15 @@ def wallet_bind(req: BindReq, request: Request):
     if store.pending_binding(iid, req.chain):
         raise HTTPException(409, "a change is already pending on this chain — cancel it first")
 
-    binding = store.create_binding(
-        iid, req.chain, req.address, req.nonce, req.signature, message, COOLING_HOURS
-    )
+    # The checks above are check-then-insert; a concurrent bind can win the
+    # window. The DB indexes still hold the invariant — surface the loss as a
+    # 409 like the pre-insert checks do, not a 500 stack trace.
+    try:
+        binding = store.create_binding(
+            iid, req.chain, req.address, req.nonce, req.signature, message, COOLING_HOURS
+        )
+    except store.BindingConflict as e:
+        raise HTTPException(409, str(e))
     return {
         "status": binding["status"],
         "activates_at": binding["activates_at"],
@@ -280,11 +389,13 @@ def api_registry():
 def api_me(request: Request):
     iid = request.session.get("identity_id")
     if not iid:
-        return {"authenticated": False, "cooling_hours": COOLING_HOURS}
+        return {"authenticated": False, "cooling_hours": COOLING_HOURS,
+                "dev": DEV_MODE}
     store.promote_due(iid)
     ident = store.get_identity(iid)
     return {
         "authenticated": True,
+        "dev": DEV_MODE,
         "identity": {
             "id": ident["id"],
             "display_name": ident["display_name"],
@@ -388,9 +499,12 @@ if DEV_MODE:
                 "message": message, "signature": signature}
 
 
-@app.get("/", response_class=HTMLResponse)
+# The UI lives in frontend/ (React + Vite) and is served by Vite in dev. This
+# process is API-only; the root exists so a human landing here is redirected
+# to the right place instead of a 404.
+@app.get("/")
 def index():
-    return (Path(__file__).parent / "static" / "index.html").read_text()
+    return {"service": "fayda-wallet-registry API", "ui": PUBLIC}
 
 
 if __name__ == "__main__":

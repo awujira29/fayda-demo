@@ -1,0 +1,248 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--body-size);
+  line-height: 1.6;
+}
+
+.wrap { max-width: var(--page-max); margin: 0 auto; padding: var(--space-5) 28px 90px; }
+
+/* ---------------------------------------------------------------- header */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--label-size);
+  letter-spacing: var(--label-tracking);
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: var(--space-3);
+}
+h1 {
+  font-size: var(--display-size);
+  font-weight: var(--display-weight);
+  letter-spacing: -.01em;
+  margin: 0 0 var(--space-2);
+}
+h1 strong { font-weight: var(--strong-weight); }
+.sub { color: var(--muted); margin: 0 0 var(--space-4); max-width: 62ch; }
+
+h2 {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  margin: var(--space-5) 0 var(--space-3);
+  padding-bottom: 9px;
+  border-bottom: 2px solid var(--ink);
+}
+
+/* ---------------------------------------------------------------- shared */
+button {
+  font-family: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+  border-radius: 5px;
+  padding: 9px 15px;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+  transition: opacity .12s;
+}
+button:hover { opacity: .85; }
+button:disabled { opacity: .35; cursor: not-allowed; }
+button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+button.ghost { background: transparent; color: var(--ink); border-color: var(--rule-2); }
+button.danger { background: transparent; color: var(--red); border-color: var(--red); }
+button.sm { font-size: 12px; padding: 6px 11px; }
+
+.card {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 19px 21px;
+  margin-bottom: var(--space-3);
+  background: var(--card);
+}
+.mono { font-family: var(--font-mono); }
+/* Addresses render as a real button: focusable, copyable from the keyboard,
+   with the shared focus ring. user-select stays so mouse/touch selection also
+   works. */
+.addr {
+  font-family: var(--font-mono);
+  font-size: var(--data-size);
+  word-break: break-all;
+  color: var(--blue);
+  user-select: all;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  cursor: copy;
+  display: block;
+  width: 100%;
+  line-height: 1.6;
+  border-radius: 0;
+}
+.addr:hover { opacity: 1; text-decoration: underline; }
+.addr .copied {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--green);
+  margin-left: 8px;
+  user-select: none;
+}
+.row { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.label {
+  font-family: var(--font-mono);
+  font-size: var(--label-size);
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.value { font-size: var(--body-size); }
+
+.pill {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+.p-active { background: var(--green-bg); color: var(--green); }
+.p-pending { background: var(--amber-bg); color: var(--amber-ink); }
+.p-empty, .p-archived { background: var(--surface); color: var(--muted); }
+.p-cancelled { background: var(--red-bg); color: var(--red-ink); }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
+@media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+
+.msgbox {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  background: var(--surface);
+  padding: 13px 15px;
+  border-radius: 5px;
+  margin: 12px 0;
+  line-height: 1.55;
+}
+.note { font-size: 12.5px; color: var(--muted); margin-top: 10px; line-height: 1.6; }
+
+table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: var(--data-size); }
+th {
+  text-align: left;
+  font-size: 10.5px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1.5px solid var(--ink);
+  padding: 7px 9px;
+  font-weight: 600;
+}
+td { padding: 7px 9px; border-bottom: 1px solid var(--rule); vertical-align: top; font-variant-numeric: tabular-nums; }
+
+.err {
+  background: var(--red-bg);
+  border-left: 3px solid var(--red);
+  padding: 11px 14px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin: 12px 0;
+  color: var(--err-ink);
+}
+.ok {
+  background: var(--green-bg);
+  border-left: 3px solid var(--green);
+  padding: 11px 14px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin: 12px 0;
+  color: var(--ok-ink);
+}
+.banner {
+  background: var(--surface);
+  border-left: 3px solid var(--rule-2);
+  padding: 13px 17px;
+  border-radius: 4px;
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-bottom: var(--space-4);
+  line-height: 1.65;
+}
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 13px; }
+
+/* --------------------------------------------------------------- identity */
+.id-name { font-size: var(--title-size); font-weight: var(--strong-weight); letter-spacing: -.01em; }
+.id-meta { margin-top: var(--space-1); }
+.id-meta .mono { color: var(--ink); }
+
+/* ----------------------------------------------------------------- empty */
+.empty { color: var(--muted); }
+
+details summary { cursor: pointer; }
+.claims-summary {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.table-card { padding: 0; overflow: auto; }
+
+/* ------------------------------------------------- spacing utilities
+   The only sanctioned spacing values are the --space-* scale; components use
+   these classes instead of inline literals. */
+.chain-name { font-weight: var(--strong-weight); }
+.stack { margin-top: var(--space-3); }
+.stack-sm { margin-top: var(--space-2); }
+.stack-xs { margin-top: var(--space-1); }
+.flush { margin-top: 0; }
+.flush-b { margin-bottom: 0; }
+.divider {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--rule);
+}
+.wallet-select { font-family: var(--font-mono); font-size: var(--data-size); max-width: 100%; }
+.cell-addr { max-width: 260px; word-break: break-all; }
+.cell-addr-sm { max-width: 230px; word-break: break-all; }
+
+/* History collapses to stacked label/value blocks on narrow screens: the
+   5-column table silently clips the ACTIVATES column at 380px, and the
+   activation time is the one datum the cooling screen exists to show. */
+@media (max-width: 420px) {
+  .stacking-table thead { display: none; }
+  .stacking-table, .stacking-table tbody, .stacking-table tr, .stacking-table td { display: block; }
+  .stacking-table tr { border-bottom: 1px solid var(--rule); padding: 10px 12px; }
+  .stacking-table td { border: none; padding: 3px 0; display: flex; gap: 12px; }
+  .stacking-table td::before {
+    content: attr(data-label);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    flex: 0 0 84px;
+    padding-top: 1px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+
+@media (max-width: 420px) {
+  .wrap { padding: 28px 16px 60px; }
+  h1 { font-size: 27px; }
+}

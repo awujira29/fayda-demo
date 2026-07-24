@@ -6,18 +6,22 @@ Mirrors the real contract so the client code below is production code:
     POST /v1/esignet/oauth/v2/token     (private_key_jwt client assertion, RS256)
     GET  /v1/esignet/oidc/userinfo      (bearer token)
 
-CAVEAT, and it is the important one: the claim names returned by /userinfo are a
-reconstruction. The real scope names and claim shape are only knowable once you
-hold approved partner credentials. Everything else here — the flow, the assertion
-format, the signing algorithm — follows the published spec and should hold.
+The userinfo claim shape is CONFIRMED against the official Python client,
+github.com/National-ID-Program-Ethiopia/fayda-auth-python:
+
+    sub, name, birthdate, gender, phone, picture, residenceStatus,
+    address: {kebele, region, woreda, zone}
+
+`sub` is the only identifier — there is no fayda_fin claim. `picture` is a
+face image (stubbed here). The residenceStatus VALUE SET is not confirmed:
+the strings below are placeholders and must be checked with NIDP before any
+feature keys off them.
 
 Personas below are fictional. FINs are 12 digits to match the real format.
 """
 
 import secrets
 import time
-from datetime import datetime, timezone, timedelta
-
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -35,39 +39,60 @@ CLIENT_PUBLIC_KEY = None
 EXPECTED_CLIENT_ID = "fayda-wallet-demo"
 TOKEN_ENDPOINT = "http://127.0.0.1:8000/v1/esignet/oauth/v2/token"
 
+# residenceStatus values are placeholders — the real value set is unconfirmed
+# and must be checked with NIDP. picture stands in for the base64 face image
+# the real provider returns.
 PERSONAS = [
     {
         "fin": "301884729166",
         "name": "Meseret Alemu",
-        "given_name": "Meseret",
-        "family_name": "Alemu",
         "birthdate": "1991-04-17",
         "gender": "female",
-        "phone_number": "+251911204418",
-        "region": "Addis Ababa",
+        "phone": "+251911204418",
+        "picture": "data:image/jpeg;base64,/9j/MESERET_STUB",
+        "residenceStatus": "CITIZEN",
+        "address": {"kebele": "13", "region": "Addis Ababa",
+                    "woreda": "08", "zone": "Yeka"},
         "note": "Urban, has a bank account",
     },
     {
         "fin": "774021398450",
         "name": "Tesfaye Bekele",
-        "given_name": "Tesfaye",
-        "family_name": "Bekele",
         "birthdate": "1978-11-02",
         "gender": "male",
-        "phone_number": "+251921887340",
-        "region": "Oromia",
+        "phone": "+251921887340",
+        "picture": "data:image/jpeg;base64,/9j/TESFAYE_STUB",
+        "residenceStatus": "CITIZEN",
+        "address": {"kebele": "02", "region": "Oromia",
+                    "woreda": "Kofele", "zone": "West Arsi"},
         "note": "Rural smallholder, no prior banking",
     },
     {
         "fin": "509163472208",
         "name": "Hiwot Girma",
-        "given_name": "Hiwot",
-        "family_name": "Girma",
         "birthdate": "1996-07-25",
         "gender": "female",
-        "phone_number": "+251913556201",
-        "region": "Amhara",
+        "phone": "+251913556201",
+        "picture": "data:image/jpeg;base64,/9j/HIWOT_STUB",
+        "residenceStatus": "CITIZEN",
+        "address": {"kebele": "07", "region": "Amhara",
+                    "woreda": "Farta", "zone": "South Gondar"},
         "note": "Second identity, for testing the sybil constraint",
+    },
+    {
+        # Fayda covers legally resident foreign nationals — a valid Fayda auth
+        # is NOT proof of citizenship (CLAUDE.md, B2). This persona exists so
+        # that distinction is visible and testable.
+        "fin": "628304917552",
+        "name": "Daniel Otieno",
+        "birthdate": "1985-02-11",
+        "gender": "male",
+        "phone": "+251912774063",
+        "picture": "data:image/jpeg;base64,/9j/DANIEL_STUB",
+        "residenceStatus": "FOREIGN_NATIONAL",
+        "address": {"kebele": "12", "region": "Addis Ababa",
+                    "woreda": "03", "zone": "Bole"},
+        "note": "Foreign national, legally resident — valid Fayda, not a citizen",
     },
 ]
 
@@ -95,8 +120,12 @@ def authorize(request: Request, client_id: str, redirect_uri: str,
               response_type: str = "code", scope: str = "openid profile",
               state: str = "", nonce: str = ""):
     """
-    The real thing prompts for fingerprint, iris, face or OTP. Here you pick a
-    persona, which stands in for a successful biometric match.
+    The real eSignet screen is a biometric prompt: fingerprint, iris, face or
+    OTP, matched against the national register. This mock cannot capture
+    anything, so the page is framed as exactly that — a simulated capture —
+    and choosing a resident below stands in for a successful match. The form
+    contract (fin/state/nonce/redirect_uri → POST /authorize/confirm) is the
+    part the client code depends on; the framing around it is presentation.
     """
     if client_id != EXPECTED_CLIENT_ID:
         raise HTTPException(400, "unknown client_id")
@@ -112,38 +141,77 @@ def authorize(request: Request, client_id: str, redirect_uri: str,
           <input type="hidden" name="state" value="{state}">
           <input type="hidden" name="nonce" value="{nonce}">
           <button class="persona" type="submit">
-            <div class="pname">{p['name']}</div>
-            <div class="pmeta">FIN {p['fin']} &middot; {p['region']}</div>
-            <div class="pnote">{p['note']}</div>
+            <span class="match">MATCH</span>
+            <span class="pbody">
+              <span class="pname">{p['name']}</span>
+              <span class="pmeta">FIN {p['fin']} &middot; {p['address']['region']} &middot; {p['residenceStatus']}</span>
+              <span class="pnote">{p['note']}</span>
+            </span>
           </button>
         </form>"""
 
     return f"""<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fayda eSignet (mock)</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@200;400;500;600&display=swap');
   body{{margin:0;background:#12161C;color:#FBFBF9;font-family:'IBM Plex Sans',sans-serif;
        display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}}
-  .box{{max-width:460px;width:100%}}
+  .box{{max-width:480px;width:100%}}
   .brand{{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.16em;
           text-transform:uppercase;color:#7E8794;margin-bottom:8px}}
-  h1{{font-size:22px;font-weight:600;margin:0 0 6px}}
-  .sub{{color:#9AA3B0;font-size:14px;margin:0 0 26px;line-height:1.5}}
-  .persona{{display:block;width:100%;text-align:left;background:#1B212A;border:1px solid #2C3542;
-            border-radius:6px;padding:15px 17px;margin-bottom:10px;cursor:pointer;color:inherit;
-            font-family:inherit;transition:border-color .12s,background .12s}}
+  h1{{font-size:24px;font-weight:200;margin:0 0 6px;letter-spacing:-.01em}}
+  h1 b{{font-weight:600}}
+  .sub{{color:#9AA3B0;font-size:14px;margin:0 0 22px;line-height:1.5}}
+  .capture{{display:flex;align-items:center;gap:18px;background:#1B212A;border:1px dashed #3A4656;
+            border-radius:6px;padding:16px 18px;margin-bottom:22px}}
+  .capture svg{{flex:none}}
+  .cap-label{{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.14em;
+              text-transform:uppercase;color:#C9A227;margin-bottom:4px}}
+  .cap-text{{font-size:12.5px;color:#9AA3B0;line-height:1.55}}
+  .step{{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.12em;
+         text-transform:uppercase;color:#7E8794;margin:0 0 10px}}
+  .persona{{display:flex;gap:14px;align-items:flex-start;width:100%;text-align:left;
+            background:#1B212A;border:1px solid #2C3542;border-radius:6px;padding:14px 16px;
+            margin-bottom:10px;cursor:pointer;color:inherit;font-family:inherit;
+            transition:border-color .12s,background .12s}}
   .persona:hover{{border-color:#4E5D70;background:#212936}}
-  .pname{{font-size:15px;font-weight:600;margin-bottom:3px}}
-  .pmeta{{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#7E8794}}
-  .pnote{{font-size:12.5px;color:#9AA3B0;margin-top:5px}}
-  .foot{{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5C6673;
+  .persona:focus-visible{{outline:2px solid #C9A227;outline-offset:2px}}
+  .match{{font-family:'IBM Plex Mono',monospace;font-size:9.5px;letter-spacing:.12em;
+          color:#48A971;border:1px solid #2C5540;border-radius:3px;padding:2px 6px;margin-top:2px}}
+  .pbody{{display:block}}
+  .pname{{display:block;font-size:15px;font-weight:600;margin-bottom:3px}}
+  .pmeta{{display:block;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#8B95A3}}
+  .pnote{{display:block;font-size:12.5px;color:#9AA3B0;margin-top:4px}}
+  .foot{{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#7E8794;
          margin-top:22px;line-height:1.6;border-top:1px solid #242C36;padding-top:14px}}
 </style>
 <div class="box">
-  <div class="brand">Fayda &middot; eSignet</div>
-  <h1>Verify your identity</h1>
-  <p class="sub">In production this step captures a fingerprint, iris, face or OTP.
-     For the demo, choosing a persona stands in for a successful biometric match.</p>
+  <div class="brand">Fayda &middot; eSignet &middot; National ID</div>
+  <h1>Biometric verification <b>&mdash; simulated</b></h1>
+  <p class="sub">In production this screen captures a <strong>fingerprint, iris or face</strong>
+     and matches it against the national register. This mock captures nothing.</p>
+  <div class="capture">
+    <svg width="44" height="44" viewBox="0 0 44 44" fill="none" aria-hidden="true">
+      <!-- fingerprint: nested ridge loops around a core, ridges broken the way
+           a print is, with a horizontal scan line -->
+      <g stroke="#4E5D70" stroke-width="1.5" stroke-linecap="round">
+        <path d="M11.5 30.5C10.5 28 10 25.5 10 23c0-6.6 5.4-12 12-12 4.2 0 7.9 2.2 10 5.4"/>
+        <path d="M33.9 20.5c.4 1.1.6 2.3.6 3.5 0 2.8-.4 5.6-1.2 8.5"/>
+        <path d="M14.8 33.8C14 31.2 13.5 28 13.5 23c0-4.7 3.8-8.5 8.5-8.5 3.3 0 6.1 1.8 7.5 4.5"/>
+        <path d="M30.4 22.2c.1.6.1 1.2.1 1.8 0 3.3-.5 6.6-1.5 9.5"/>
+        <path d="M18.4 35c-.9-3-1.4-6.6-1.4-11 0-2.8 2.2-5 5-5s5 2.2 5 5c0 3.7-.4 7.3-1.3 10.5"/>
+        <path d="M22 22.5c.8 0 1.5.7 1.5 1.5 0 3.9-.5 7.6-1.4 11"/>
+      </g>
+      <line x1="6" y1="24" x2="38" y2="24" stroke="#C9A227" stroke-width="1.2" stroke-dasharray="3 3"/>
+    </svg>
+    <div>
+      <div class="cap-label">Simulated capture &mdash; no sensor read</div>
+      <div class="cap-text">Selecting a resident below stands in for a successful
+        biometric match. The OIDC flow from here on is the real contract.</div>
+    </div>
+  </div>
+  <p class="step">Step 2 of 2 &mdash; select the matched resident</p>
   {cards}
   <div class="foot">MOCK PROVIDER &mdash; not connected to the national register.<br>
      Requested scope: {scope}</div>
@@ -213,17 +281,14 @@ def userinfo(authorization: str = Header(None)):
         raise HTTPException(401, "invalid or expired access token")
 
     p = next(x for x in PERSONAS if x["fin"] == rec["fin"])
-    # Claim names are a reconstruction. Verify against real docs before production.
+    # Confirmed shape (fayda-auth-python): sub is the only identifier.
     return JSONResponse({
         "sub": p["fin"],
-        "fayda_fin": p["fin"],
         "name": p["name"],
-        "given_name": p["given_name"],
-        "family_name": p["family_name"],
         "birthdate": p["birthdate"],
         "gender": p["gender"],
-        "phone_number": p["phone_number"],
-        "address": {"region": p["region"], "country": "ET"},
-        "auth_method": "biometric.fingerprint",
-        "auth_time": int(time.time()),
+        "phone": p["phone"],
+        "picture": p["picture"],
+        "residenceStatus": p["residenceStatus"],
+        "address": p["address"],
     })

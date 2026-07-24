@@ -5,6 +5,433 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Diff review — 2026-07-24 (repo split: backend/ + React/Vite frontend, origin split BASE/PUBLIC)
+
+Scope: the uncommitted restructure only. Backend logic is UNCHANGED from the five
+prior rounds except the five items below; I did not re-derive the binding/crypto/
+session core (see the prior sections — still holds). New surface reviewed:
+- `backend/app.py` — `PUBLIC_URL` split (`AUTHORIZE_URL`/`REDIRECT_URI` from PUBLIC,
+  PUBLIC defaults to BASE), root route now returns JSON `{service, ui}`, `/api/me`
+  gains `"dev": DEV_MODE`.
+- `backend/mock_esignet.py` — authorize page redesigned (simulated-biometric
+  framing). OIDC contract (endpoints, params, RS256 client assertion, code pop)
+  unchanged.
+- `backend/t.py` — `cwd=HERE` on the two subprocess spawns (import-path fix).
+- `frontend/` — new React+Vite SPA: `vite.config.js` proxy, `src/api.js`,
+  `src/wallet.js` (Privy), `src/App.jsx`, `src/components.jsx`. Also a committed
+  `frontend/dist/` prebuilt bundle.
+
+Method: read every changed backend hunk and every hand-written frontend source
+file, traced the OIDC dance through the proxy, grepped the frontend for any
+off-origin sink, then ran the suite. Killed :8000, started `APP_ENV=dev python
+backend/app.py` WITHOUT `PUBLIC_URL`, ran `python backend/t.py` against a fresh
+server: **ALL 18 CHECKS PASSED** (3b/3c FIN-and-claims asserts included). Server
+log grep for every persona FIN / `fayda_fin` / `sub` / `picture` / `phone`:
+nothing.
+
+### The origin-split / CSRF answer (requested explicitly)
+
+**Routing the OIDC dance through the Vite proxy introduces no new session or CSRF
+weakness.** Walked it end to end:
+
+- The browser stays on one origin (`http://localhost:5173`). `/login`, `/authorize`,
+  `/callback`, `/logout`, `/api/*`, `/v1` are all proxied to `127.0.0.1:8000`
+  server-to-server; the browser never issues a request to the backend origin, so
+  the `Set-Cookie` from the proxied `/callback` lands on `localhost:5173` and every
+  later `/api/*` call carries it. `RedirectResponse("/")` after callback is
+  relative → resolves on the SPA origin, never the backend.
+- The OIDC `state` check is untouched (`callback` compares to `session["oidc_state"]`
+  and rejects on mismatch). The session id is an opaque 256-bit token + HMAC,
+  `HttpOnly`, `SameSite=Lax`, server-side store — a forged/truncated sid is rejected
+  by `hmac.compare_digest` before any DB hit. `SameSite=Lax` still permits the
+  top-level-navigation GET `/callback` to carry the cookie, which is required and
+  safe because `state` binds the callback to the initiating session.
+- **No cross-origin leak between `localhost:5173` and `127.0.0.1:8000`.** They are
+  distinct cookie origins; a cookie set on one is never sent to the other. Someone
+  hitting `127.0.0.1:8000` directly runs an independent flow whose cookie cannot
+  reach the SPA origin, and vice versa. Nothing the proxy does bridges them.
+- The proxy makes no new cross-origin *request* pattern possible: every proxied
+  path was already served by the backend; the proxy only relabels the origin the
+  browser sees. `/v1` (mock token/userinfo) is now reachable through the proxy but
+  is dev-only (mock router mounted only under `DEV_MODE`) and still requires the
+  RS256 client assertion / bearer token.
+- Vite binds to localhost by default (no `--host`), `strictPort:true` — the dev
+  server is not exposed on the network.
+
+The one real behavioural footgun and the one raised-exploitability item are below;
+neither is a critical or high.
+
+### Low — `PUBLIC_URL` defaulting to `BASE` strands the session cookie in a mixed-origin dev run
+`backend/app.py:44-49`. `PUBLIC` defaults to `BASE` (`127.0.0.1:8000`) when
+`PUBLIC_URL` is unset, so `AUTHORIZE_URL`/`REDIRECT_URI` point at the backend
+origin. If a developer runs the SPA on `localhost:5173` but forgets to set
+`PUBLIC_URL=http://localhost:5173`, `/login` (proxied) returns an absolute redirect
+to `http://127.0.0.1:8000/authorize`; the browser leaves the SPA origin, the whole
+dance completes on `127.0.0.1:8000`, and the session cookie is set there — stranded
+off the SPA origin, which stays unauthenticated. This is a **fail-safe** footgun
+(the outcome is "not logged in", never "logged in as someone else" or a leak), and
+it is exactly what the in-code comment warns about; the default is deliberately
+chosen to keep the single-origin `t.py` path working. Not a security break, but the
+two-process dev run silently half-works unless `PUBLIC_URL` is set. Confidence:
+certain. Worth a startup log line or a README call-out; no code-security change.
+
+### Low — mock `/authorize` reflected XSS now shares the SPA origin (dev-only, exploitability raised)
+`backend/mock_esignet.py:130-160`. The redesigned authorize page still interpolates
+`state`, `nonce`, `redirect_uri` into hidden-input `value="..."` attributes and
+`scope` into page text with **no escaping** (unchanged from the prior-round Low). A
+crafted `GET /authorize?...&redirect_uri="><script>...` breaks out of the attribute
+and executes. Pre-existing — but the proxy changes the blast radius: the mock page
+is now served *through* `localhost:5173`, so the injected script runs **same-origin
+with the real SPA** and can drive authenticated `/api/*` calls off the HttpOnly
+session cookie, rather than executing on an isolated backend origin. Still bounded
+to **dev** — the entire `mock_esignet.router` is mounted only under `DEV_MODE`
+(test 13 confirms `/authorize` 404s in production), so it cannot ship. The paired
+open-redirect (authorize_confirm 302s to the client-supplied `redirect_uri`) is
+likewise dev-only. Flagging so the reflected values get escaped before this framing
+is ever copied toward a real login page, and so the proxy-raises-severity note is on
+record. Confidence: certain (dev-only).
+
+### Low/info — `/api/me` now advertises `dev: DEV_MODE` to any caller, authenticated or not
+`backend/app.py:389-395`. Both branches return `"dev": DEV_MODE`. It exists to let
+the SPA gate the dev buttons (`me.dev` in `App.jsx`/`components.jsx`), and it is the
+correct second gate — the routes themselves 404 in production regardless. The only
+residual is that an unauthenticated `GET /api/me` now reports whether an instance is
+in dev mode. In production it is `false`, and the dev surface is already probeable by
+hitting a dev route, so this discloses nothing new of value. Not a bug. Confidence:
+certain.
+
+### Frontend — no off-origin exfiltration path (verified)
+- Grepped all hand-written `src/`: the only network sink is `fetch(path, …)` in
+  `api.js` with **relative paths only** (comment enforces it), and the only env read
+  is `VITE_PRIVY_APP_ID`. No absolute URLs, no second `fetch`/`axios`/
+  `XMLHttpRequest`/`sendBeacon`/`ws://`. The signed message, claims, and any test
+  signature travel only to same-origin `/api/*`.
+- `wallet.js` Privy config is genuinely wallet-only / no-embedded as claimed:
+  `loginMethods:['wallet']`, `embeddedWallets.ethereum.createOnLogin:'off'` and
+  `.solana.createOnLogin:'off'`. `signFor` does `personal_sign` (EVM, hex message)
+  and wallet-standard `signMessage` + local base58 (Solana) against a *connected
+  external* wallet; no private key is ever in the app's hands. All `@privy-io`
+  imports are isolated to this one file as the comment claims.
+- The dev test-key path (`api('/api/dev/test-wallet')`) is UI-gated by `me.dev` and
+  server-gated by `DEV_MODE`; it is the pre-existing server-side-key dev surface
+  (#5), not a new frontend weakening — the key is generated and signed on the
+  backend, never touched by frontend code.
+- Note (hygiene, not security): `frontend/dist/` is a committed prebuilt bundle
+  (hundreds of third-party JS chunks). Not a runtime vuln, but it is untracked build
+  output that should not be in the repo — review/regenerate rather than trust it.
+
+### Verified safe (this diff)
+- **OIDC state/CSRF check intact under the proxy** — unchanged, and the same-origin
+  proxy keeps the cookie on the SPA origin end to end.
+- **Cookie stays opaque + server-side** — sid+HMAC only, `HttpOnly`, `SameSite=Lax`;
+  test 3b decodes every segment and finds no FIN, `identity_id`, or `claims`. The
+  origin split touched only URL construction, not the middleware.
+- **Confirmed userinfo schema drops the FIN and the new PII** — `SAFE_CLAIMS` now
+  `{name, birthdate, gender, address, residenceStatus}`; `sub` (the FIN), `phone`,
+  and `picture` (face image) are stripped at the callback boundary. Tests 3b/3c
+  assert absence by name *and* by value (`+2519…`, `base64,/9j/…`); server log
+  carries no FIN. Non-negotiable #1 holds.
+- **Empty `sub` → 502** (`callback` raises "userinfo returned no sub") — a blank
+  identifier cannot collide identities.
+- **Dev surface still fully gated** — `/api/dev/*` and the mock IdP 404 when
+  `APP_ENV != dev` (test 13); production refuses to start without secrets (test 14).
+  The new `me.dev` flag is a UI convenience layered on top, not the gate.
+- **Binding / crypto / nonce / sybil core unchanged** — M1/M2 resolutions, the
+  global DB lock, and signature verification are byte-identical to the prior round;
+  tests 4–12 and 15–18 pass.
+- **`t.py cwd` fix is inert** — it only sets the subprocess working directory so
+  `app:app` imports resolve from `backend/`; no behavioural change, suite green.
+
+### Verdict
+Safe to build on — **yes**. The restructure is overwhelmingly a move plus a new
+same-origin SPA; the origin split is fail-safe (a misconfig strands the cookie into
+an unauthenticated state, never a bypass or a leak), the CSRF/state posture is
+unchanged and sound through the proxy, and the frontend has no off-origin sink and
+no embedded-wallet/private-key custody. No new critical or high. Three lows: the
+`PUBLIC_URL` default footgun (fail-safe), the dev-only mock XSS whose blast radius
+the proxy raises to the SPA origin (still unshippable), and the informational
+`me.dev` flag. Pre-existing mediums (unbounded `sessions`/`auth_nonces` tables,
+write-on-read under the global lock, non-atomic logout, the M4 migration hazard)
+remain open and untouched by this diff.
+
+New criticals: 0, new highs: 0.
+
+---
+
+## Diff review — 2026-07-24 (real userinfo schema, SAFE_CLAIMS whitelist, server-side sessions)
+
+Scope: the new uncommitted changes only — `mock_esignet.py` (confirmed Fayda
+claim shape, `sub`-only identifier, FOREIGN_NATIONAL persona), `app.py`
+(`ServerSideSessionMiddleware`, `SAFE_CLAIMS`, `hash_fin(sub)`), `store.py`
+(`sessions` table + `load/save/delete_session`), `static/index.html`
+(residenceStatus surfaced), `t.py` (3b/3c fixation + whitelist asserts). The M1/M2
+binding work below was audited in the prior run and is out of scope here.
+
+Method: read all changed files, derived each attack against CLAUDE.md's
+non-negotiables, then corroborated live against a freshly restarted dev server.
+**All 18 checks pass.** Findings below are independent of that pass — the run
+confirms the wins; the mediums are behaviours the suite does not exercise. Every
+medium was reproduced empirically (row counts, expires_at deltas, a threaded
+logout race, an /api/me body dump), not reasoned about in the abstract.
+
+### Medium — sessions table grows without bound from unauthenticated `/login`
+`app.py:227-236` — `/login` writes `oidc_state` into the session, so the
+middleware (`app.py:152-160`) mints a sid and persists a `sessions` row on every
+hit, authenticated or not. Those rows are only ever expired *lazily, on load of
+that exact sid* (`store.load_session`, `store.py:186-194`) — and a random
+attacker sid is never loaded again, so it is never swept. There is no background
+reaper and no rate limit. Reproduced: 50 fresh unauthenticated `GET /login`
+calls added exactly 50 orphan rows (`{"oidc_state": ...}`, 12h TTL) that nothing
+will ever reclaim. A script can add rows as fast as it can request, growing the
+DB and — because every write serialises on the process-global `_DB_LOCK`
+(`store.py:113`) — contending with legitimate traffic. Invariant strained: the
+DoS posture in CLAUDE.md ("unbounded tables, expensive unauthenticated ops").
+Confidence: certain (measured).
+
+### Medium — every authenticated request rewrites its session row and re-sets the cookie
+`app.py:152-160` — the middleware persists whenever the in-memory session is
+non-empty, unconditionally, on `http.response.start`. So a plain `GET /api/me`
+or `GET /api/registry` from a logged-in user issues a `Set-Cookie` *and* an
+`INSERT … ON CONFLICT DO UPDATE` that slides `expires_at` forward. Reproduced:
+two `/api/me` reads 1.1s apart produced two different `expires_at` values and a
+`Set-Cookie` on the read. Because every DB op — including this write-on-read —
+takes the global `_DB_LOCK`, an authenticated client polling `/api/me` turns
+each read into a serialized write. Combined with the finding above, the new
+session store converts the read path into a lock-bound write path. Not a
+correctness break, but a real throughput/starvation surface the old signed-cookie
+design did not have. Confidence: certain (measured).
+
+### Medium — logout is not atomic: a concurrent in-flight request resurrects the session
+`app.py:285-288` (`logout` → `session.clear()`) and `app.py:141-167`
+(save-whole-snapshot on response). The middleware loads the session at request
+start and re-saves that snapshot at response start. So if any other request for
+the same sid is in flight when `/logout` runs, that request's response re-INSERTs
+the row (`store.save_session` is upsert, `store.py:197-206`) *and* re-sets the
+cookie — after logout deleted the row and sent `Max-Age=0`. Reproduced: with one
+cookie jar, firing `/api/me` reads concurrently with `/logout`, logout returned
+200 but the `sessions` row survived and the cookie still authenticated
+(`/api/me` → `authenticated: true`). The realistic trigger is two tabs (one
+loading, one signing out) — the UI keeps the page open and `load()` fires on
+every action. Sign-out is a security operation (the user's means of ending a
+possibly-compromised session); it must not be defeatable by the user's own
+overlapping request. Note this is self-defeating concurrency, not attacker-driven
+against a victim — an attacker cannot cause a victim's row to resurrect.
+Confidence: certain (measured).
+
+### Low — `/api/me` returns neighbourhood-level address (kebele/woreda) in the body
+`app.py:395` echoes `session["claims"]`, which includes the whitelisted `address`
+`{kebele, region, woreda, zone}` (confirmed in a live `/api/me`), and
+`static/index.html:197` renders the full claims blob into the DOM. This is the
+authenticated owner's *own* data over their *own* session, and the store.py
+rationale (`store.py:80-83`) is explicitly about the **cookie** — "must never sit
+in a signed-but-unencrypted cookie … the browser gets only the opaque sid" —
+which is honoured. So this is consistent with design intent, not a leak. The only
+residual: `/api/me` carries no `Cache-Control: no-store`, so neighbourhood-level
+PII is cacheable by the browser/intermediaries. Worth a header; not a bug.
+Confidence: worth checking.
+
+### Low — `store.reset()` unlinks the DB file outside the global lock (dev only)
+`store.py:133-140` unlinks `registry.db`/`-wal`/`-shm` *before* re-`init()`, and
+the unlink is not under `_DB_LOCK`. A concurrent request holding the lock has an
+open fd to the now-unlinked inode and could write to a ghost file. Only reachable
+via `/api/dev/reset`, which is not registered in production, so blast radius is a
+shared dev instance. Confidence: likely.
+
+### Low — mock `/authorize` reflects `state`/`scope`/`redirect_uri` unescaped
+`mock_esignet.py:131-175` interpolates request params straight into the HTML
+(`state`/`nonce`/`redirect_uri` into attribute values, `scope` into text) with no
+escaping — reflected XSS in the mock IdP page. Dev-only surface: the whole
+`mock_esignet.router` is mounted only when `APP_ENV == "dev"` (`app.py:177-178`),
+verified 404 in production by test 13. Flagging so it is not copied into any
+real login page. Confidence: certain (dev-only).
+
+### Low/info — a non-string `sub` from a real provider would 500
+`app.py:266-268` accepts any truthy `sub`; `hash_fin` (`app.py:185`) calls
+`fin.encode()`. The mock always sends a string, but a real userinfo returning a
+numeric/JSON `sub` would raise inside `hash_fin` → 500 rather than a clean 502.
+Robustness only. Confidence: worth checking.
+
+### Verified safe (actively attacked, held)
+- **Cookie is opaque and unforgeable.** `session=<sid>.<hmac>`; `_sid_from_cookie`
+  (`app.py:117-128`) rejects a missing dot, verifies the HMAC with
+  `hmac.compare_digest` (constant-time), and returns None on any mismatch. A
+  forged or truncated sid never reaches the DB. Without `SESSION_SECRET` an
+  attacker cannot mint a valid cookie.
+- **No session data leaks client-side.** The cookie holds only sid+HMAC; test 3b
+  base64-decodes every segment and confirms neither the raw FIN, `identity_id`,
+  nor `claims` bytes are present. Confirmed the whole session lives in SQLite.
+- **Raw FIN / `sub` never persisted, logged, or returned.** Only `fin_hmac`
+  (HMAC-pepper) is stored; `sub` is stripped by `SAFE_CLAIMS` before it enters the
+  session; `/api/me` and `/api/registry` bodies carry no `sub`/FIN (tests 3/3b).
+  Grepped: no logging of claims, sid, or FIN anywhere.
+- **Session fixation.** The pre-login sid is deleted and a fresh sid minted at the
+  privilege change (`__rotate__`, `app.py:149-160`); `__rotate__` is popped before
+  persist so it never lands in a row; rotation is committed together with the login
+  redirect, so a fixated pre-auth sid cannot ride in. Test 3b asserts the cookie
+  changes across login (non-vacuous: pre-login cookie is real).
+- **Expired/replayed sid.** `load_session` deletes the row and returns None on
+  expiry; the middleware then treats the request as anonymous and mints a new sid
+  on any write — a replayed expired cookie cannot resurrect the old session.
+- **`phone`/`picture` stripped.** Whitelist excludes both; test 3c confirms
+  absence by claim name *and* by value (`+2519…`, `base64,/9j/…`).
+- **Empty/missing `sub`.** `callback` raises 502 (`app.py:267-268`) — a blank sub
+  cannot hash to a shared identity. `residenceStatus` survives the whitelist and
+  is display-only (`index.html` renders verbatim, never branches on it).
+- **Dev surface + secrets guard.** `/api/dev/*` and the mock IdP 404 when
+  `APP_ENV != "dev"`; production refuses to start without `SESSION_SECRET`/
+  `FIN_PEPPER` (tests 13/14).
+- **Binding lifecycle unchanged.** Sybil, nonce single-use/binding, cooling, and
+  the M1/M2 race handling are untouched by this diff and still pass (tests 4-12,
+  15-18).
+
+### Verdict
+Safe to build on — **yes**. No new critical or high: the session rewrite
+introduces no auth bypass, no FIN/`sub`/PII leak, and fixation is closed. The
+three mediums are DoS/robustness properties of the new SQLite session store
+(unbounded orphan rows, write-on-read under the global lock, non-atomic logout) —
+fix before production load, but none breaks a CLAUDE.md correctness invariant.
+
+---
+
+## Diff review — 2026-07-24 (M1 fix, M2 tests, deadlock fix)
+
+Scope: the uncommitted diff only — `store.py`, `app.py`, `t.py`, `PROGRESS.md`.
+Three changes: (1) M2's `ux_pending_chain_address` + savepoint promotion (tests
+15/16); (2) M1 — `create_binding` translates `sqlite3.IntegrityError` →
+`store.BindingConflict`, `wallet_bind` maps it to a 409 (tests 17/18); (3) a
+process-level `threading.Lock` serializing `conn()` open/use/close.
+
+Method: read all three files, derived each attack, then ran the suite against a
+freshly restarted dev server (pepper is per-process in dev). **All 18 checks pass.**
+Findings are independent of that; the run is corroboration. Empirically probed the
+SQLite error strings, the multi-index-violation report order, and cancel-then-rebind.
+
+### M1 — IntegrityError → 500 — **RESOLVED**
+`store.create_binding` (`store.py:268-292`) wraps the `INSERT` and re-raises every
+`sqlite3.IntegrityError` as `BindingConflict` with a fixed, client-safe string;
+`wallet_bind` (`app.py:265-270`) catches it and returns `HTTPException(409, str(e))`.
+`str(e)` is the `BindingConflict` message (a constant), never the chained cause, so
+no raw driver text reaches the body. Verified two ways: (a) at the store level the
+cause is `sqlite3.IntegrityError` but `str(BindingConflict)` is one of the two fixed
+strings; (b) SQLite's unique-constraint message names only columns
+(`UNIQUE constraint failed: wallet_bindings.chain, wallet_bindings.address`) — never
+row values, addresses, or the FIN — so even the chained cause carries no PII. Test 17
+runs a real two-thread HTTP race 10 rounds and asserts `[200,409]`, never 500; test 18
+drives both index flavors at the store level and asserts the cause is
+`IntegrityError`. Neither is vacuous: 17 requires exactly one 200 and one 409 (both-200
+or both-409 fail the sort), 18 asserts both distinct messages.
+
+### M2 — cross-identity pending wedge — **RESOLVED** (was resolved prior run; this diff adds the tests)
+`ux_pending_chain_address` (`store.py:67-68`) closes the pending-vs-pending race at
+the DB layer, and `promote_due` (`store.py:330-350`) wraps each promotion in
+`SAVEPOINT promote_one`, rolling back and cancelling the conflicting pending row on
+`IntegrityError` so it cannot re-detonate. Test 15 plants the un-indexable
+active-vs-pending state and confirms reads stay 200, the loser is cancelled, and both
+incumbents survive; test 16 confirms the index rejects the duplicate pending with an
+`IntegrityError` cause. Confirmed the savepoint cancels only `p["id"]`, the outer
+transaction survives, and the loop continues.
+
+**Note — M4 still open, not addressed by this diff.** PROGRESS.md's M4 (the
+`CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_chain_address` in `init()` will raise at
+import time on a legacy DB that already holds two pending rows on one `(chain,address)`
+— the exact population the M2 fix targets) is untouched here. Fresh/throwaway DBs
+(all t.py runs) never hit it, so the suite stays green while the hazard remains. Still
+medium, still todo.
+
+### Deadlock fix — global connection lock — **sound, no new high/critical**
+The non-reentrant `_DB_LOCK` (`store.py:101-113`) is safe: I confirmed no store
+function opens a second `conn()` while holding one. `create_binding`, `cancel_pending`,
+and `force_due` each call their helper read (`active_binding`/`pending_binding`)
+*before* entering their own `with conn()` block (`store.py:252` vs `268`, `297` vs
+`300`, `356` vs `359`), so the helper's lock is released before the outer acquire.
+`promote_due` and the rest hold a single connection and issue no nested store calls.
+No `conn()` body performs network I/O or crypto (signature verification runs outside
+any connection in `wallet_bind`), so the lock is never held across a slow operation.
+The claim in the comment is accurate.
+
+### Pending-index lockout question — **answer: NO**
+`ux_pending_chain_address` cannot lock a legitimate owner out of their own wallet via
+someone else's stale or cancelled pending row:
+- **Cancelled/archived rows are outside the partial index** (`WHERE status='pending'`).
+  A cancelled or archived row has `status` `'cancelled'`/`'archived'`, so it is not in
+  the index and blocks nothing. Verified live: cancel a pending bind on address C, then
+  re-bind C — succeeds. `address_claimed_by_other` likewise only counts
+  `('active','pending')`, so a cancelled row does not block at the app layer either.
+- **No resurrection.** Nothing flips a cancelled/archived row back to `pending`;
+  `promote_due` only reads `status='pending'`, `cancel_pending` only writes
+  `'cancelled'`. A once-cancelled row stays out of the index permanently.
+- **A live pending row can only be created by a party who proved control of the
+  address's key** (a valid signature over the server-issued message). The "leaked/shared
+  key" park is therefore the inherent sybil/key-control tradeoff that already exists at
+  the *active* tier — whoever proves control and is Fayda-verified can claim the address.
+  The pending index adds no new lockout: it only forbids a *second* pending on an
+  address already pending, which is precisely M2.
+- **A never-promoting pending row does not park indefinitely.** `/api/registry` is
+  unauthenticated and runs `promote_due()` for *all* identities, so anyone can drive a
+  due pending row to resolution; it then either promotes (the key-holder takes the
+  address, as designed) or is cancelled on an active-tier collision. Either way it only
+  ever blocks *that one address*, never a different one the owner might bind.
+The owner's recourse is unchanged: cancel their own pending during cooling (session
+compromise) or dispute a genuinely leaked key out of band.
+
+### New findings
+
+#### N2 — `BindingConflict` message can misclassify a same-identity collision as "different identity" — **low (cosmetic)**
+**Location:** `store.py:285-291`
+When a single `INSERT` violates *both* a `(chain,address)` and a `(identity_id,chain)`
+unique index, SQLite reports only one, and empirically it names the `(chain,address)`
+one first — routing to "already bound to a different Fayda identity". In the security-
+relevant direction this is safe: that message appears **only** when a `(chain,address)`
+index is genuinely violated, which at the active tier always means a *different*
+identity holds the address (an active `INSERT` only happens when the inserting identity
+has no active row for that chain, so it can never self-collide on the active-tier
+index). The residual is purely cosmetic: a same-identity double-submit that *also*
+happens to collide on address at the pending tier could show "different identity"
+instead of "reload and retry". No security impact — both are 409, same actor, and the
+app-level `pending_binding` check catches the ordinary double-submit before
+`create_binding` is even reached. Worth a one-line comment; not worth code change.
+
+#### N3 — global lock makes all DB access strictly serial; unauthenticated `/api/registry` amplifies it — **low (DoS, largely pre-existing)**
+**Location:** `store.py:104-113`, `app.py:279-282`
+The lock serializes every connection open/use/close in the process, reads included.
+`/api/registry` is unauthenticated and calls `promote_due()` (a full scan of all
+pending rows) on every hit; under the global lock, an attacker spamming it now
+serializes the entire server rather than merely competing for the writer lock. This is
+the old L4 ("promote_due on every read") with a strictly-serial concurrency profile,
+not a new capability, and for a single-process demo it is acceptable — the same lock
+also *eliminates* intra-process `SQLITE_BUSY`. Flag only so a future multi-worker /
+production move reconsiders: move promotion to a scheduled job and gate `/api/registry`.
+
+### Verified safe (this diff)
+
+- **No raw SQLite text or PII reaches any response body.** `BindingConflict` messages
+  are two fixed strings; `str(e)` in `wallet_bind` uses the `BindingConflict`, not the
+  chained cause; and SQLite unique-constraint messages carry column names only, never
+  values or the FIN.
+- **Cancelled/archived rows never block a rebind** (partial index + app check both scope
+  to `active`/`pending`); cancel-then-rebind of the same address verified to succeed.
+- **The non-reentrant lock cannot self-deadlock** — no nested `conn()` acquisition
+  anywhere; helper reads run before the outer `with conn()` in all three functions that
+  call them.
+- **The savepoint promotion isolates failures** — only the conflicting row is cancelled,
+  the outer transaction and every other read survive (test 15, three reads stay 200).
+- **Tests are not vacuous** — 17 requires exactly `[200,409]`; 16 and 18 assert the
+  `IntegrityError` cause and both distinct client messages.
+- **The active-tier sybil invariant still holds under the race** — test 17's 10 rounds
+  never produce a duplicate active row; the loser always 409s.
+
+### Verdict
+
+**Yes, safe to build on with respect to these three changes.** M1 and M2 are genuinely
+resolved, the deadlock fix is correct and self-deadlock-free, and the new pending index
+introduces no owner lockout — cancelled/archived rows sit outside it and only a proven
+key-holder can create a blocking pending row, which is the pre-existing key-control
+tradeoff. No new criticals or highs. Two lows (N2 cosmetic message, N3 serialization/DoS
+amplification), and the previously-recorded M4 migration hazard remains open and
+untouched by this diff.
+
+---
+
 ## Verification pass — 2026-07-24 (post-fix)
 
 Re-audit after a developer applied fixes for **C1, H1, H2, H3 only** (mediums/lows

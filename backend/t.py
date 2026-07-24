@@ -4,12 +4,14 @@ c=httpx.Client(follow_redirects=False, timeout=10)
 
 def step(n): print(f"\n--- {n}")
 
+HERE=os.path.dirname(os.path.abspath(__file__))
+
 def server(port, env_extra):
     env=dict(os.environ); env.update(env_extra)
     return subprocess.Popen(
         [sys.executable,"-m","uvicorn","app:app","--host","127.0.0.1",
          "--port",str(port),"--log-level","warning"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        env=env, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 def wait_up(port, tries=100):
     for _ in range(tries):
@@ -19,6 +21,7 @@ def wait_up(port, tries=100):
 
 step("1. OIDC login redirect")
 r=c.get(f"{B}/login"); assert r.status_code==307, r.status_code
+pre_login_cookie=c.cookies.get("session")
 loc=r.headers["location"]; print("  -> /authorize", "client_id=" in loc)
 r=c.get(loc); assert r.status_code==200
 fins=re.findall(r'name="fin" value="(\d+)"', r.text); print("  personas:", fins)
@@ -43,19 +46,33 @@ step("3b. C1: raw FIN must appear NOWHERE in /api/me nor the session cookie")
 raw_fin=fins[0]
 full=c.get(f"{B}/api/me").text
 assert raw_fin not in full, "RAW FIN in /api/me response body"
-# The sensitive claims must be stripped at the callback boundary; a whitelisted
-# claim must survive so the UI still has something to show.
-assert "fayda_fin" not in full and "phone_number" not in full, "sensitive claim in /api/me"
 assert '"sub"' not in full, "raw sub (== FIN) in /api/me"
 assert me["claims"].get("name"), "whitelisted claim dropped — UI would be empty"
-# SessionMiddleware signs but does not encrypt: decode the cookie the way any
-# client can and confirm the FIN is not carried inside it.
+# The session is server-side: the cookie must be an opaque id + HMAC carrying
+# no data at all. Decode every segment the way any cookie holder would and
+# confirm nothing readable is inside.
 cookie=c.cookies.get("session"); assert cookie, "no session cookie"
-payload=cookie.split(".")[0]
-decoded=base64.b64decode(payload+"="*(-len(payload)%4))
-assert raw_fin.encode() not in decoded, "RAW FIN inside session cookie payload"
-assert raw_fin not in cookie, "RAW FIN in raw session cookie"
-print("  raw FIN absent from response body and cookie: ok")
+assert cookie!=pre_login_cookie, "session id must rotate at login (fixation)"
+assert raw_fin not in cookie, "RAW FIN in session cookie"
+for seg in cookie.split("."):
+    try: blob=base64.urlsafe_b64decode(seg+"="*(-len(seg)%4))
+    except Exception: continue
+    assert raw_fin.encode() not in blob, "RAW FIN decodable from session cookie"
+    assert b"identity_id" not in blob and b"claims" not in blob, \
+        "session data readable client-side — cookie must hold only an opaque id"
+print("  raw FIN absent from response body; cookie is opaque: ok")
+
+step("3c. confirmed schema: picture and phone never reach /api/me")
+assert '"picture"' not in full and '"phone"' not in full, "picture/phone claim leaked"
+# values too, not just names: every persona phone starts +2519, every picture
+# stub carries the data-URI prefix
+assert "+2519" not in full and "base64,/9j/" not in full, "sensitive claim value leaked"
+# residenceStatus must survive the whitelist — B2's citizenship distinction
+# lives there and the UI displays it. Its value set is unconfirmed (NIDP).
+me=c.get(f"{B}/api/me").json()
+assert me["claims"].get("residenceStatus"), "residenceStatus dropped by the whitelist"
+assert "kebele" in me["claims"].get("address", {}), "address is not the confirmed shape"
+print("  picture/phone stripped, residenceStatus surfaced: ok")
 
 step("4. bind EVM via throwaway key")
 t=c.post(f"{B}/api/dev/test-wallet", json={"chain":"evm"}).json()
@@ -147,7 +164,7 @@ finally:
 step("14. H3: app refuses to start in production without SESSION_SECRET/FIN_PEPPER")
 env=dict(os.environ); env["APP_ENV"]="production"
 env.pop("SESSION_SECRET", None); env.pop("FIN_PEPPER", None)
-p=subprocess.run([sys.executable,"-c","import app"], env=env,
+p=subprocess.run([sys.executable,"-c","import app"], env=env, cwd=HERE,
                  capture_output=True, text=True, timeout=30)
 out=p.stdout+p.stderr
 assert p.returncode!=0, "app started in production with no secrets"
@@ -192,7 +209,68 @@ st.create_binding(Ci["id"], "evm", Y, secrets.token_hex(8), "s", "m", 72)  # C: 
 try:
     st.create_binding(Di["id"], "evm", Y, secrets.token_hex(8), "s", "m", 72)
     raise AssertionError("second cross-identity pending on one address was accepted")
-except sqlite3.IntegrityError:
+except st.BindingConflict as e:
+    # the rejection must come from the DB index, not an application check
+    assert isinstance(e.__cause__, sqlite3.IntegrityError), e.__cause__
     print("  ux_pending_chain_address rejects the duplicate pending: ok")
+
+step("17. M1: raced first-time binds of one address -> one wins, loser 409s, never 500")
+# Two first-time binders race the check-then-insert window on the same address.
+# Both must be first-time so both INSERTs target status='active' and the loser
+# hits ux_active_chain_address — the raced-replacement variant is test 15's
+# ground. c2 (step 10) never bound anything; log the third persona in fresh.
+import threading
+from eth_account import Account
+from eth_account.messages import encode_defunct
+c3=httpx.Client(follow_redirects=False, timeout=10)
+r=c3.get(f"{B}/login"); loc=r.headers["location"]
+r=c3.get(loc); state=re.search(r'name="state" value="([^"]*)"', r.text).group(1)
+r=c3.post(f"{B}/authorize/confirm", data={"fin":fins[1],"redirect_uri":f"{B}/callback",
+         "state":state,"nonce":"n"})
+code=re.search(r"code=([^&]+)", r.headers["location"]).group(1)
+c3.get(f"{B}/callback", params={"code":code,"state":state})
+for _ in range(10):
+    acct=Account.create(); addr=acct.address
+    def payload(cl):
+        n=cl.post(f"{B}/api/wallet/nonce", json={"chain":"evm","address":addr}).json()
+        sig=Account.sign_message(encode_defunct(text=n["message"]), acct.key).signature.hex()
+        return {"chain":"evm","address":addr,"nonce":n["nonce"],"signature":sig}
+    p2,p3=payload(c2),payload(c3)
+    gate=threading.Barrier(2); res={}
+    def fire(k, cl, p):
+        gate.wait(); res[k]=cl.post(f"{B}/api/wallet/bind", json=p)
+    ths=[threading.Thread(target=fire,args=("a",c2,p2)),
+         threading.Thread(target=fire,args=("b",c3,p3))]
+    for th in ths: th.start()
+    for th in ths: th.join()
+    codes=sorted(v.status_code for v in res.values())
+    assert codes==[200,409], ("raced bind broke the contract", codes,
+                              [v.text[:120] for v in res.values()])
+    # archive the winner's row so the next round is a first-time bind again
+    with st.conn() as sc:
+        sc.execute("UPDATE wallet_bindings SET status='archived', archived_at=? WHERE address=?",
+                   (st.iso(st.now()), addr))
+print("  10 raced rounds, every loser got 409 and no 500 ever: ok")
+
+step("18. M1: a losing INSERT raises BindingConflict with the right flavor")
+# This is the loser's exact state: past every app check, INSERT collides with a
+# unique index. Pre-fix this was a raw sqlite3.IntegrityError — the 500.
+E=st.upsert_identity(secrets.token_hex(16), "Race E", "")
+F=st.upsert_identity(secrets.token_hex(16), "Race F", "")
+Z=rnd_addr()
+st.create_binding(E["id"], "evm", Z, secrets.token_hex(8), "s", "m", 72)  # E: active on Z
+try:
+    st.create_binding(F["id"], "evm", Z, secrets.token_hex(8), "s", "m", 72)
+    raise AssertionError("second active binding on one address was accepted")
+except st.BindingConflict as e:
+    assert "different Fayda identity" in str(e), str(e)
+# The other index flavor: one identity double-submitting on one chain.
+st.create_binding(E["id"], "evm", rnd_addr(), secrets.token_hex(8), "s", "m", 72)  # pending
+try:
+    st.create_binding(E["id"], "evm", rnd_addr(), secrets.token_hex(8), "s", "m", 72)
+    raise AssertionError("second pending for one identity+chain was accepted")
+except st.BindingConflict as e:
+    assert "reload and retry" in str(e), str(e)
+print("  both unique-index flavors translate to BindingConflict: ok")
 
 print("\n\nALL CHECKS PASSED")

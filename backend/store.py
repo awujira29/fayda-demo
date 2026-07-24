@@ -10,7 +10,9 @@ by two different Fayda identities, and the "one verified person, one wallet"
 guarantee collapses.
 """
 
+import json
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -74,6 +76,17 @@ CREATE TABLE IF NOT EXISTS auth_nonces (
     expires_at  TEXT NOT NULL,
     consumed    INTEGER NOT NULL DEFAULT 0
 );
+
+-- Session data stays server-side. The claims now include address.kebele and
+-- address.woreda — neighbourhood-level location — which must never sit in a
+-- signed-but-unencrypted cookie any cookie holder can decode. The browser
+-- gets only the opaque sid.
+CREATE TABLE IF NOT EXISTS sessions (
+    sid         TEXT PRIMARY KEY,
+    data        TEXT NOT NULL,   -- JSON
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL
+);
 """
 
 
@@ -89,15 +102,27 @@ def parse(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+# One connection at a time per process. Concurrent open/close of the same
+# SQLite file across threads can deadlock inside the OS sqlite library (seen
+# on macOS: connection_close in sqlite3WalClose and connection_init in
+# findReusableFd wait on the same inode mutex forever), hanging every request
+# — a two-users-clicking-at-once denial of service. SQLite serializes writers
+# anyway; this only serializes the open/close churn that triggers the hang.
+# No store function opens a second connection while holding one, so a plain
+# (non-reentrant) lock cannot self-deadlock.
+_DB_LOCK = threading.Lock()
+
+
 @contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    try:
-        yield c
-        c.commit()
-    finally:
-        c.close()
+    with _DB_LOCK:
+        c = sqlite3.connect(DB_PATH)
+        c.row_factory = sqlite3.Row
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
 
 
 def init():
@@ -156,6 +181,36 @@ def get_identity(identity_id: str) -> dict | None:
         return dict(row) if row else None
 
 
+# ----------------------------------------------------------------- sessions
+
+def load_session(sid: str) -> dict | None:
+    with conn() as c:
+        row = c.execute("SELECT * FROM sessions WHERE sid = ?", (sid,)).fetchone()
+        if not row:
+            return None
+        if parse(row["expires_at"]) < now():
+            c.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+            return None
+        return json.loads(row["data"])
+
+
+def save_session(sid: str, data: dict, ttl_hours: int) -> None:
+    with conn() as c:
+        c.execute(
+            """INSERT INTO sessions (sid, data, created_at, expires_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(sid) DO UPDATE SET
+                   data = excluded.data, expires_at = excluded.expires_at""",
+            (sid, json.dumps(data), iso(now()),
+             iso(now() + timedelta(hours=ttl_hours))),
+        )
+
+
+def delete_session(sid: str) -> None:
+    with conn() as c:
+        c.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+
+
 # ------------------------------------------------------------------- nonces
 
 def issue_nonce(nonce: str, address: str, chain: str, message: str,
@@ -192,6 +247,10 @@ def consume_nonce(nonce: str, address: str, chain: str) -> tuple[bool, str, str]
 
 
 # ------------------------------------------------------------------ bindings
+
+class BindingConflict(Exception):
+    """A bind lost a race to a unique index. The message is safe for the client."""
+
 
 def active_binding(identity_id: str, chain: str) -> dict | None:
     with conn() as c:
@@ -249,14 +308,29 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
         "archived_at": None,
     }
     with conn() as c:
-        c.execute(
-            """INSERT INTO wallet_bindings
-               (id, identity_id, chain, address, status, proof_nonce, proof_sig,
-                proof_message, requested_at, activates_at, activated_at, archived_at)
-               VALUES (:id,:identity_id,:chain,:address,:status,:proof_nonce,:proof_sig,
-                       :proof_message,:requested_at,:activates_at,:activated_at,:archived_at)""",
-            row,
-        )
+        try:
+            c.execute(
+                """INSERT INTO wallet_bindings
+                   (id, identity_id, chain, address, status, proof_nonce, proof_sig,
+                    proof_message, requested_at, activates_at, activated_at, archived_at)
+                   VALUES (:id,:identity_id,:chain,:address,:status,:proof_nonce,:proof_sig,
+                           :proof_message,:requested_at,:activates_at,:activated_at,:archived_at)""",
+                row,
+            )
+        except sqlite3.IntegrityError as e:
+            # The app-level checks are check-then-insert; a concurrent bind can
+            # land between them and this INSERT. The unique indexes hold the
+            # invariant — this only translates the loss into a client-safe
+            # message instead of a 500. SQLite names the violated columns:
+            # (chain, address) means another identity claimed this wallet;
+            # (identity_id, chain) means this identity double-submitted.
+            if "wallet_bindings.address" in str(e):
+                raise BindingConflict(
+                    "this wallet is already bound to a different Fayda identity"
+                ) from e
+            raise BindingConflict(
+                "a binding on this chain is already active or pending — reload and retry"
+            ) from e
     return row
 
 
