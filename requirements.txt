@@ -1,0 +1,15 @@
+# Versions as tested. Loosen if you need to.
+
+fastapi==0.139.2
+uvicorn==0.51.0
+itsdangerous==2.2.0        # SessionMiddleware
+python-multipart==0.0.32   # form posts on the mock /token endpoint
+
+PyJWT[crypto]==2.7.0       # RS256 client assertion
+cryptography==46.0.6       # RSA keypair generation
+
+eth-account==0.13.7        # secp256k1 signer recovery (EVM)
+PyNaCl==1.6.2              # ed25519 verification (Solana)
+base58==2.1.1              # Solana address and signature encoding
+
+httpx==0.28.1              # OIDC token/userinfo calls, and t.py

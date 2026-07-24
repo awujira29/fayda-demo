@@ -1,0 +1,83 @@
+name: Nightly loop
+
+# Runs while you sleep, on GitHub's runners, not your laptop.
+# Picks the top unblocked task from PROGRESS.md, implements it on a branch,
+# audits its own diff, and opens a PR. Never pushes to main.
+
+on:
+  schedule:
+    # 06:00 UTC = 01:00 Chicago (CDT) / 09:00 Addis. crontab.guru to change.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-loop
+  cancel-in-progress: false
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--max-turns 40"
+          prompt: |
+            You are running unattended overnight. Nobody is watching. Prefer
+            stopping and reporting over guessing.
+
+            1. Read CLAUDE.md, PROGRESS.md and AUDIT.md.
+
+            2. Pick exactly ONE task, the top unblocked item under "Now". One per
+               run, no exceptions. Do not batch.
+
+            3. Create a branch named loop/<short-task-id>.
+
+            4. Implement it. Follow every non-negotiable in CLAUDE.md. Any new
+               invariant gets a test in t.py that would fail without the fix.
+
+            5. Run the tests:
+                   APP_ENV=dev python app.py &
+                   sleep 5
+                   python t.py
+               Every check must pass. If one fails and you cannot fix it in budget,
+               stop, commit what you have, say so plainly in the PR. Do not weaken
+               or delete a test to make it pass. That is a failed run.
+
+            6. Use the auditor subagent to review your own diff adversarially.
+               Append to AUDIT.md with today's date. If it finds a critical or high
+               in YOUR changes, fix and re-audit before opening the PR.
+
+            7. Update PROGRESS.md. Move the task to Done, or to Blocked with the
+               specific reason. Add new findings as tasks under Now.
+
+            8. Open a PR against main stating: which task, verbatim test results,
+               what the auditor found, and anything you were unsure about.
+
+            Rules:
+            - Never push to main. Always a PR.
+            - Never integrate Privy or any wallet provider. Seam only.
+            - Never add on-chain code.
+            - Never change the mock's OIDC contract.
+            - No unblocked task means do nothing and exit cleanly. An empty night
+              is a fine outcome.
+            - Ambiguous task goes to Blocked with the question you would have asked.
+              Do not guess at intent.

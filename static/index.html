@@ -1,0 +1,356 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fayda wallet registry</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#12161C; --paper:#FBFBF9; --rule:#DCDED8; --rule-2:#B8BCB4;
+    --muted:#5C6169; --blue:#1F4E79; --green:#1B7A4B; --amber:#B07203; --red:#C13B2F;
+    --surface:#F2F1EC;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+       font-family:'IBM Plex Sans',system-ui,sans-serif;font-size:14px;line-height:1.6}
+  .wrap{max-width:900px;margin:0 auto;padding:44px 28px 90px}
+  .eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.14em;
+           text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  h1{font-size:30px;font-weight:600;letter-spacing:-.02em;margin:0 0 10px}
+  .sub{color:var(--muted);margin:0 0 30px;max-width:60ch}
+  h2{font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;letter-spacing:.1em;
+     text-transform:uppercase;margin:44px 0 14px;padding-bottom:9px;border-bottom:2px solid var(--ink)}
+  button{font-family:inherit;font-size:13.5px;cursor:pointer;border-radius:5px;
+         padding:9px 15px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);
+         transition:opacity .12s}
+  button:hover{opacity:.85}
+  button:disabled{opacity:.35;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--ink);border-color:var(--rule-2)}
+  button.danger{background:transparent;color:var(--red);border-color:var(--red)}
+  button.sm{font-size:12px;padding:6px 11px}
+  .card{border:1px solid var(--rule);border-radius:7px;padding:19px 21px;margin-bottom:14px;background:#fff}
+  .mono{font-family:'IBM Plex Mono',monospace}
+  .addr{font-family:'IBM Plex Mono',monospace;font-size:12px;word-break:break-all;color:var(--blue)}
+  .row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+  .pill{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.07em;
+        text-transform:uppercase;padding:3px 8px;border-radius:3px;font-weight:500}
+  .p-active{background:#E3F1E9;color:var(--green)}
+  .p-pending{background:#FBF0DC;color:var(--amber)}
+  .p-empty{background:var(--surface);color:var(--muted)}
+  .p-archived{background:var(--surface);color:var(--muted)}
+  .p-cancelled{background:#F7E4E2;color:var(--red)}
+  .label{font-size:12px;color:var(--muted);margin-bottom:3px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:700px){.grid{grid-template-columns:1fr}}
+  .msgbox{font-family:'IBM Plex Mono',monospace;font-size:11.5px;white-space:pre-wrap;
+          background:var(--surface);padding:13px 15px;border-radius:5px;margin:12px 0;
+          max-height:220px;overflow:auto;line-height:1.55}
+  .note{font-size:12.5px;color:var(--muted);margin-top:10px;line-height:1.6}
+  table{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:12px}
+  th{text-align:left;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;
+     color:var(--muted);border-bottom:1.5px solid var(--ink);padding:7px 9px;font-weight:600}
+  td{padding:7px 9px;border-bottom:1px solid var(--rule);vertical-align:top}
+  .err{background:#F7E4E2;border-left:3px solid var(--red);padding:11px 14px;
+       border-radius:4px;font-size:13px;margin:12px 0;color:#7A2119}
+  .ok{background:#E3F1E9;border-left:3px solid var(--green);padding:11px 14px;
+      border-radius:4px;font-size:13px;margin:12px 0;color:#12563A}
+  .banner{background:var(--surface);border-left:3px solid var(--rule-2);padding:13px 17px;
+          border-radius:4px;font-size:12.5px;color:var(--muted);margin-bottom:26px;line-height:1.65}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:13px}
+  .hide{display:none}
+</style>
+
+<div class="wrap">
+  <div class="eyebrow">Internal proof of concept</div>
+  <h1>Fayda identity &rarr; wallet registry</h1>
+  <p class="sub">One Fayda-verified Ethiopian identity, bound to at most one verified
+     self-custodied wallet per chain. No custody taken, no keys held.</p>
+
+  <div class="banner">
+    <strong>Mock Fayda.</strong> The identity provider here is local and not connected to the
+    national register. The client code is real OIDC &mdash; authorization code flow, RS256
+    private-key-JWT client assertion &mdash; so production is an env var change.
+    The <em>claim names</em> returned by userinfo are a reconstruction and are the one thing
+    likely to need rework once you hold partner credentials.
+  </div>
+
+  <div id="err"></div>
+  <div id="msg"></div>
+
+  <!-- ------------------------------------------------------------ signed out -->
+  <div id="signedOut">
+    <h2>Step 1 &mdash; verify identity</h2>
+    <div class="card">
+      <p style="margin-top:0">Authenticate with Fayda to establish a verified identity.
+         In production this captures a fingerprint, iris, face or OTP.</p>
+      <button onclick="location.href='/login'">Verify with Fayda</button>
+    </div>
+  </div>
+
+  <!-- ------------------------------------------------------------- signed in -->
+  <div id="signedIn" class="hide">
+    <h2>Verified identity</h2>
+    <div class="card">
+      <div class="row">
+        <div>
+          <div style="font-size:17px;font-weight:600" id="idName"></div>
+          <div class="label" style="margin-top:4px">Born <span id="idDob"></span></div>
+        </div>
+        <button class="ghost sm" onclick="logout()">Sign out</button>
+      </div>
+      <div style="margin-top:15px">
+        <div class="label">Stored identifier &mdash; HMAC-SHA256, peppered</div>
+        <div class="addr" id="idHash"></div>
+      </div>
+      <p class="note">The raw 12-digit FIN is never written to the database. A bare hash
+         would be pointless here &mdash; 10<sup>12</sup> values is enumerable in minutes &mdash;
+         so this is an HMAC under a server-side pepper.</p>
+      <details style="margin-top:12px">
+        <summary class="mono" style="font-size:11.5px;cursor:pointer;color:var(--muted)">
+          Claims returned by userinfo (session only, not persisted)</summary>
+        <div class="msgbox" id="claimsBox"></div>
+      </details>
+    </div>
+
+    <h2>Bound wallets</h2>
+    <div class="grid">
+      <div class="card" id="card-evm"></div>
+      <div class="card" id="card-solana"></div>
+    </div>
+
+    <div id="signPanel" class="hide">
+      <h2>Sign to prove control</h2>
+      <div class="card">
+        <div class="label">Message issued by the server</div>
+        <div class="msgbox" id="signMsg"></div>
+        <div class="actions">
+          <button id="btnWalletSign">Sign with wallet</button>
+          <button class="ghost" id="btnTestSign">Use a throwaway test key</button>
+          <button class="ghost" onclick="cancelSign()">Cancel</button>
+        </div>
+        <p class="note">The signature proves control of the private key. It authorises
+           nothing and cannot move funds. The server verifies against its own stored copy
+           of this message, never the one the browser sends back.</p>
+      </div>
+    </div>
+
+    <h2>Binding history</h2>
+    <div class="card" style="padding:0;overflow:auto">
+      <table id="histTable"><thead><tr>
+        <th>Chain</th><th>Address</th><th>Status</th><th>Requested</th><th>Activates</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <h2>Registry</h2>
+  <div class="card" style="padding:0;overflow:auto">
+    <table id="regTable"><thead><tr>
+      <th>Identity</th><th>Ethereum</th><th>Solana</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+  <div class="actions">
+    <button class="ghost sm" onclick="loadRegistry()">Refresh</button>
+    <button class="danger sm" onclick="resetAll()">Reset everything</button>
+  </div>
+</div>
+
+<script>
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function b58encode(bytes){
+  let d=[0];
+  for(const b of bytes){ let c=b;
+    for(let i=0;i<d.length;i++){ c+=d[i]<<8; d[i]=c%58; c=(c/58)|0; }
+    while(c){ d.push(c%58); c=(c/58)|0; } }
+  let s=''; for(const b of bytes){ if(b===0) s+='1'; else break; }
+  for(let i=d.length-1;i>=0;i--) s+=B58[d[i]];
+  return s;
+}
+
+let ME=null, PENDING=null;
+
+const CHAINS={evm:{label:'Ethereum',wallet:'MetaMask or Rabby'},
+              solana:{label:'Solana',wallet:'Phantom'}};
+
+function showErr(t){ document.getElementById('err').innerHTML=t?`<div class="err">${t}</div>`:''; }
+function showOk(t){ document.getElementById('msg').innerHTML=t?`<div class="ok">${t}</div>`:'';
+                    if(t) setTimeout(()=>document.getElementById('msg').innerHTML='',6000); }
+
+async function api(path,body){
+  const r=await fetch(path,{method:body?'POST':'GET',
+    headers:{'Content-Type':'application/json'},
+    body:body?JSON.stringify(body):undefined});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.detail||`request failed (${r.status})`);
+  return j;
+}
+
+async function load(){
+  ME=await api('/api/me');
+  document.getElementById('signedOut').classList.toggle('hide',ME.authenticated);
+  document.getElementById('signedIn').classList.toggle('hide',!ME.authenticated);
+  if(ME.authenticated){
+    document.getElementById('idName').textContent=ME.identity.display_name;
+    document.getElementById('idDob').textContent=ME.identity.birthdate||'—';
+    document.getElementById('idHash').textContent=ME.identity.fin_hmac;
+    document.getElementById('claimsBox').textContent=JSON.stringify(ME.claims,null,2);
+    renderChain('evm'); renderChain('solana'); renderHistory();
+  }
+  loadRegistry();
+}
+
+function fmt(t){ return t? new Date(t).toLocaleString(undefined,
+  {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—'; }
+
+function renderChain(chain){
+  const c=document.getElementById('card-'+chain);
+  const active=ME.active[chain], pending=ME.pending[chain], L=CHAINS[chain];
+  let h=`<div class="row"><div style="font-weight:600">${L.label}</div>`;
+  h+= active?`<span class="pill p-active">Active</span>`
+            :`<span class="pill p-empty">Not bound</span>`;
+  h+=`</div>`;
+  if(active){
+    h+=`<div style="margin-top:13px"><div class="label">Verified wallet</div>
+        <div class="addr">${active.address}</div>
+        <div class="label" style="margin-top:7px">Since ${fmt(active.activated_at)}</div></div>`;
+  } else {
+    h+=`<p class="note" style="margin-top:11px">No wallet bound on this chain yet.</p>`;
+  }
+  if(pending){
+    h+=`<div style="margin-top:15px;padding-top:14px;border-top:1px solid var(--rule)">
+        <div class="row"><div class="label" style="margin:0">Replacement pending</div>
+        <span class="pill p-pending">Cooling</span></div>
+        <div class="addr" style="margin-top:6px">${pending.address}</div>
+        <div class="label" style="margin-top:7px">Activates ${fmt(pending.activates_at)}</div>
+        <div class="actions">
+          <button class="danger sm" onclick="cancelPending('${chain}')">Cancel change</button>
+          <button class="ghost sm" onclick="fastForward('${chain}')">Fast-forward (dev)</button>
+        </div>
+        <p class="note">The incumbent stays active throughout, so there is no gap in service.
+           If someone else initiated this, cancelling here stops it.</p></div>`;
+  } else {
+    h+=`<div class="actions">
+        <button class="sm" onclick="startBind('${chain}')">
+          ${active?'Replace wallet':'Bind wallet'}</button></div>
+        <p class="note">Connect with ${L.wallet}.</p>`;
+  }
+  c.innerHTML=h;
+}
+
+function renderHistory(){
+  const tb=document.querySelector('#histTable tbody');
+  tb.innerHTML = ME.history.length? ME.history.map(b=>`<tr>
+      <td>${CHAINS[b.chain].label}</td>
+      <td style="max-width:260px;word-break:break-all">${b.address}</td>
+      <td><span class="pill p-${b.status}">${b.status}</span></td>
+      <td>${fmt(b.requested_at)}</td>
+      <td>${fmt(b.activates_at||b.activated_at)}</td></tr>`).join('')
+    : `<tr><td colspan="5" style="color:var(--muted)">No bindings yet</td></tr>`;
+}
+
+async function loadRegistry(){
+  const r=await api('/api/registry');
+  const tb=document.querySelector('#regTable tbody');
+  tb.innerHTML = r.identities.length? r.identities.map(i=>`<tr>
+      <td>${i.display_name}</td>
+      <td style="max-width:230px;word-break:break-all">${i.evm||'<span style="color:#9A9E98">—</span>'}</td>
+      <td style="max-width:230px;word-break:break-all">${i.solana||'<span style="color:#9A9E98">—</span>'}</td>
+    </tr>`).join('') : `<tr><td colspan="3" style="color:var(--muted)">Registry empty</td></tr>`;
+}
+
+// ------------------------------------------------------------- binding flow
+
+async function startBind(chain){
+  showErr('');
+  const panel=document.getElementById('signPanel');
+  const box=document.getElementById('signMsg');
+  const btnW=document.getElementById('btnWalletSign');
+  try{
+    const addr = await connectWallet(chain);
+    const n = await api('/api/wallet/nonce',{chain,address:addr});
+    PENDING={chain,address:addr,nonce:n.nonce,message:n.message};
+    box.textContent=n.message;
+    btnW.disabled=false;
+  }catch(e){
+    // No extension, or the user declined. Open the panel anyway so the test-key
+    // path stays reachable — otherwise the demo is unusable without extensions.
+    PENDING={chain,address:null,nonce:null,message:null};
+    box.textContent=`No ${CHAINS[chain].wallet} connection.\n\n`+
+      `${e.message}\n\nYou can still exercise the full flow with a throwaway `+
+      `test key below. The server generates the pair, signs, and discards it.`;
+    btnW.disabled=true;
+  }
+  panel.classList.remove('hide');
+  panel.scrollIntoView({behavior:'smooth',block:'center'});
+}
+
+async function connectWallet(chain){
+  if(chain==='evm'){
+    if(!window.ethereum) throw new Error(
+      'No EVM wallet detected. Install MetaMask or Rabby, or use the throwaway test key below.');
+    const a=await window.ethereum.request({method:'eth_requestAccounts'});
+    return a[0];
+  }
+  if(!window.solana||!window.solana.isPhantom) throw new Error(
+    'Phantom not detected. Install it, or use the throwaway test key below.');
+  const r=await window.solana.connect();
+  return r.publicKey.toString();
+}
+
+document.getElementById('btnWalletSign').onclick=async()=>{
+  if(!PENDING) return;
+  showErr('');
+  try{
+    let sig;
+    if(PENDING.chain==='evm'){
+      sig=await window.ethereum.request({
+        method:'personal_sign',params:[PENDING.message,PENDING.address]});
+    } else {
+      const enc=new TextEncoder().encode(PENDING.message);
+      const res=await window.solana.signMessage(enc,'utf8');
+      sig=b58encode(res.signature);
+    }
+    await submit(sig);
+  }catch(e){ showErr(e.message); }
+};
+
+document.getElementById('btnTestSign').onclick=async()=>{
+  if(!PENDING) return;
+  showErr('');
+  try{
+    // Dev shortcut. The server generates a throwaway keypair, issues a nonce for
+    // it and signs in one pass. Not how self-custody works — see the README.
+    const t = await api('/api/dev/test-wallet',{chain:PENDING.chain});
+    PENDING={chain:PENDING.chain,address:t.address,nonce:t.nonce,message:t.message};
+    document.getElementById('signMsg').textContent=t.message;
+    await submit(t.signature);
+  }catch(e){ showErr(e.message); }
+};
+
+async function submit(sig){
+  const r=await api('/api/wallet/bind',{
+    chain:PENDING.chain,address:PENDING.address,nonce:PENDING.nonce,signature:sig});
+  document.getElementById('signPanel').classList.add('hide');
+  PENDING=null;
+  showOk(r.status==='active'
+    ? 'Wallet bound and active.'
+    : `Replacement accepted. Activates in ${r.cooling_hours}h — the current wallet stays active until then.`);
+  await load();
+}
+
+function cancelSign(){ PENDING=null; document.getElementById('signPanel').classList.add('hide'); }
+
+async function cancelPending(chain){
+  try{ await api('/api/wallet/cancel',{chain,address:''}); showOk('Pending change cancelled.'); await load(); }
+  catch(e){ showErr(e.message); }
+}
+async function fastForward(chain){
+  try{ await api('/api/dev/fast-forward',{chain,address:''}); showOk('Cooling period collapsed.'); await load(); }
+  catch(e){ showErr(e.message); }
+}
+async function logout(){ await api('/logout',{}); location.reload(); }
+async function resetAll(){
+  if(!confirm('Wipe all identities and bindings?')) return;
+  await api('/api/dev/reset',{}); location.reload();
+}
+
+load();
+</script>
