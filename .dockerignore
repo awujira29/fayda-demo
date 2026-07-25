@@ -1,0 +1,10 @@
+**/node_modules
+**/dist
+**/__pycache__
+**/registry.db*
+screenshots/
+.claude/
+.git/
+*.md
+!REBUILD.md
+frontend/.env.local

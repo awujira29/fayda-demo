@@ -20,8 +20,11 @@ feature keys off them.
 Personas below are fictional. FINs are 12 digits to match the real format.
 """
 
+import html
 import secrets
 import time
+from urllib.parse import urlparse
+
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -97,6 +100,23 @@ PERSONAS = [
 ]
 
 
+def _valid_redirect(redirect_uri: str) -> bool:
+    """
+    A real OIDC provider only ever redirects to a pre-registered URI. The
+    client here always registers a `/callback`, so we accept exactly that
+    path (relative or on any http(s) origin) and reject everything else.
+    This closes the open redirect — an attacker cannot point a persona login
+    at an arbitrary site — and, with the output escaping below, the mock's
+    reflected inputs stop being an XSS/phishing surface even though DEMO_MODE
+    publishes this page on a real origin.
+    """
+    try:
+        u = urlparse(redirect_uri)
+    except ValueError:
+        return False
+    return u.path == "/callback" and u.scheme in ("", "http", "https")
+
+
 def generate_client_keypair():
     """
     In production you generate this once and register the public JWK with Fayda.
@@ -131,15 +151,22 @@ def authorize(request: Request, client_id: str, redirect_uri: str,
         raise HTTPException(400, "unknown client_id")
     if response_type != "code":
         raise HTTPException(400, "only response_type=code is supported")
+    if not _valid_redirect(redirect_uri):
+        raise HTTPException(400, "invalid redirect_uri")
 
+    # Every reflected value is escaped: these are attacker-supplied query
+    # params, and DEMO_MODE serves this page on the deploy's real origin.
+    e_redirect = html.escape(redirect_uri, quote=True)
+    e_state = html.escape(state, quote=True)
+    e_nonce = html.escape(nonce, quote=True)
     cards = ""
     for p in PERSONAS:
         cards += f"""
         <form method="post" action="/authorize/confirm">
           <input type="hidden" name="fin" value="{p['fin']}">
-          <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-          <input type="hidden" name="state" value="{state}">
-          <input type="hidden" name="nonce" value="{nonce}">
+          <input type="hidden" name="redirect_uri" value="{e_redirect}">
+          <input type="hidden" name="state" value="{e_state}">
+          <input type="hidden" name="nonce" value="{e_nonce}">
           <button class="persona" type="submit">
             <span class="match">MATCH</span>
             <span class="pbody">
@@ -206,7 +233,7 @@ def authorize(request: Request, client_id: str, redirect_uri: str,
       <line x1="6" y1="24" x2="38" y2="24" stroke="#C9A227" stroke-width="1.2" stroke-dasharray="3 3"/>
     </svg>
     <div>
-      <div class="cap-label">Simulated capture &mdash; no sensor read</div>
+      <div class="cap-label">Step 1 of 2 &mdash; simulated capture, no sensor read</div>
       <div class="cap-text">Selecting a resident below stands in for a successful
         biometric match. The OIDC flow from here on is the real contract.</div>
     </div>
@@ -214,7 +241,7 @@ def authorize(request: Request, client_id: str, redirect_uri: str,
   <p class="step">Step 2 of 2 &mdash; select the matched resident</p>
   {cards}
   <div class="foot">MOCK PROVIDER &mdash; not connected to the national register.<br>
-     Requested scope: {scope}</div>
+     Requested scope: {html.escape(scope, quote=True)}</div>
 </div>"""
 
 
@@ -224,6 +251,9 @@ def authorize_confirm(fin: str = Form(...), redirect_uri: str = Form(...),
     persona = next((p for p in PERSONAS if p["fin"] == fin), None)
     if not persona:
         raise HTTPException(400, "unknown persona")
+    # Re-validate: this POST can be crafted directly, not only via the page above.
+    if not _valid_redirect(redirect_uri):
+        raise HTTPException(400, "invalid redirect_uri")
     code = secrets.token_urlsafe(24)
     _codes[code] = {"fin": fin, "nonce": nonce, "exp": time.time() + 120}
     sep = "&" if "?" in redirect_uri else "?"

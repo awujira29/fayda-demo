@@ -1,0 +1,142 @@
+@import 'tailwindcss';
+@import './tokens.css';
+
+/* Map tokens into Tailwind v4 theme so utilities resolve to the runtime
+   variables and follow the data-theme switch. */
+@theme inline {
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-card: var(--card);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-rule: var(--rule);
+  --color-rule-strong: var(--rule-strong);
+  --color-verify: var(--verify);
+  --color-verify-soft: var(--verify-soft);
+  --color-verify-ink: var(--verify-ink);
+  --color-cooling: var(--cooling);
+  --color-cooling-soft: var(--cooling-soft);
+  --color-cooling-ink: var(--cooling-ink);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-danger-ink: var(--danger-ink);
+  --font-display: var(--font-display);
+  --font-ui: var(--font-ui);
+  --font-mono: var(--font-mono);
+  --radius-doc: var(--radius);
+}
+
+@layer base {
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: var(--size-body);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection {
+    background: var(--verify-soft);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--verify);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation: none !important;
+      transition: none !important;
+    }
+  }
+}
+
+@layer components {
+  /* Record label: the registry's small-caps mono voice. */
+  .doc-label {
+    font-family: var(--font-mono);
+    font-size: var(--size-label);
+    letter-spacing: var(--track-label);
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* Section head: a ruled entry in the register. */
+  .doc-section {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    border-bottom: 1.5px solid var(--rule-strong);
+    padding-bottom: 0.5rem;
+    margin: 2.75rem 0 1rem;
+  }
+
+  /* Machine values: mono, selectable, breaking. */
+  .doc-value {
+    font-family: var(--font-mono);
+    font-size: var(--size-data);
+    word-break: break-all;
+    user-select: all;
+  }
+
+  /* Ledger table: ruled lines, mono data. Stacks under 420px. */
+  .ledger {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: var(--size-data);
+  }
+  .ledger th {
+    font-size: 0.65rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    text-align: left;
+    color: var(--muted);
+    border-bottom: 1.5px solid var(--rule-strong);
+    padding: 0.5rem 0.625rem;
+  }
+  .ledger td {
+    padding: 0.625rem;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+    font-variant-numeric: tabular-nums;
+  }
+  @media (max-width: 420px) {
+    /* thead stays in the accessibility tree (sr-only pattern) even though
+       the visual layout stacks; ::before labels carry the visible pairing */
+    .ledger thead {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+    }
+    .ledger, .ledger tbody, .ledger tr, .ledger td { display: block; }
+    .ledger tr { border-bottom: 1px solid var(--rule); padding: 0.625rem 0.75rem; }
+    .ledger td { border: none; padding: 0.1875rem 0; display: flex; gap: 0.75rem; }
+    .ledger td::before {
+      content: attr(data-label);
+      font-size: 0.65rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      flex: 0 0 5.5rem;
+      padding-top: 1px;
+    }
+  }
+
+  /* The one authored motion: attestation dialog entrance. */
+  .attest-enter {
+    animation: attest-rise 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes attest-rise {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+}

@@ -1,45 +1,105 @@
-import { useCallback, useEffect, useState } from 'react'
+/*
+ * Direction contract —
+ * THESIS: a national registry record, not a crypto app; the refusal is the
+ *   NFT-mint page and the SaaS dashboard alike.
+ * OWN-WORLD: issued-document language — OKLCH paper/ink neutrals, one Fayda
+ *   green-teal accent spent only on identity/verification/active, Source
+ *   Serif 4 300/700 display, Public Sans UI, Spline Sans Mono machine values,
+ *   guilloché band, ruled ledgers, stamp-like status marks.
+ * STORY: the visitor understands their identity is verified, sees exactly
+ *   what a wallet binding proves, signs one legible message, and can read
+ *   their record at a glance.
+ * FIRST VIEWPORT: masthead (serif 300/700) over guilloché rule, then the
+ *   verified-identity record or the verification handoff; primary action is
+ *   the single accent button.
+ * FORM: brief-pinned (financial-grade civil registry) — no tournament run;
+ *   the brief beats the roll.
+ */
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
-import { signFor, useWalletConnection, PRIVY_CONFIGURED } from './wallet.js'
-import {
-  ChainCard, ConfirmButton, HistoryTable, IdentityCard,
-  PrivySetupNotice, RegistryTable, SignPanel,
-} from './components.jsx'
+import { signEvm, currentNetwork, useWalletConnection, PRIVY_CONFIGURED } from './wallet/index.jsx'
+import { RecordHeader } from './components/RecordHeader.jsx'
+import { IdentityRecord } from './components/IdentityRecord.jsx'
+import { VerifyGate, BackendDown, OriginMismatch } from './components/VerifyGate.jsx'
+import { SetupConnector } from './components/SetupConnector.jsx'
+import { EvmRecord, SolanaRecord, CHAINS } from './components/ChainRecord.jsx'
+import { AttestationDialog } from './components/AttestationDialog.jsx'
+import { HistoryLedger, RegistryLedger } from './components/Ledgers.jsx'
+import { Alert } from './components/ui/alert.jsx'
+import { Button } from './components/ui/button.jsx'
+import { Card } from './components/ui/card.jsx'
+
+function Skeleton() {
+  return (
+    <div className="space-y-4">
+      <p role="status" className="sr-only">Loading the registry…</p>
+      <div aria-hidden="true" className="animate-pulse space-y-4">
+        <div className="h-28 rounded-doc border border-rule bg-surface" />
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="h-40 rounded-doc border border-rule bg-surface" />
+          <div className="h-40 rounded-doc border border-rule bg-surface" />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Two-step destructive control: one persistent button element so keyboard
+ * focus survives arming; the second click confirms. */
+function WipeButton({ onConfirm, disabled }) {
+  const [armed, setArmed] = useState(false)
+  return (
+    <>
+      <Button
+        variant="danger"
+        size="sm"
+        disabled={disabled}
+        onClick={() => {
+          if (armed) { setArmed(false); onConfirm() } else setArmed(true)
+        }}
+      >
+        {armed ? 'Confirm: erase every identity and binding' : 'Wipe registry (dev)'}
+      </Button>
+      {armed && (
+        <Button variant="ghost" size="sm" onClick={() => setArmed(false)}>
+          Keep everything
+        </Button>
+      )}
+    </>
+  )
+}
 
 export default function App() {
   const conn = useWalletConnection()
   const [me, setMe] = useState(null)
   const [registry, setRegistry] = useState(null)
-  const [pending, setPending] = useState(null) // {chain, address, nonce, message, wallet}
+  const [attest, setAttest] = useState(null)
+  const [fatal, setFatal] = useState('')
   const [err, setErr] = useState('')
-  const [ok, setOk] = useState('')
+  const [ok, setOk] = useState(null) // { msg, tone }
   const [busy, setBusy] = useState(false)
+  // Bumped when the dialog closes; a signature resolving after abandonment
+  // must not bind. The nonce is single-use and expires, so abandoning is safe.
+  const attestGen = useRef(0)
 
   const load = useCallback(async () => {
     const [m, r] = await Promise.all([api('/api/me'), api('/api/registry')])
     setMe(m)
     setRegistry(r)
+    return m
   }, [])
 
   useEffect(() => {
-    load().catch((e) => setErr(e.message))
+    load().catch((e) => setFatal(e.message))
   }, [load])
 
-  useEffect(() => {
-    if (!ok) return
-    const t = setTimeout(() => setOk(''), 6000)
-    return () => clearTimeout(t)
-  }, [ok])
-
-  async function run(fn, doneMsg) {
-    // Clear BOTH banners: a stale success surviving into a new action's
-    // failure reads as two contradictory outcomes at once.
+  async function run(fn, done) {
     setErr('')
-    setOk('')
+    setOk(null)
     setBusy(true)
     try {
       await fn()
-      if (doneMsg) setOk(doneMsg)
+      if (done) setOk(typeof done === 'string' ? { msg: done, tone: 'success' } : done)
       await load()
     } catch (e) {
       setErr(e.message)
@@ -50,145 +110,156 @@ export default function App() {
 
   const startBind = (chain, wallet) =>
     run(async () => {
-      const n = await api('/api/wallet/nonce', { chain, address: wallet.address })
-      setPending({ chain, address: wallet.address, nonce: n.nonce, message: n.message, wallet })
-    })
-
-  const sign = () =>
-    run(async () => {
-      // Test-key flow carries the server-produced signature; the wallet flow
-      // signs here, in the browser, with the connected wallet.
-      const sig = pending.testSignature
-        ?? await signFor(pending.chain, pending.wallet, pending.message)
-      const r = await api('/api/wallet/bind', {
-        chain: pending.chain, address: pending.address,
-        nonce: pending.nonce, signature: sig,
+      const [n, network] = await Promise.all([
+        api('/api/wallet/nonce', { chain, address: wallet.address }),
+        currentNetwork(wallet),
+      ])
+      setAttest({
+        phase: 'review', chain, address: wallet.address, wallet, network,
+        nonce: n.nonce, message: n.message, error: '',
       })
-      setPending(null)
-      setOk(r.status === 'active'
-        ? 'Wallet bound and active.'
-        : `Replacement accepted. Activates in ${r.cooling_hours}h — the current wallet stays active until then.`)
     })
 
   const testKey = (chain) =>
     run(async () => {
-      // Dev shortcut: the server generates a throwaway keypair, issues a nonce
-      // and signs in one pass. Not how self-custody works — see the README.
-      // The message is still shown for review before anything is submitted.
       const t = await api('/api/dev/test-wallet', { chain })
-      setPending({
-        chain, address: t.address, nonce: t.nonce, message: t.message,
-        wallet: null, testSignature: t.signature,
+      setAttest({
+        phase: 'review', chain, address: t.address, wallet: null, network: null,
+        nonce: t.nonce, message: t.message, testSignature: t.signature, error: '',
       })
     })
 
-  const cancelPending = (chain) =>
-    run(() => api('/api/wallet/cancel', { chain, address: '' }), 'Pending change cancelled.')
-
-  const fastForward = (chain) =>
-    run(() => api('/api/dev/fast-forward', { chain, address: '' }), 'Cooling period collapsed.')
-
-  const logout = () => run(async () => { await api('/logout', {}); setPending(null) })
-
-  const resetAll = () =>
-    run(async () => { await api('/api/dev/reset', {}); setPending(null) }, 'Registry wiped.')
-
-  if (!me) {
-    return (
-      <div className="wrap">
-        <div className="eyebrow">Internal proof of concept</div>
-        <h1>Fayda identity → <strong>wallet registry</strong></h1>
-        {err
-          ? <div className="err">Backend unreachable: {err}. Start it with <span className="mono">APP_ENV=dev python backend/app.py</span>.</div>
-          : <p className="sub">Loading…</p>}
-      </div>
-    )
+  async function sign() {
+    const gen = attestGen.current
+    const a = attest
+    setErr('')
+    setBusy(true)
+    try {
+      let signature = a.testSignature
+      if (!signature) {
+        setAttest((s) => ({ ...s, phase: 'signature-pending', error: '' }))
+        signature = await signEvm(a.wallet, a.message)
+        // The user may have cancelled while the wallet prompt was open.
+        if (attestGen.current !== gen) return
+      }
+      setAttest((s) => (s ? { ...s, phase: 'binding' } : s))
+      const r = await api('/api/wallet/bind', {
+        chain: a.chain, address: a.address, nonce: a.nonce, signature,
+      })
+      if (attestGen.current !== gen) return
+      setAttest(null)
+      const label = CHAINS[a.chain].label
+      setOk(
+        r.status === 'active'
+          ? { msg: `Wallet bound. It is now your verified ${label} wallet.`, tone: 'success' }
+          : { msg: `Replacement recorded for ${label}. It activates in ${r.cooling_hours} hours — your current wallet stays active until then.`, tone: 'warning' },
+      )
+      await load()
+    } catch (e) {
+      if (attestGen.current === gen) {
+        setAttest((s) => (s ? { ...s, phase: 'review', error: e.message } : s))
+      }
+    } finally {
+      setBusy(false)
+    }
   }
 
+  const closeAttest = () => {
+    attestGen.current += 1
+    setAttest(null)
+  }
+
+  const cancelPending = (chain) =>
+    run(() => api('/api/wallet/cancel', { chain, address: '' }),
+      `Replacement cancelled. Your current ${CHAINS[chain].label} wallet stays active.`)
+  const fastForward = (chain) =>
+    run(() => api('/api/dev/fast-forward', { chain, address: '' }),
+      `Cooling skipped (dev). The ${CHAINS[chain].label} replacement is now active.`)
+  const logout = () => run(async () => { await api('/logout', {}); closeAttest() })
+  const wipe = () => run(async () => { await api('/api/dev/reset', {}); closeAttest() }, 'Registry wiped.')
+
+  const originMismatch =
+    me && !me.authenticated && me.public_origin &&
+    !me.public_origin.startsWith(window.location.origin)
+
   return (
-    <div className="wrap">
-      <div className="eyebrow">Internal proof of concept</div>
-      <h1>Fayda identity → <strong>wallet registry</strong></h1>
-      <p className="sub">
-        One Fayda-verified Ethiopian identity, bound to at most one verified
-        self-custodied wallet per chain. No custody taken, no keys held.
-      </p>
+    <div className="mx-auto max-w-[60rem] px-6 pb-24 pt-10 max-[420px]:px-4 max-[420px]:pt-6">
+      <RecordHeader />
 
-      <div className="banner">
-        <strong>Mock Fayda.</strong> The identity provider here is local and not
-        connected to the national register. The client code is real OIDC —
-        authorization code flow, RS256 private-key-JWT client assertion — so
-        production is an env var change. The claim shape matches the official
-        client library (<span className="mono">github.com/National-ID-Program-Ethiopia/fayda-auth-python</span>).
-      </div>
-
-      {err && <div className="err">{err}</div>}
-      {ok && <div className="ok">{ok}</div>}
-
-      {!me.authenticated ? (
-        <>
-          <h2>Step 1 — verify identity</h2>
-          <div className="card">
-            <p className="flush">
-              Authenticate with Fayda to establish a verified identity. In
-              production this captures a fingerprint, iris, face or OTP.
-            </p>
-            <button onClick={() => { window.location.href = '/login' }}>Verify with Fayda</button>
-          </div>
-        </>
+      {fatal ? (
+        <BackendDown detail={fatal} />
+      ) : !me ? (
+        <Skeleton />
       ) : (
         <>
-          <h2>Verified identity</h2>
-          <IdentityCard me={me} onLogout={logout} />
+          {err && <Alert tone="danger" className="mb-4">{err}</Alert>}
+          <div role="status" aria-live="polite">
+            {ok && (
+              <Alert tone={ok.tone} role="presentation" className="mb-4">
+                {ok.msg}
+              </Alert>
+            )}
+          </div>
+          {originMismatch && <div className="mb-4"><OriginMismatch publicOrigin={me.public_origin} /></div>}
 
-          {!PRIVY_CONFIGURED && <PrivySetupNotice />}
+          {!me.authenticated ? (
+            <VerifyGate simulated={me.dev || me.demo} />
+          ) : (
+            <>
+              <h2 className="doc-section">Identity</h2>
+              <IdentityRecord me={me} onLogout={logout} busy={busy} />
 
-          <h2>Bound wallets</h2>
-          <div className="grid">
-            {['evm', 'solana'].map((chain) => (
-              <ChainCard
-                key={chain}
-                chain={chain}
-                me={me}
-                conn={conn}
-                busy={busy}
-                onConnect={conn.connect}
-                onStartBind={startBind}
-                onCancel={cancelPending}
-                onFastForward={fastForward}
-                onTestKey={testKey}
-              />
-            ))}
+              {!PRIVY_CONFIGURED && (
+                <>
+                  <h2 className="doc-section">Wallet connector</h2>
+                  <SetupConnector />
+                </>
+              )}
+
+              <h2 className="doc-section">Bound wallets</h2>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <EvmRecord
+                  me={me} conn={conn} busy={busy}
+                  onStartBind={startBind} onCancel={cancelPending}
+                  onFastForward={fastForward} onTestKey={testKey}
+                />
+                <SolanaRecord
+                  me={me} busy={busy}
+                  onCancel={cancelPending} onFastForward={fastForward} onTestKey={testKey}
+                />
+              </div>
+
+              <h2 className="doc-section">Binding history</h2>
+              <HistoryLedger history={me.history} />
+            </>
+          )}
+
+          <h2 className="doc-section">Public registry</h2>
+          <RegistryLedger identities={registry ? registry.identities : []} />
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button variant="ghost" size="sm" onClick={() => load().catch((e) => setErr(e.message))}>
+              Refresh
+            </Button>
+            {me.dev && me.authenticated && <WipeButton onConfirm={wipe} disabled={busy} />}
           </div>
 
-          <SignPanel
-            pending={pending}
-            conn={conn}
-            busy={busy}
-            onSign={sign}
-            onCancel={() => setPending(null)}
-          />
-
-          <h2>Binding history</h2>
-          <HistoryTable history={me.history} />
+          {me.authenticated && !me.dev && (
+            <Card className="mt-8 border-rule bg-surface">
+              <p className="text-[0.8125rem] text-muted">
+                This is an internal proof of concept, not an official government
+                service. Bindings recorded here carry no legal weight.
+              </p>
+            </Card>
+          )}
         </>
       )}
 
-      <h2>Registry</h2>
-      <RegistryTable identities={registry ? registry.identities : []} />
-      <div className="actions">
-        <button className="ghost sm" onClick={() => load().catch((e) => setErr(e.message))}>
-          Refresh
-        </button>
-        {me.dev && me.authenticated && (
-          <ConfirmButton
-            label="Reset everything"
-            confirmLabel="Confirm: wipe all identities and bindings"
-            onConfirm={resetAll}
-            disabled={busy}
-          />
-        )}
-      </div>
+      <AttestationDialog
+        attest={attest} conn={conn} busy={busy}
+        onSign={sign}
+        onFreshTest={() => testKey(attest.chain)}
+        onClose={closeAttest}
+      />
     </div>
   )
 }

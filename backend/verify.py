@@ -14,18 +14,27 @@ Neither path touches an RPC node. This is pure cryptography, so the demo needs
 no testnet, no faucet and no chain config.
 """
 
+import os
+from urllib.parse import urlparse
+
 import base58
 import nacl.signing
 import nacl.exceptions
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-DOMAIN = "fayda-registry.local"
-URI = "http://127.0.0.1:8000"
+# The message's stated origin must match what the user's address bar and the
+# wallet's origin check show — three mismatched origins at the moment of
+# signing reads as phishing. Derived from the same env contract app.py uses:
+# PUBLIC_URL is the browser-facing origin, BASE_URL the fallback.
+URI = (os.getenv("PUBLIC_URL")
+       or os.getenv("RENDER_EXTERNAL_URL")
+       or os.getenv("BASE_URL", "http://127.0.0.1:8000")).rstrip("/")
+DOMAIN = urlparse(URI).netloc or "fayda-registry.local"
 
 
 def build_message(chain: str, address: str, nonce: str, issued_at: str,
-                  identity_label: str) -> str:
+                  expires_at: str, identity_label: str) -> str:
     """
     SIWE-style (EIP-4361). Human-readable on purpose: the user should be able to
     read in their wallet exactly what they are agreeing to before they sign.
@@ -38,13 +47,15 @@ def build_message(chain: str, address: str, nonce: str, issued_at: str,
         f"\n"
         f"Identity: {identity_label}\n"
         f"\n"
-        f"By signing you prove you control this wallet. This does not grant any\n"
-        f"permission to move funds.\n"
+        f"By signing you prove you control this wallet.\n"
+        f"This does not grant any permission to move funds.\n"
+        f"This binding will be listed in the public registry.\n"
         f"\n"
         f"URI: {URI}\n"
         f"Chain: {chain_label}\n"
         f"Nonce: {nonce}\n"
-        f"Issued At: {issued_at}"
+        f"Issued At: {issued_at}\n"
+        f"Expiration Time: {expires_at}"
     )
 
 

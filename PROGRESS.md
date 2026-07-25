@@ -74,7 +74,7 @@ at bind time. It cannot be reconstructed later.
 wallet and cannot manage a seed phrase. Adding it later should be additive.
 
 **What landed (S2):** the seam is real and lives client-side —
-frontend/src/wallet.js is the only file that may import @privy-io, exposing
+frontend/src/wallet/ (rebuilt in S3) is the only module that may import @privy-io, exposing
 WalletProvider/useWalletConnection/signFor. Swapping providers = rewriting one
 file. Privy is integrated for CONNECTION of external self-custody wallets only;
 embedded wallets are off (createOnLogin: 'off', both chains). The binding
@@ -105,10 +105,20 @@ accepted, or the distinction is unrecoverable).
   Cache-Control: no-store to authenticated responses.
 - L7 (auditor, 2026-07-24) A non-string sub from a real provider would 500 in
   hash_fin; coerce/validate at the callback boundary.
-- L8 (auditor, 2026-07-24) Mock /authorize reflects state/scope/redirect_uri
-  unescaped; dev-only, 404 in production. Re-flagged after the restructure:
-  the Vite proxy now serves the mock page on the SPA origin, so the reflected
-  XSS would run same-origin with the real app in dev. HTML-escape the params.
+- L8 RESOLVED (2026-07-24) Mock /authorize reflected state/scope/redirect_uri
+  unescaped. The Render deploy publishes the mock via DEMO_MODE, which promoted
+  this to a live medium (reflected XSS same-origin with the wallet SPA). Fixed:
+  all reflected params html.escape'd, and redirect_uri constrained to a
+  /callback path at both /authorize and /authorize/confirm (also closes the
+  paired open redirect). Test 21.
+- L11 (auditor, 2026-07-24) The redirect_uri check is PATH-ONLY, so
+  <any-host>/callback passes → a restricted open redirect after a persona
+  click. Harmless in the mock (leaked code unexchangeable without the
+  server-held client-assertion key; persona is public). MUST become a full
+  host+path match against the registered URI when real Fayda credentials
+  replace the mock (see B1). Deliberately not host-matched now: Render's
+  Host-forwarding is unverified from here and a wrong guess would 400 every
+  live login.
 - L9 (auditor, 2026-07-24) PUBLIC_URL defaults to BASE_URL: running the SPA
   without PUBLIC_URL=http://localhost:5173 strands the session cookie on the
   backend origin — fails safe (never logged in), but the two-process dev run
@@ -145,6 +155,72 @@ Ethiopian data-protection rules. Unanswered. Do not integrate before it is.
 ---
 
 ## Done
+
+### D1 - Single-service Render deploy (API + SPA, DEMO_MODE) - done 2026-07-24
+One FastAPI process serves the API and the built React SPA (frontend/dist),
+same-origin, so the cookie/OIDC flow is unchanged and there is no CORS. Vite
+base './' for relative assets; app.py mounts /assets and adds a catch-all
+(registered last, so no /api|/login|/callback|/logout|/v1|/authorize|/config.js
+route is shadowed; api_route over all methods so an unmatched POST 404s not
+405s; resolve()+is_relative_to traversal guard). Production cookie is Secure
+(non-dev, both set and delete paths); SameSite=Lax still admits the top-level
+/callback nav. PUBLIC/BASE and verify.py's message origin derive from
+PUBLIC_URL || RENDER_EXTERNAL_URL || BASE (env-only, not Host-influenced);
+BASE tracks $PORT for the server's self-calls. Privy app id is runtime config
+via /config.js (no rebuild to set/rotate).
+
+DEMO_MODE mounts ONLY the mock IdP (personas) — never /api/dev/*, so a demo
+visitor cannot wipe the DB (H1) or skip cooling (H2); the secrets guard and
+Secure cookie stay. Dockerfile (Node build stage → python:3.12-slim runtime,
+native-dep toolchain in the build stage only), render.yaml (Docker web
+service, generateValue secrets, DEMO_MODE=1, PRIVY_APP_ID sync:false,
+RENDER_EXTERNAL_URL auto), DEPLOY.md (exact click-path, every env var, the
+Privy allowed-origins step, and the SQLite-resets-on-redeploy caveat plainly).
+
+Verified: image built and run as Render would (PORT=10000, prod, DEMO_MODE),
+full persona→Secure-cookie→/api/me round trip passed over one origin, every
+/api/dev/* 404, message names the deployed origin, traversal cannot escape
+dist. backend/t.py: 21/21 (tests 20 demo-gating, 21 mock XSS+open-redirect).
+Auditor on the deploy deltas: 0 new criticals, 0 new highs; one medium (the
+DEMO_MODE-published mock XSS) found and fixed (L8), two lows. Dropped stale
+itsdangerous dep.
+
+
+### S3 - Frontend rebuild v2: financial-grade UI + real wallet connector - done 2026-07-24
+Old frontend deleted, rebuilt as React + Vite + Tailwind v4 with shadcn-style
+primitives themed to a committed visual world (DESIGN.md: civil-registry
+record — Source Serif 4 300/700, Public Sans, Spline Sans Mono, OKLCH tinted
+neutrals, one Fayda green-teal accent for identity/verification/active only,
+guilloché band, ruled ledgers, full dark + light). Privy is the wallet
+connector (connection only; identity stays Fayda; embedded wallets off;
+EIP-6963 discovery), isolated in frontend/src/wallet/ — the R2 seam. Solana
+connect is honestly disabled (SOLANA_WALLETS_ENABLED=false) until external
+Solana support in the connector is verified; never fake a chain. Every state
+designed: loading, empty, error+recovery, disconnected, signature-pending,
+cooling (warning-toned), missing-config, origin-mismatch (new public_origin
+field in /api/me).
+
+Backend deltas: signed message origins derive from PUBLIC_URL (no more
+three-origin mismatch at the signing moment — NOTE production must set
+PUBLIC_URL or the message names the backend host); message gained a
+public-registry consequence line and an Expiration Time line; nonces record
+issued_via server-side and bindings persist proof_method, so a dev test-key
+attestation can never masquerade as a wallet attestation (t.py test 19; the
+first cut of this silently no-oped — auditor caught it, fixed and re-verified
+against the DB). Mock capture panel labeled "Step 1 of 2".
+
+Verification: Impeccable detector zero findings (twice); two-pass design
+review — design-critic + ux-heuristics-review + cognitive-load-conversion +
+ai-trust-builders + accessibility ran in parallel, ~30 named findings all
+applied, pass 2 verified all resolved, no regressions, no banned patterns,
+verdict "designed" (DESIGN-REVIEW.md, screenshots/ desktop+380px both
+themes). Auditor: 0 new criticals, 0 new highs; 1 medium (the proof_method
+no-op) found, fixed, re-verified. backend/t.py: 19/19. Live-verified in the
+user's Chrome: MetaMask installed and EIP-6963-announcing. The full
+MetaMask-through-Privy-modal demo needs the user's Privy app id (no dashboard
+session existed; not automatable) plus a human click in the extension popup —
+the single remaining human step, documented in README.
+
 
 ### S2 - Restructure: backend/ + React/Vite frontend + Privy wallet layer - done 2026-07-24
 Backend moved (not rewritten) into backend/; t.py changed only by subprocess

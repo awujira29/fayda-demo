@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS wallet_bindings (
     proof_nonce   TEXT NOT NULL,
     proof_sig     TEXT NOT NULL,
     proof_message TEXT NOT NULL,
+    proof_method  TEXT NOT NULL DEFAULT 'wallet',
     requested_at  TEXT NOT NULL,
     activates_at  TEXT,
     activated_at  TEXT,
@@ -74,7 +75,11 @@ CREATE TABLE IF NOT EXISTS auth_nonces (
     chain       TEXT NOT NULL,
     message     TEXT NOT NULL,   -- exact text issued; never trust the client's copy
     expires_at  TEXT NOT NULL,
-    consumed    INTEGER NOT NULL DEFAULT 0
+    consumed    INTEGER NOT NULL DEFAULT 0,
+    -- how the proof will be produced: 'wallet' or 'dev-test-key'. Recorded
+    -- server-side at issue time so a test-key binding can never masquerade
+    -- as a real wallet attestation in the audit trail.
+    issued_via  TEXT NOT NULL DEFAULT 'wallet'
 );
 
 -- Session data stays server-side. The claims now include address.kebele and
@@ -214,36 +219,38 @@ def delete_session(sid: str) -> None:
 # ------------------------------------------------------------------- nonces
 
 def issue_nonce(nonce: str, address: str, chain: str, message: str,
-                ttl_seconds: int) -> None:
+                ttl_seconds: int, issued_via: str = "wallet") -> None:
     with conn() as c:
         c.execute(
-            "INSERT INTO auth_nonces (nonce, address, chain, message, expires_at) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT INTO auth_nonces (nonce, address, chain, message, expires_at, issued_via) "
+            "VALUES (?,?,?,?,?,?)",
             (nonce, address, chain, message,
-             iso(now() + timedelta(seconds=ttl_seconds))),
+             iso(now() + timedelta(seconds=ttl_seconds)), issued_via),
         )
 
 
-def consume_nonce(nonce: str, address: str, chain: str) -> tuple[bool, str, str]:
+def consume_nonce(nonce: str, address: str, chain: str) -> tuple[bool, str, str, str]:
     """
     Single use, bound to the address and chain it was issued for.
     Returns the exact message that was issued, so the caller verifies the
-    signature against server state rather than anything the client sent.
+    signature against server state rather than anything the client sent —
+    plus the server-recorded issued_via, so binding provenance cannot be
+    claimed by the client.
     """
     with conn() as c:
         row = c.execute(
             "SELECT * FROM auth_nonces WHERE nonce = ?", (nonce,)
         ).fetchone()
         if not row:
-            return False, "unknown nonce", ""
+            return False, "unknown nonce", "", ""
         if row["consumed"]:
-            return False, "nonce already used", ""
+            return False, "nonce already used", "", ""
         if parse(row["expires_at"]) < now():
-            return False, "nonce expired", ""
+            return False, "nonce expired", "", ""
         if row["address"].lower() != address.lower() or row["chain"] != chain:
-            return False, "nonce was issued for a different address or chain", ""
+            return False, "nonce was issued for a different address or chain", "", ""
         c.execute("UPDATE auth_nonces SET consumed = 1 WHERE nonce = ?", (nonce,))
-        return True, "", row["message"]
+        return True, "", row["message"], row["issued_via"]
 
 
 # ------------------------------------------------------------------ bindings
@@ -285,7 +292,7 @@ def address_claimed_by_other(chain: str, address: str, identity_id: str) -> bool
 
 
 def create_binding(identity_id, chain, address, nonce, sig, message,
-                   cooling_hours: int) -> dict:
+                   cooling_hours: int, proof_method: str = "wallet") -> dict:
     """
     First binding for a chain activates immediately.
     A replacement goes pending for `cooling_hours`; the incumbent stays active
@@ -301,6 +308,7 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
         "proof_nonce": nonce,
         "proof_sig": sig,
         "proof_message": message,
+        "proof_method": proof_method,
         "requested_at": iso(t),
         "status": "active" if incumbent is None else "pending",
         "activates_at": None if incumbent is None else iso(t + timedelta(hours=cooling_hours)),
@@ -312,9 +320,11 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
             c.execute(
                 """INSERT INTO wallet_bindings
                    (id, identity_id, chain, address, status, proof_nonce, proof_sig,
-                    proof_message, requested_at, activates_at, activated_at, archived_at)
+                    proof_message, proof_method, requested_at, activates_at,
+                    activated_at, archived_at)
                    VALUES (:id,:identity_id,:chain,:address,:status,:proof_nonce,:proof_sig,
-                           :proof_message,:requested_at,:activates_at,:activated_at,:archived_at)""",
+                           :proof_message,:proof_method,:requested_at,:activates_at,
+                           :activated_at,:archived_at)""",
                 row,
             )
         except sqlite3.IntegrityError as e:

@@ -2,7 +2,6 @@
 
 fastapi==0.139.2
 uvicorn==0.51.0
-itsdangerous==2.2.0        # SessionMiddleware
 python-multipart==0.0.32   # form posts on the mock /token endpoint
 
 PyJWT[crypto]==2.7.0       # RS256 client assertion

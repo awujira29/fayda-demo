@@ -1,0 +1,73 @@
+/*
+ * tokens.css — the single source of design values. CLAUDE.md and DESIGN.md
+ * point here. Change values here, never as literals in components.
+ *
+ * World: digitized civil-registry document. OKLCH throughout — tinted
+ * neutrals, never pure black/white/gray. ONE accent (Fayda green-teal),
+ * spent exclusively on identity / verification / active state.
+ */
+
+:root {
+  /* ---- neutrals (light: issued paper) */
+  --paper: oklch(0.975 0.004 95);
+  --surface: oklch(0.955 0.005 95);
+  --card: oklch(0.99 0.002 95);
+  --ink: oklch(0.24 0.012 250);
+  --muted: oklch(0.48 0.014 250);
+  --faint: oklch(0.55 0.014 250);
+  --rule: oklch(0.88 0.006 95);
+  --rule-strong: oklch(0.42 0.014 250);
+
+  /* ---- the accent: identity, verification, active. Nothing else. */
+  --verify: oklch(0.46 0.085 175);
+  --verify-soft: oklch(0.93 0.025 172);
+  --verify-ink: oklch(0.35 0.075 175);
+
+  /* ---- semantic status (never decorative) */
+  --cooling: oklch(0.55 0.11 75);
+  --cooling-soft: oklch(0.95 0.035 85);
+  --cooling-ink: oklch(0.44 0.095 70);
+  --danger: oklch(0.50 0.13 25);
+  --danger-soft: oklch(0.94 0.03 25);
+  --danger-ink: oklch(0.40 0.115 25);
+
+  /* ---- type */
+  --font-display: 'Source Serif 4', Georgia, serif;
+  --font-ui: 'Public Sans', system-ui, sans-serif;
+  --font-mono: 'Spline Sans Mono', ui-monospace, monospace;
+  --w-hairline: 300;
+  --w-strong: 700;
+  --size-display: 2.25rem;   /* 36px */
+  --size-title: 1.375rem;    /* 22px */
+  --size-body: 0.9375rem;    /* 15px */
+  --size-data: 0.8125rem;    /* 13px */
+  --size-label: 0.6875rem;   /* 11px */
+  --track-label: 0.13em;
+
+  /* ---- rhythm */
+  --radius: 4px;
+  --page-max: 60rem;
+}
+
+[data-theme='dark'] {
+  /* Night register: same document, examined under office light after dark. */
+  --paper: oklch(0.205 0.012 250);
+  --surface: oklch(0.24 0.012 250);
+  --card: oklch(0.235 0.013 250);
+  --ink: oklch(0.93 0.006 95);
+  --muted: oklch(0.72 0.012 95);
+  --faint: oklch(0.58 0.012 250);
+  --rule: oklch(0.33 0.012 250);
+  --rule-strong: oklch(0.78 0.01 95);
+
+  --verify: oklch(0.72 0.10 172);
+  --verify-soft: oklch(0.30 0.045 175);
+  --verify-ink: oklch(0.80 0.09 172);
+
+  --cooling: oklch(0.78 0.115 80);
+  --cooling-soft: oklch(0.30 0.045 80);
+  --cooling-ink: oklch(0.82 0.10 82);
+  --danger: oklch(0.68 0.14 25);
+  --danger-soft: oklch(0.30 0.05 25);
+  --danger-ink: oklch(0.78 0.11 25);
+}

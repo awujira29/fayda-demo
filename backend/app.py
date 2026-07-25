@@ -7,11 +7,13 @@ local mock provider — swapping to production is an env var change, not a rewri
 
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import base58
 import httpx
@@ -21,7 +23,8 @@ import uvicorn
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import Headers, MutableHeaders
 
@@ -40,8 +43,14 @@ import verify as vf
 # server (http://localhost:5173), which proxies /authorize and /callback here.
 # Defaults keep the single-process case (t.py, no frontend) working: both
 # collapse to the same origin.
-BASE = os.getenv("BASE_URL", "http://127.0.0.1:8000")
-PUBLIC = os.getenv("PUBLIC_URL", BASE)
+# BASE must track the actual listen port for the server's calls to itself
+# (token exchange, userinfo) — on Render the process listens on $PORT.
+BASE = os.getenv("BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
+# Deployed platforms provide the public origin (Render: RENDER_EXTERNAL_URL,
+# e.g. https://myapp.onrender.com). Explicit PUBLIC_URL still wins.
+PUBLIC = (os.getenv("PUBLIC_URL")
+          or os.getenv("RENDER_EXTERNAL_URL")
+          or BASE).rstrip("/")
 CLIENT_ID = os.getenv("FAYDA_CLIENT_ID", "fayda-wallet-demo")
 AUTHORIZE_URL = os.getenv("FAYDA_AUTHORIZE_URL", f"{PUBLIC}/authorize")
 TOKEN_URL = os.getenv("FAYDA_TOKEN_URL", f"{BASE}/v1/esignet/oauth/v2/token")
@@ -60,6 +69,12 @@ NONCE_TTL = 300
 # use is an explicit opt-in: `APP_ENV=dev python app.py`.
 APP_ENV = os.getenv("APP_ENV", "production")
 DEV_MODE = APP_ENV == "dev"
+# DEMO_MODE mounts ONLY the mock IdP on a production deploy that has no real
+# Fayda credentials yet: a visitor can click a persona and log in, but none of
+# /api/dev/* exists — the demo audience must not be able to wipe the DB (H1)
+# or collapse the cooling window (H2). Everything else keeps its production
+# posture, including the secrets guard and the Secure cookie.
+DEMO_MODE = os.getenv("DEMO_MODE", "").lower() in ("1", "true", "yes")
 
 # Session-id signing key and FIN pepper must survive restarts. If the secret
 # changes, every session cookie's HMAC stops verifying (users logged out; the
@@ -165,13 +180,15 @@ class ServerSideSessionMiddleware:
                     headers.append(
                         "set-cookie",
                         f"{self.COOKIE}={sid}.{_sign_sid(sid)}; Path=/; HttpOnly; "
-                        f"SameSite=Lax; Max-Age={SESSION_TTL_HOURS * 3600}",
+                        f"SameSite=Lax; Max-Age={SESSION_TTL_HOURS * 3600}"
+                        + ("" if DEV_MODE else "; Secure"),
                     )
                 elif sid is not None:
                     store.delete_session(sid)
                     headers.append(
                         "set-cookie",
-                        f"{self.COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                        f"{self.COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+                        + ("" if DEV_MODE else "; Secure"),
                     )
                     sid = None
             await send(message)
@@ -182,8 +199,9 @@ class ServerSideSessionMiddleware:
 app = FastAPI(title="Fayda wallet registry")
 app.add_middleware(ServerSideSessionMiddleware)
 
-# The mock IdP is part of the dev surface — it must not exist in production.
-if DEV_MODE:
+# The mock IdP mounts in dev, and in an explicitly opted-in demo deploy.
+# The /api/dev/* surface is NEVER tied to DEMO_MODE.
+if DEV_MODE or DEMO_MODE:
     app.include_router(mock_esignet.router)
 
 store.init()
@@ -331,8 +349,9 @@ def wallet_nonce(req: NonceReq, request: Request):
 
     ident = store.get_identity(iid)
     nonce = secrets.token_urlsafe(16)
-    issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    message = vf.build_message(req.chain, req.address, nonce, issued_at,
+    t = datetime.now(timezone.utc).replace(microsecond=0)
+    message = vf.build_message(req.chain, req.address, nonce, t.isoformat(),
+                               (t + timedelta(seconds=NONCE_TTL)).isoformat(),
                                ident["display_name"])
     store.issue_nonce(nonce, req.address, req.chain, message, NONCE_TTL)
     return {"nonce": nonce, "message": message, "expires_in": NONCE_TTL}
@@ -344,7 +363,7 @@ def wallet_bind(req: BindReq, request: Request):
 
     # Consuming the nonce returns the exact message the server issued. The
     # signature is verified against that, never against anything the client sent.
-    ok, err, message = store.consume_nonce(req.nonce, req.address, req.chain)
+    ok, err, message, issued_via = store.consume_nonce(req.nonce, req.address, req.chain)
     if not ok:
         raise HTTPException(400, err)
 
@@ -367,7 +386,8 @@ def wallet_bind(req: BindReq, request: Request):
     # 409 like the pre-insert checks do, not a 500 stack trace.
     try:
         binding = store.create_binding(
-            iid, req.chain, req.address, req.nonce, req.signature, message, COOLING_HOURS
+            iid, req.chain, req.address, req.nonce, req.signature, message,
+            COOLING_HOURS, proof_method=issued_via,
         )
     except store.BindingConflict as e:
         raise HTTPException(409, str(e))
@@ -389,13 +409,17 @@ def api_registry():
 def api_me(request: Request):
     iid = request.session.get("identity_id")
     if not iid:
+        # public_origin lets the frontend detect a PUBLIC_URL misconfiguration
+        # (browser origin != where the OIDC redirect will land) and show a
+        # clear notice instead of a silent half-login.
         return {"authenticated": False, "cooling_hours": COOLING_HOURS,
-                "dev": DEV_MODE}
+                "dev": DEV_MODE, "demo": DEMO_MODE, "public_origin": PUBLIC}
     store.promote_due(iid)
     ident = store.get_identity(iid)
     return {
         "authenticated": True,
         "dev": DEV_MODE,
+        "demo": DEMO_MODE,
         "identity": {
             "id": ident["id"],
             "display_name": ident["display_name"],
@@ -483,10 +507,12 @@ if DEV_MODE:
             raise HTTPException(400, "unsupported chain")
 
         nonce = secrets.token_urlsafe(16)
-        issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        message = vf.build_message(req.chain, address, nonce, issued_at,
+        t = datetime.now(timezone.utc).replace(microsecond=0)
+        message = vf.build_message(req.chain, address, nonce, t.isoformat(),
+                                   (t + timedelta(seconds=NONCE_TTL)).isoformat(),
                                    ident["display_name"])
-        store.issue_nonce(nonce, address, req.chain, message, NONCE_TTL)
+        store.issue_nonce(nonce, address, req.chain, message, NONCE_TTL,
+                          issued_via="dev-test-key")
 
         if req.chain == "evm":
             signature = Account.sign_message(
@@ -499,12 +525,63 @@ if DEV_MODE:
                 "message": message, "signature": signature}
 
 
-# The UI lives in frontend/ (React + Vite) and is served by Vite in dev. This
-# process is API-only; the root exists so a human landing here is redirected
-# to the right place instead of a 404.
-@app.get("/")
-def index():
-    return {"service": "fayda-wallet-registry API", "ui": PUBLIC}
+# The Privy app id is a public identifier, not a secret, and making it a
+# runtime env var (instead of a Vite build-time constant) means a deploy can
+# set or rotate it without rebuilding the bundle. Served before the SPA loads.
+PRIVY_APP_ID = os.getenv("PRIVY_APP_ID", "")
+
+
+@app.get("/config.js")
+def config_js():
+    return Response(
+        f"window.__PRIVY_APP_ID = {json.dumps(PRIVY_APP_ID)};",
+        media_type="application/javascript",
+    )
+
+
+# ---------------------------------------------------------------- SPA serving
+#
+# In dev, Vite serves the UI and proxies to this process. Outside dev, THIS
+# process serves the built SPA from frontend/dist — one origin, one service,
+# so the cookie/OIDC flow is identical to dev. Route order is the guarantee
+# that no API route is shadowed: everything above registered first, and the
+# catch-all below is registered last, so it only sees requests nothing else
+# claimed.
+DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+SERVE_SPA = not DEV_MODE and (DIST / "index.html").is_file()
+
+if SERVE_SPA:
+    app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
+
+    @app.get("/")
+    def index():
+        return FileResponse(DIST / "index.html")
+
+    # All methods, so an unmatched POST (e.g. /api/dev/* when not in dev)
+    # gets the same clean 404 it had before the SPA existed — a GET-only
+    # catch-all would turn those into 405s and leak route-shape information.
+    @app.api_route("/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
+    def spa(path: str, request: Request):
+        # API namespaces never fall through to HTML: an unknown /api path is
+        # a 404, not a 200 page that confuses every client.
+        if request.method not in ("GET", "HEAD"):
+            raise HTTPException(404, "not found")
+        # authorize belongs to the IdP: when the mock is mounted its routes
+        # win by registration order; when it is not, the path must 404 like
+        # any other absent IdP — never render the SPA shell there.
+        if path.split("/", 1)[0] in ("api", "v1", "assets", "authorize"):
+            raise HTTPException(404, "not found")
+        # Real files from dist (favicons etc.), with the resolved path pinned
+        # inside DIST so ../ traversal cannot escape it.
+        f = (DIST / path).resolve()
+        if path and f.is_file() and f.is_relative_to(DIST.resolve()):
+            return FileResponse(f)
+        return FileResponse(DIST / "index.html")
+else:
+
+    @app.get("/")
+    def index():
+        return {"service": "fayda-wallet-registry API", "ui": PUBLIC}
 
 
 if __name__ == "__main__":

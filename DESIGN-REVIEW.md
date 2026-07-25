@@ -1,250 +1,294 @@
 # Design review — Fayda wallet registry frontend
 
-Method: rendered states in `screenshots/` diffed against the visual language in
-`frontend/src/tokens.css` and CLAUDE.md. Two-pass process; this is pass one.
-Report only — no files changed except this one.
+Method: rendered every state (desktop + 380px, light + dark) into `screenshots/`
+and diffed against `DESIGN.md` / `PRODUCT.md` and the token source
+`frontend/src/styles/tokens.css`. Contrast is computed from the OKLCH tokens
+that produce the pixels (not eyedropped from compressed PNGs) — see
+`scratchpad/contrast.py` / `hex.py`. Report only; no files changed except this
+one. Privy connect-modal states are not capturable (no app id) — noted as a gap,
+not reviewed blind.
+
+This file reviews the **rebuilt** React + Vite + Tailwind 4 frontend (Source
+Serif 4 / Public Sans / Spline Sans Mono, one green-teal accent). The prior
+contents reviewed the deleted vanilla-JS frontend and have been replaced.
 
 ---
 
-## 2026-07-24
+## 2026-07-24 — pass one
 
-Reviewed all seven states at desktop and 380px. The frontend is deliberately
-authored, not defaulted — the findings below are drift and edge-case breakage,
-not a rebuild. Grouped by severity.
-
-### Pass 2 — verification (2026-07-24)
-
-Close-out of the two-pass process. Re-rendered every state (desktop + 380px) in
-`screenshots/` and read the code where a screenshot cannot show the change
-(focus ring, keyboard copy, token wiring). All ten pass-one findings land.
-Privy modal states stay uncapturable (no app id) — unchanged, pre-noted gap.
-
-| # | Finding | Status | Evidence |
-|---|---|---|---|
-| 1 | Contradictory success banner on error | **Resolved** | `App.jsx` `run()` 37–38 now `setErr(''); setOk('')`. `07-error.png` + `07-error-380px.png` show the red banner alone — no stacked green. |
-| 2 | History table clips ACTIVATES at 380px | **Resolved** | `app.css` 223–238 `@media(max-width:420px)` stacks `.stacking-table` to label/value blocks via `td::before { content: attr(data-label) }`; `components.jsx` 224/231–235 supply `data-label`. `07-error-380px.png` shows CHAIN/ADDRESS/STATUS/REQUESTED/ACTIVATES as full rows, activation time intact. |
-| 3 | Amber/red pill text sub-AA | **Resolved** | `tokens.css` 26–27 `--amber-ink #8A5A02`, `--red-ink #A32A20`; `app.css` 124/126 `.p-pending`/`.p-cancelled` consume them. `--amber`/`--red` retained for borders on paper. COOLING + PENDING pills in `07-error.png` read as dark amber, ≈4.9:1. |
-| 4 | IdP dark page two sub-AA tiers | **Resolved** | `mock_esignet.py` 184 `.pmeta #8B95A3`, 186 `.foot #7E8794`. `02-biometric-prompt.png`: FIN/region/status line and MOCK PROVIDER footer both legible on the dark ground. |
-| 5 | Addresses not keyboard-operable | **Resolved** | `components.jsx` 21–39 `CopyValue` is a `<button>` — reachable by Tab, copies on Enter/Space via `navigator.clipboard`, `aria-live` "copied" feedback (94–102), shares `button:focus-visible` ring (`app.css` 57), keeps `user-select:all` for mouse/touch. Used for every address (57, 109, 122, 153). |
-| 6 | Inline style literals off the token scale | **Resolved (one residual)** | 14 of 15 literals migrated to `.stack`/`.stack-sm`/`.divider`/`.chain-name`/`.wallet-select`/`.cell-addr` (`app.css` 206–218); `App.jsx` carries none. **Residual:** `components.jsx:76` still `style={{ marginBottom: 0 }}`. Current: inline literal. Replacement: a `.flush-b { margin-bottom: 0 }` utility (mirrors `.flush`) on that `<p>`. Cosmetic, not a regression. |
-| 7 | Disabled Reset shows pale-red signed out | **Resolved** | `App.jsx` 183 gates on `me.dev && me.authenticated`. `01-signed-out.png` shows Refresh only — no pink control. |
-| 8 | Colour/elevation literals outside tokens | **Resolved** | `tokens.css` 28–30 add `--err-ink #7A2119`, `--ok-ink #12563A`, `--card #FFFFFF`; `app.css` `.card` (70), `.err` (163), `.ok` (172) reference them. No bare hexes left in those rules. |
-| 9 | `<select>` outside focus-visible rule | **Resolved** | `app.css` 57 selector now includes `select:focus-visible` → 2px blue ring, matching buttons/links. |
-| 10 | Capture glyph reads as wifi | **Resolved** | `mock_esignet.py` 198–204 redrawn as six nested ridge-loop paths around a core; `02-biometric-prompt.png` reads as a fingerprint. The amber dashed line (206) now scans across the ridges rather than radiating — reinforces the SIMULATED CAPTURE label. |
-
-No regressions introduced by any fix. The `.addr` button inherits the global
-`button` reset but is explicitly stripped back (`app.css` 76–92: no border,
-no padding, `background:none`, `cursor:copy`) so it renders identically to the
-prior `<div>` while gaining focus and keyboard copy — verified against
-`05-one-bound.png` and `07-error.png`.
+Seven states at two widths and two themes. The build is authored, not defaulted:
+serif 300/700 masthead split, mono for every machine value, a strict semantic
+accent, a guilloché band, ruled ledgers that stack at 380px. Findings below are
+one real breakage plus colour-discipline drift — not a rebuild. Grouped by
+severity.
 
 ### HIGH
 
-**1. Error state shows a contradictory success banner stacked on the error.**
-Screenshot: `07-error.png` (top of page). The red `proof of control failed:
-signature does not match address` sits directly above a green `Replacement
-accepted. Activates in 72h`. The two statements contradict each other and both
-claim to describe the last action.
-- Cause: `App.jsx` `run()` (lines 34–46) clears `setErr('')` at line 35 on every
-  action but never clears `ok`. A stale success from a prior action survives into
-  the next action's failure. `ok` only clears on its 6s timeout (lines 28–32).
-- Current: `run()` starts with `setErr(''); setBusy(true)`.
-- Replacement: add `setOk('')` alongside `setErr('')` at the top of `run()` so a
-  new action clears both banners before it resolves. This is the one state the
-  brief explicitly asked to see, and it currently reads as two mutually exclusive
-  outcomes at once.
+**1. The attestation signing message is scroll-trapped and clips at 380px.**
+Screenshots: `04-attestation-380px.png`, `07-error-380px.png` — both end the
+message box at `URI: http://127.0.0.1:8000`; **Chain**, **Nonce** and **Issued
+At** are cut off below the fold. On desktop (`04-attestation.png`) the full
+message fits, so the bug only bites the mobile-first user the product is built
+for.
+- Offending line: `frontend/src/components/AttestationDialog.jsx:32`
+- Current: `<pre className="mt-4 max-h-[36vh] overflow-y-auto whitespace-pre-wrap rounded-doc border border-rule bg-surface px-4 py-3 font-mono text-[0.75rem] leading-relaxed">`
+- Replacement: drop `max-h-[36vh] overflow-y-auto` →
+  `<pre className="mt-4 whitespace-pre-wrap rounded-doc border border-rule bg-surface px-4 py-3 font-mono text-[0.75rem] leading-relaxed">`.
+  The dialog container already scrolls as one unit
+  (`dialog.jsx:18`, `max-h-[88vh] overflow-y-auto`), so the whole message renders
+  and the user scrolls the dialog — never a hidden inner box.
+- Why HIGH: this is the one screen where the user authorises something with a
+  key. The clipped lines are the anti-replay **Nonce** and the **Issued At** that
+  back the "single-use and expires in five minutes" promise printed directly
+  below the box. The consent copy claims properties the user cannot see on a
+  phone. `DESIGN.md` / the review brief both state the message must be "never
+  truncated, never scroll-trapped."
 
 ### MEDIUM
 
-**2. Binding-history table clips its most important column at 380px.**
-Screenshots: `06-pending-cooling-380px.png`, `07-error-380px.png`,
-`05-one-bound-380px.png` (BINDING HISTORY block). The 5-column table overflows
-the viewport; the `ACTIVATES` header renders as `ACTIV` and the activation
-timestamp (`Jul 27, 02:53 PM`) is sliced off at the container's right edge. For a
-pending/cooling binding, *when the replacement goes live* is the single datum a
-user is on this screen to read, and it is the one being cut.
-- Cause: `app.css` line 178 `.table-card { padding: 0; overflow: auto; }` — the
-  table (`components.jsx` HistoryTable, lines 198–221) scrolls horizontally but
-  gives no scroll affordance and truncates silently, and the mono address column
-  wraps to ~6 lines which crowds the row further.
-- Current: fixed 5-column table at all widths.
-- Replacement: at `≤420px` render each binding as a stacked label/value block
-  (Chain, Address, Status, Requested, Activates as rows) instead of a horizontal
-  table — matching the `.label` + `.value` pattern already used in ChainCard. The
-  Registry table (3 columns) survives 380px; History (5 columns) does not.
-
-**3. Amber status pill text fails WCAG AA.**
-Screenshots: `06-pending-cooling.png` (COOLING pill), `07-error.png` (PENDING
-pill). `--amber #B07203` on `--amber-bg #FBF0DC` at 10.5px measures ≈3.5:1;
-AA requires 4.5:1 for text this size. `--red #C13B2F` on `--red-bg #F7E4E2` is
-also borderline at ≈4.3:1. Green passes (≈4.5:1).
-- Current: `app.css` lines 101/103; tokens `--amber #B07203`, `--red #C13B2F`.
-- Replacement: darken the pill *foreground* tokens for the pill context only —
-  amber to ~`#8A5A02` (raises to ≈4.9:1 on the same bg) and red to ~`#A5302610`…
-  i.e. ~`#A32A20` (≈5.2:1). Keep the `--amber`/`--red` tokens as-is for borders
-  and left-rules where they sit on paper and already pass; add
-  `--amber-ink`/`--red-ink` for on-tint text. Status colour is load-bearing here,
-  so it has to clear AA, not sit under it.
-
-**4. IdP dark page has two sub-AA text tiers.**
-Screenshot: `02-biometric-prompt.png`. `mock_esignet.py`:
-- line 186–187 `.foot` `#5C6673` on `#12161C` ≈3.1:1 — the `MOCK PROVIDER — not
-  connected…` footer is barely legible. Raise to ~`#7E8794` (≈4.6:1).
-- line 184 `.pmeta` `#7E8794` on the `#1B212A` card ≈4.2:1 — the `FIN … · region
-  · status` line is just under AA on the cards. Raise to ~`#8B95A3` (≈4.9:1).
-These are the resident metadata and provenance line; both should clear 4.5:1.
-
-**5. Addresses are mouse/touch-selectable but not keyboard-operable.**
-Screenshots: every signed-in state (blue `.addr` rows). `.addr` uses
-`user-select: all` (`app.css` lines 73–79), so a mouse drag or mobile long-press
-copies the full string — good — but the element is a non-focusable `<div>`, so a
-keyboard-only desktop user cannot reach or copy it. The brief requires full
-keyboard operation *and* that addresses be copyable.
-- Current: `<div className="addr">…</div>`, no tabindex, no copy control.
-- Replacement: render each address as a copy affordance — a `<button>`-wrapped or
-  focusable element with an explicit copy action and the existing
-  `:focus-visible` outline — rather than a select-all div. Addresses are never
-  truncated (good), so this is purely the keyboard/copy gap.
-
-**6. Inline style literals scatter design values off the token scale.**
-`components.jsx` carries ~15 inline `style={{…}}` numbers — `marginTop: 15`
-(line 31), `fontWeight: 700` (line 76), `marginTop: 13` (83), `marginTop: 7`
-(86, 99), `marginTop: 11` (89), `marginTop: 15, paddingTop: 14, borderTop`
-(92–93), `fontSize: 12` (123), `maxWidth: 260` (209), `maxWidth: 230/230`
-(234–235), plus `App.jsx` line 129 `marginTop: 0`. The values 15/13/11/7 are off
-the `--space-*` scale (4/8/14/22/44) and `700`/`12` duplicate token values. The
-brief bans inline styles competing with the stylesheet and values scattered as
-literals — this is exactly that drift.
-- Replacement: move these to classes in `app.css` referencing `--space-*` /
-  `--strong-weight` / `--data-size`. `fontWeight: 700` on the chain label
-  (line 76) should be a class, not an inline literal that bypasses the token.
+**2. A pending replacement is confirmed in the active/verification accent.**
+Screenshot: `06-cooling.png` (top banner, green) vs the `COOLING` pill (amber) on
+the same screen. The success banner "Replacement recorded. It activates in 72
+hours — your current wallet stays active until then." reports a **pending**
+outcome but renders in green — the accent `DESIGN.md` reserves for
+identity/verification/**active**. Banner colour contradicts the badge colour for
+the same state.
+- Offending lines: `frontend/src/App.jsx:178` (`{ok && <Alert tone="success">}`
+  for every success) and the message set at `App.jsx:144`.
+- Current: one `ok` string → always `tone="success"` (verify green).
+- Replacement: carry a tone with the message (e.g. `setOk({ msg, tone })`), keep
+  "Wallet bound … active" (`App.jsx:143`) as `tone="success"`, and give
+  "Replacement recorded … activates in Nh" (`App.jsx:144`) `tone="warning"`
+  (cooling amber). Aligns the banner with the pending semantic and keeps green
+  exclusive to active — the accent's whole discipline.
 
 ### LOW
 
-**7. Disabled "Reset everything" renders as pale red on the signed-out screen.**
-Screenshot: `01-signed-out.png` (bottom). It is the only colour on an otherwise
-ink-on-paper screen and, faded to `.35` opacity in destructive red, reads like a
-soft error rather than a disabled dev control.
-- Current: `App.jsx` 180–187 renders the dev reset whenever `me.dev`, disabled
-  when `!me.authenticated`.
-- Replacement: gate it on `me.dev && me.authenticated` so it is absent, not
-  disabled-pink, before sign-in.
+**3. The `--faint` em-dash placeholder is below AA in light theme.**
+Screenshot: `03-identity-record.png` (PUBLIC REGISTRY, Solana `—`). `--faint
+oklch(0.62 0.012 250)` on paper measures **3.38:1** (dark 4.19:1) — under the
+4.5:1 text minimum. Only the "no wallet bound" dash uses it (`Ledgers.jsx:51,54`),
+so impact is small, but it is rendered text.
+- Current: `--faint: oklch(0.62 0.012 250)` (tokens.css:17).
+- Replacement: darken to ~`oklch(0.55 0.014 250)` (≈4.6:1 on paper), or render the
+  dash at `--muted`; reserve `--faint` for non-text rules only.
 
-**8. Colour and elevation literals live outside tokens.**
-`app.css`: `.card { background: #fff }` (line 70 — pure white cards sit on
-`--paper #FBFBF9`; the 1-step lift is intentional but the value is a literal),
-`.err` text `#7A2119` (line 140), `.ok` text `#12563A` (line 149). CLAUDE.md
-points at `tokens.css` as the single source; these three, plus the magic spacing
-from finding 6, should be migrated in as `--card`, `--err-ink`, `--ok-ink`.
+**4. The guilloché masthead band is drawn in the reserved accent.**
+Screenshot: every state, the teal band under the masthead. `RecordHeader.jsx:47`
+wraps `<Guilloche/>` in `text-verify`. `DESIGN.md` spends the accent "exclusively
+[on] identity, verification and active state … if it appears on anything else, it
+is a bug," and the band is a decorative security-print texture, not a state.
+- Current: `<div className="mt-5 text-verify"><Guilloche/></div>`.
+- Replacement (if strict): `text-rule-strong` or `text-ink/30`. Keep `text-verify`
+  only if the band is explicitly accepted as an authenticity/verification mark —
+  in which case record that exception in `DESIGN.md` so it is not re-flagged.
+  Borderline; author's call.
 
-**9. `<select>` and `<details>` fall outside the focus-visible rule.**
-`app.css` line 57 scopes `:focus-visible` to `button, a, summary`. The wallet
-picker `<select>` (`components.jsx` 119–128) and the claims `<details>` get only
-the browser default ring. Add `select` (and rely on `summary` for details) to the
-focus-visible selector for a consistent 2px blue outline.
+**5. The Privy connect modal theme is hardcoded light.**
+Not capturable (no app id) — flagged from code. `wallet/index.jsx:44` sets
+`appearance: { walletChainType: 'ethereum-only', theme: 'light' }`. In dark mode
+the wallet-connect modal would render light — a visible seam mid-flow.
+- Current: `theme: 'light'`.
+- Replacement: derive from `document.documentElement.dataset.theme` at mount/connect
+  so the modal follows the app theme.
 
-**10. The simulated-capture glyph reads as a wifi/broadcast icon.**
-Screenshot: `02-biometric-prompt.png`. The SVG (`mock_esignet.py` ~line 196–204)
-next to `SIMULATED CAPTURE — NO SENSOR READ` is arcs + a dashed line — ambiguous
-between a fingerprint and a signal icon. The amber label carries the meaning; the
-glyph does not reinforce it. Minor — a fingerprint-ridge or face silhouette would
-tie the icon to the copy.
+Cosmetic, not numbered: at 380px "Sign out" wraps to an orphaned line between the
+identity `<dl>` and the REGISTRY SERIAL rule (`05-one-bound-380px.png`,
+`06-cooling-380px.png`) — legible and reachable, just loosely placed. The
+Ethereum "NOT BOUND" card carries a tall void because the grid matches the taller
+Solana card (`03-identity-record.png`) — normal equal-height grid behaviour.
+
+---
+
+## 2026-07-24 — pass two (verification close-out)
+
+Fresh screenshots at both widths and themes re-shot after the fixes. Each applied
+change was checked in the render, or in code where the change is not visual (Privy
+modal, ARIA, provenance flags). This is the second and final pass of the two-pass
+process — no new subjective threads opened; only landed / not-landed and
+regressions. **Every applied item landed. No regression found. No open finding
+remains.**
+
+### Pass-one findings — all closed
+
+- **Finding 1 (HIGH) — signing message clipped at 380px → RESOLVED.**
+  `AttestationDialog.jsx:38` now reads `mt-4 whitespace-pre-wrap break-words …` —
+  `max-h-[36vh] overflow-y-auto` gone. `04-attestation-380px.png` renders the whole
+  message: the full EVM address on its own wrapped line, then **Chain**, **Nonce**,
+  **Issued At** and the new **Expiration Time** all above the fold; the dialog
+  scrolls as one unit, no inner box. Verified again on `06-cooling-380px.png` and
+  `07-error.png`.
+- **Finding 2 (MEDIUM) — pending outcome shown in the active accent → RESOLVED.**
+  `setOk` now carries a tone (`App.jsx:79,102`). `06-cooling.png`: "Replacement
+  recorded for Ethereum. It activates in 72 hours …" renders on the cooling-amber
+  banner (`tone="warning"`, `App.jsx:155`), matching the `COOLING` pill on the same
+  screen. `05-one-bound.png`: "Wallet bound. It is now your verified Ethereum
+  wallet." stays verify-green (`tone="success"`, `App.jsx:154`). Both name the
+  chain. Green is again exclusive to active.
+- **Finding 3 (LOW) — sub-AA `--faint` em-dash → RESOLVED.** `--faint` darkened to
+  `oklch(0.55 0.014 250)` (`tokens.css:17`) and the registry placeholder dash moved
+  to `text-muted` (`Ledgers.jsx:62,64`, `--muted oklch(0.48 0.014 250)`, ≈5.7:1 on
+  paper). `--faint` is now referenced by no text node at all (grep of `src/`), so
+  the sub-AA path is gone twice over. Visible as the muted Solana `—` in
+  `05-one-bound.png`.
+- **Finding 4 (LOW) — guilloché in the reserved accent → RESOLVED by documented
+  exception.** The author's-call option was taken: `RecordHeader.jsx:47` keeps
+  `text-verify`, and `DESIGN.md:39–41` now records the guilloché as "the
+  issued-document mark … the one non-state use the accent is permitted." Recorded,
+  so it is not re-flagged.
+- **Finding 5 (LOW) — Privy modal hardcoded light → RESOLVED (code).**
+  `wallet/index.jsx:46` derives `theme` from
+  `document.documentElement.dataset.theme` at provider mount. Not screenshot-able
+  without an app id; the light-theme literal is gone.
+
+### Other applied changes — landed
+
+- **Signed message rebuilt (`backend/verify.py:30–57`) → landed.** Origins derive
+  from `PUBLIC_URL` (`URI`/`DOMAIN`), so the message reads `localhost:5173` — the
+  address bar, not `127.0.0.1:8000`. Confirmed in `04-attestation.png` /
+  `06-cooling-380px.png`. Sentence-boundary line breaks, the "This binding will be
+  listed in the public registry." consequence line, and the "Expiration Time" line
+  are all present in the render.
+- **Dialog copy / interaction (`AttestationDialog.jsx`) → landed.** Reassurance
+  bullets merged to three, the public-record consent bullet added (`:44`);
+  test-key description is conditional (`:33–35`); the error alert carries recovery
+  guidance (`:62–71`) — seen in `07-error.png` ("… request a fresh one and try
+  again."); the dead test-key path offers **Get a fresh message and retry**
+  (`:74–77`, visible in `07-error.png`) instead of a dead loop; **Cancel** is
+  disabled only while `binding`, operable during `signature-pending` (`:93`).
+- **Smaller items → landed.** residenceStatus renders in default ink not accent
+  (`IdentityRecord.jsx:32`; `05-one-bound.png`); ledger + card say "cooling" not
+  "pending" (`Ledgers.jsx:29`, `ChainRecord.jsx:67`); test-key bindings carry a
+  server-recorded "test key" marker (`Ledgers.jsx:21–23` on `proof_method ===
+  'dev-test-key'`); `fmt` includes the year (`ChainRecord.jsx:16`; "Jul 24, 2026,
+  05:13 PM"); cooling shows "— in about N hours" (`ChainRecord.jsx:72`;
+  `06-cooling.png`); theme toggle labels the destination "Dark theme" / "Light
+  theme" (`RecordHeader.jsx:35`; `05-one-bound-dark.png` reads "LIGHT THEME"); chain
+  titles are `h3` (`ChainRecord.jsx:107,178`); the multi-wallet `select` uses
+  `border-rule-strong` (`ChainRecord.jsx:128`); `CopyValue` has a persistent
+  `aria-live` region and per-value `aria-label` (`CopyValue.jsx:19,30`); wipe and
+  skip-cooling are single-element two-step arms (`App.jsx:49–70`,
+  `ChainRecord.jsx:29–50`); the skeleton carries an sr-only status
+  (`App.jsx:35`); the mobile ledger `thead` is sr-only (`clip-path`) not
+  `display:none`, keeping the header in the a11y tree while the body stacks
+  (`app.css:110–119`); bind labels are "Bind this wallet" / "Bind a throwaway test
+  key (dev)" with the test-key button as the `outline` variant
+  (`ChainRecord.jsx:146,155–157`; `05-one-bound.png`).
+
+### Not resolved / regressions
+
+None. No applied item failed to land, and diffing the fresh screenshots against
+pass one surfaced no regression in type, colour, spacing, hierarchy or state
+legibility.
+
+### Banned-pattern re-scan (REBUILD.md "Look" ban list) — clean
+
+- **No purple/violet, no gradient, no glassmorphism/blur.** `grep` for
+  `gradient|backdrop-blur|blur(` over `src/` returns nothing; the accent is the
+  single green-teal (`--verify`), status is amber/red only.
+- **No Inter/Roboto/system as a display face.** Source Serif 4 (display),
+  Public Sans (UI), Spline Sans Mono (machine) load from `index.html:9`; the
+  masthead 300/700 split renders in every state. The mock IdP's IBM Plex is a
+  deliberate separate-party face (`02-biometric-prompt.png`), not the registry's.
+- **No neon, mascot, marketing hero, pill-everything.** The signed-out state is a
+  numbered ledger card, not a hero (`01-signed-out.png`).
+- **Tinted OKLCH neutrals, never #000/#666.** All neutrals are OKLCH with small
+  chroma on hue 95/250 (`tokens.css`); dark ground is `oklch(0.205 …)`, not pure
+  black (`05-one-bound-dark.png`).
+- **One accent, on identity/verification/active only.** Guilloché is the recorded
+  exception (Finding 4).
+- **Dark + light, AA, 380px, weight 300/700, ~3× size steps, mono for every
+  machine value** — all still hold (see verified-good).
 
 ---
 
 ### Verified good — checked and correct, do not re-plough
 
-*(Pass 2 additions, now confirmed correct and not to be re-ploughed:)*
-
-- **Token file is now the single source.** `tokens.css` carries all colour,
-  type, and spacing values including the pass-one additions (`--amber-ink`,
-  `--red-ink`, `--err-ink`, `--ok-ink`, `--card`). `app.css` references them; no
-  bare hex or off-scale spacing literal survives except the one noted in finding
-  6. The "extract into a tokens file" note from pass one is **done** — CLAUDE.md
-  already points here.
-- **Address copy affordance.** `CopyValue` is one composed component reused for
-  every address/hash — no copy-paste variants — with focus ring, keyboard copy,
-  and transient "copied" confirmation. Truncation-without-copy is gone; addresses
-  remain full-length and selectable.
-- **Responsive history.** The 5-column table degrades to stacked blocks below
-  420px instead of clipping; the 3-column registry table survives unchanged. The
-  one datum the cooling screen exists to show (ACTIVATES) is legible at 380px.
-- **Focus coverage.** `button, a, summary, select` all carry the 2px blue
-  `:focus-visible` ring; `<details>` is covered via `summary`. Every interactive
-  element is reachable and visibly focusable.
-- **Error state is now unambiguous.** A failed action clears any prior success
-  before resolving, so `07-error.png` shows exactly one banner describing the
-  last action.
-
----
-
-### Verified good — from pass one, unchanged
-
-- **Type system.** IBM Plex Sans / Mono split is consistent and semantic: every
-  hash, address, FIN, nonce, timestamp and figure is mono; prose is sans. The h1
-  weight contrast is real (200 hairline `Fayda identity →` against 700
-  `wallet registry`) at 34px — an extreme jump, not a 400/600 hedge. h2 section
-  rules are mono uppercase over a 2px ink border. This is an authored scale.
-- **Palette discipline.** Ink `#12161C` on paper `#FBFBF9`, tinted neutrals
-  (`--muted #5C6169`, not `#666`; no pure `#000`). Blue `#1F4E79` reserved for
-  addresses/identity. One dominant, one accent. No purple/violet anywhere.
-- **No template tells.** No hero section, no gradient depth, no rounded icon above
-  a heading, no bounce/elastic motion, no cards nested inside cards (one level of
-  containment throughout).
-- **State distinguishable without colour.** Every pill carries a text label
-  (Active / Cooling / Pending / Not bound / Archived / Cancelled) in addition to
-  its tint, so status survives greyscale. History rows echo the same labels.
-- **Signing message.** `04-signing-panel.png`: full server message shown in
-  `.msgbox` with `white-space: pre-wrap`, no `max-height`, no scroll trap — the
-  user can read the entire thing they are authorising. Exactly per spec.
-- **Addresses not truncated.** Shown in full with `word-break: break-all`
-  everywhere; `user-select: all` makes them mouse/touch-copyable (keyboard gap
-  noted in finding 5).
-- **`prefers-reduced-motion`** honoured (`app.css` 180–182); the only transitions
-  are 0.12s opacity/border, no motion to suppress beyond that.
-- **Muted body text** `#5C6169` on white ≈6.2:1 and green pill ≈4.5:1 both clear
-  AA.
-- **IdP page reads as a separate party.** `02-biometric-prompt.png`: the dark
-  `#12161C` theme, `FAYDA · ESIGNET · NATIONAL ID` eyebrow and
-  `Biometric verification — simulated` framing read as the national IdP, distinct
-  from the paper-white registry, and the amber `SIMULATED CAPTURE — NO SENSOR
-  READ` card plus `MOCK PROVIDER — not connected to the national register` footer
-  keep it honest without reading as a toy. (The persona descriptions such as
-  "Second identity, for testing the sybil constraint" expose seed intent, but
-  that is acceptable for an internal PoC.)
+- **Type system.** Source Serif 4 300 vs 700 split renders in the masthead
+  ("One verified person," 300 / "one wallet." 700, `RecordHeader.jsx:38–41`);
+  Public Sans for prose; Spline Sans Mono for every address, HMAC, nonce,
+  timestamp and figure. Display 36px → label 11px is ~3.3×. No Inter/Roboto/
+  system as a display face.
+- **Accent discipline.** Green-teal appears only on: identity header band +
+  `FAYDA VERIFIED` badge, HMAC serial, residence-status value, active wallet
+  address + `ACTIVE SINCE` + `Active` badge, and the primary verify CTA. Residence
+  status is coloured uniformly (never branched — `IdentityRecord.jsx:32`), so it
+  reads as an identity field, not a "citizen = good" stamp. No purple/violet
+  anywhere.
+- **Contrast (computed from tokens, both themes).** Every text-on-tint pair clears
+  AA: body/muted 5.7–15.3 (light) / 6.6–14.6 (dark); active/pending/cancelled
+  badges 6.65–8.84; primary button label (paper on verify) 6.33 / 7.56. Mock IdP
+  page grays ≥4.99. The one pass-one exception (`--faint` em-dash) is closed —
+  the dash now renders at `--muted` (≈5.7:1) and `--faint` is used by no text
+  (pass-two finding 3). Every text node clears AA in both themes.
+- **Destructive action confirmed.** `WipeButton` (`App.jsx:44–61`) is a two-step
+  arm/confirm ("Wipe registry (dev)" → "Confirm: erase every identity and
+  binding" + "Keep everything"). No single-click destroy.
+- **Signing consent.** The dialog states what the signature does and cannot do
+  ("proves you control this wallet … moves no funds and grants no spending
+  permission … single-use and expires in five minutes"), plus the
+  server-verifies-its-own-copy note and the live "wallet account changed"
+  staleness block (`AttestationDialog.jsx:54–71`), plus the public-record consent
+  bullet and origin-matched `PUBLIC_URL` message. The full message — address,
+  Chain, Nonce, Issued At, Expiration Time — now renders at 380px as well as
+  desktop (pass-two finding 1 closed); no inner scroll box on any width.
+- **Copy affordance.** `CopyValue` is a real `<button>` — keyboard-reachable,
+  copies on Enter/Space, transient "copied" feedback, shares the global focus
+  ring, keeps `user-select:all`. Used for every address, HMAC and connected-wallet
+  value. No truncation-without-copy.
+- **Focus + motion.** Global `:focus-visible` = 2px `--verify` ring on all
+  interactives incl. `<select>`, `<summary>`, theme toggle (`app.css:44`).
+  `prefers-reduced-motion` kills all animation/transition (`app.css:49`); the one
+  authored motion is `attest-rise`, an exponential ease-out (`cubic-bezier(0.16,1,
+  0.3,1)`), not bounce/elastic.
+- **State coverage.** Loading (`Skeleton`), empty (registry/history/not-bound),
+  error (`BackendDown`, `OriginMismatch`, in-dialog signature failure, danger
+  alert — no raw dumps), missing-config (`SetupConnector`), disconnected/stale
+  (staleness guard), cooling, and an honest Solana-disabled state
+  (`SOLANA_WALLETS_ENABLED = false`, explicit copy, never faked).
+- **State distinguishable without colour.** Backend emits exactly
+  `active/pending/archived/cancelled` (store.py:41); the badge handles all four
+  with a text label inside each, so status survives greyscale.
+- **380px.** Header wraps, `sm:grid-cols-2` collapses to one column, ledgers stack
+  to label/value blocks via `data-label` (`app.css:110–124`), addresses
+  `break-all`, no horizontal page scroll.
+- **Privy isolation.** Every `@privy-io` import is confined to `src/wallet/`;
+  embedded wallets off both chains; EIP-6963 discovery; swap seam intact.
+- **Containment.** One card level. Shaded sub-blocks (claims JSON, `.env` snippet,
+  the attestation message exhibit) are unbordered `bg-surface` regions, not nested
+  cards.
+- **Tokens.** Single source in `tokens.css`, mapped into Tailwind `@theme`; no
+  scattered hex; the only inline `style` is the Guilloché's dynamic SVG sizing
+  (`Guilloche.jsx:21`), which is legitimate.
+- **Mock IdP reads as a separate party.** `02-biometric-prompt.png`: IBM Plex on a
+  dark ground, `SIMULATED CAPTURE — NO SENSOR READ` disclosure, fingerprint glyph,
+  `MATCH` badges, `MOCK PROVIDER` footer — a formal handoff, not a toy.
 
 ---
 
 ### Note for next session
 
-`tokens.css` already exists and CLAUDE.md already points at it — good. Finish the
-job: the literals in findings 6 and 8 (inline spacing `15/13/11/7`, `#fff` card
-fill, `#7A2119`/`#12563A` banner ink, and the new `--amber-ink`/`--red-ink` from
-finding 3) should all land in `tokens.css` so the next pass starts from tokens
-and does not re-derive these by hand.
+The token file is already authoritative and wired to `CLAUDE.md`/`DESIGN.md`, so
+the close-out needed no new tokens file — the "extract values to one place"
+requirement is already satisfied and the next session starts from it, not from
+defaults. Of the pass-one deltas: `--faint` moved in `tokens.css` (finding 3);
+the message-tone distinction is `App.jsx` logic carried on `setOk`, not a token
+(finding 2); the guilloché stayed put and became a documented exception in
+`DESIGN.md` (finding 4). All landed in pass two; nothing is left for a third pass.
 
 ---
 
 ### Designed or generated?
 
-**Designed** — and after pass two, designed all the way down to the token file.
-The deciding detail is unchanged: the hairline-200 / bold-700 split in the h1
-paired with the strict rule that every cryptographic value renders in mono while
-prose stays sans — a template picks one weight and one family and calls it clean;
-this made a semantic choice and enforced it across seven states. Pass two
-confirms the discipline holds under stress: the on-tint ink tokens
-(`--amber-ink`/`--red-ink`) that keep status pills at AA are a distinction a
-generated UI never draws — it would tint the pill and move on. Both passes are
-now closed; no third pass warranted.
-
----
-
-### Close-out (Pass 2, 2026-07-24)
-
-Two-pass process complete. All ten pass-one findings resolved; one cosmetic
-residual (finding 6, `components.jsx:76` inline `marginBottom:0`) logged for the
-next incidental edit, not worth a dedicated pass. No regressions. The tokens
-file is authoritative and wired to CLAUDE.md — the next session starts from
-tokens, not defaults.
-</content>
-</invoke>
+**Designed** — and after pass two, without the one caveat. The deciding detail:
+the Source Serif 4 300/700 split in the masthead paired with the strictly enforced
+Public-Sans-prose / Spline-Mono-machine split across all seven states, and a
+semantic accent that appears only on identity, verification and active — never as
+decoration (the guilloché is now a colour the system explicitly claims in
+`DESIGN.md`, not an arguable leak). A generated template picks one weight, one
+family, and tints every status the same; this one drew those distinctions and held
+them under stress, down to on-tint ink tokens that keep every badge above AA and a
+success/pending banner that now takes its colour from the outcome it reports. The
+one real pass-one defect — the clipped signing message at 380px — is fixed: the
+mobile-first user now reads the full attestation, address and nonce included,
+before authorising anything. Close-out: this is designed, not generated.

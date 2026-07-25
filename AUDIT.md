@@ -5,7 +5,412 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
-## Diff review — 2026-07-24 (repo split: backend/ + React/Vite frontend, origin split BASE/PUBLIC)
+## Diff review — 2026-07-24 (Render/Docker deploy: Secure cookie, SPA catch-all, DEMO_MODE, /config.js)
+
+Scope: the uncommitted deploy deltas only — `backend/app.py` (Secure cookie on
+set+delete, DEMO_MODE, SPA static serving + catch-all, `/config.js`, origin
+derivation from `RENDER_EXTERNAL_URL`/`PORT`), `backend/verify.py` (env-derived
+URI/DOMAIN + `expires_at` message line), `backend/t.py` (tests 19/20),
+`frontend/vite.config.js`, `frontend/index.html`, `frontend/src/wallet/index.jsx`,
+and the new `Dockerfile`, `.dockerignore`, `render.yaml`, `DEPLOY.md`. Prior
+rounds cleared the crypto/binding/session core; I re-derived only these deltas
+and attacked each one live.
+
+Method: read every changed hunk and the four new files. Ran the suite on a fresh
+DB (`APP_ENV=dev python app.py` + `python t.py`): **ALL 20 CHECKS PASSED**. Stood
+up a production DEMO instance (`APP_ENV=production DEMO_MODE=1` + secrets, dist
+present) and a plain-production instance, then attacked: path traversal
+(`../`, `%2e%2e`, double-encoded, backslash, nested, against both the catch-all
+and the `/assets` mount), API-route shadowing, `Host`/`X-Forwarded-Host` header
+influence on origin derivation, `/config.js` injection, the full persona→cookie→
+`/api/me`→logout round trip (sid sent manually, since a Secure cookie won't ride
+an http jar), the secrets guard under DEMO_MODE, and the mock `/authorize`
+reflection. Killed :8000/:10000/:10001 and removed the test DB after.
+
+**Counts: 0 critical · 0 high · 1 medium (now RESOLVED) · 2 low.**
+
+### Medium — `render.yaml` ships `DEMO_MODE=1` by default, publishing the mock IdP's reflected XSS (and open redirect) to the public internet — **RESOLVED**
+
+**Resolution (re-verified 2026-07-24):** `backend/mock_esignet.py` now
+`html.escape(..., quote=True)`s all four reflected sinks — `redirect_uri`,
+`state`, `nonce` in the hidden-input attributes (`:151-155, :168-170`) and
+`scope` in the footer (`:244`) — and validates `redirect_uri` via
+`_valid_redirect` (`:103-118`) at BOTH the GET `/authorize` (`:154`) and the POST
+`/authorize/confirm` (`:254-256`) handlers, rejecting anything whose path is not
+exactly `/callback` or whose scheme is not `('', 'http', 'https')`. Re-verified
+empirically on a running instance, not just via the test: an XSS payload in
+`state`/`scope`/`redirect_uri` comes back with **0 live `<script>` and 5 escaped
+`&lt;script&gt;`**; `redirect_uri=https://evil.example.com/phish` → **400 at both
+handlers**; `javascript:alert(1)` → 400; `/callback/../evil` → 400. Full suite
+**21/21 on a fresh DB** (test 21 pins the escaping and the foreign-path
+rejection). The reflected-XSS surface is closed. Original finding retained below
+for the record.
+
+**Residual (low, inconsequential in the demo): the redirect check is
+path-only, so `https://evil.example.com/callback` and protocol-relative
+`//evil.example.com/callback` still validate** — I confirmed `authorize_confirm`
+303s the `code` to `https://evil.example.com/callback?code=...&state=...`. This is
+a restricted open redirect (target path must be exactly `/callback`), and it does
+**not** matter here: the leaked authorization `code` is unexchangeable without the
+`private_key_jwt` client assertion, which is signed with a server-held key
+generated at startup and never leaves the process, and the `code` maps only to a
+mock persona that anyone can select via `/login` anyway — so there is no code
+theft of value and no privilege gain, and there is no XSS (the redirect is a
+`Location` header, not reflected HTML). Worth one line only because a **real**
+Fayda deployment must match the full registered `redirect_uri` (host **and**
+path), not just the path — this mock's path-only check would be insufficient once
+the codes it mints have real value. Not a live break in the mock demo.
+
+### Medium — `render.yaml` ships `DEMO_MODE=1` by default, publishing the mock IdP's reflected XSS (and open redirect) to the public internet — original finding
+
+**Location:** `render.yaml:16-18` (`DEMO_MODE: "1"`), reflection at
+`backend/mock_esignet.py:139-142` (hidden-input `value="..."` for
+`redirect_uri`/`state`/`nonce`) and `:216-217` (`scope` into text); open redirect
+at `backend/mock_esignet.py:221-230` (`authorize_confirm` 303s to the
+client-supplied `redirect_uri`); mount gate at `backend/app.py:204-205`.
+**Confidence:** certain (reproduced live on the DEMO instance).
+**Invariant strained:** not a CLAUDE.md non-negotiable, but the deploy brief's
+"blast radius if it ships" — the mock is dev surface, and `DEMO_MODE` is exactly
+the switch that ships part of it.
+
+Prior rounds rated this mock `/authorize` reflected XSS a **dev-only Low**
+("cannot ship — the mock router mounts only under `DEV_MODE`"). This diff changes
+that premise. The mount is now `if DEV_MODE or DEMO_MODE` (`app.py:204`), and
+`render.yaml` sets `DEMO_MODE: "1"` as a committed default, so **every Blueprint
+deploy that follows `DEPLOY.md` serves the mock IdP on its real public HTTPS
+origin** — the same origin as the wallet-connecting SPA.
+
+Reproduced against the running DEMO instance (unauthenticated):
+
+```
+GET /authorize?client_id=fayda-wallet-demo&response_type=code
+    &redirect_uri="><script>alert(document.domain)</script>&state=x&nonce=n
+->  ...name="redirect_uri" value=""><script>alert(document.domain)</script>">
+```
+
+The injected `"><script>` breaks out of the attribute and executes same-origin.
+`client_id=fayda-wallet-demo` and `response_type=code` are the only gates
+(`mock_esignet.py:130-133`); both are the documented public defaults, visible in
+the `/login` redirect. So the link is attacker-craftable and needs no session.
+
+Blast radius, stated honestly, is what keeps this a medium not a high: the deploy
+is by explicit design a **throwaway mock demo** — the identities are shared public
+personas, the "FIN" is a mock constant (no real FIN ever reaches this origin), the
+session cookie is `HttpOnly` (the script cannot read it), the DB resets every
+redeploy, and `/api/dev/*` is *not* reachable in DEMO (confirmed — reset/
+fast-forward/test-wallet all 404, and the secrets guard still refuses to start
+without `SESSION_SECRET`/`FIN_PEPPER`). The realistic worst case is arbitrary JS
+in a visitor's browser on the genuine registry domain: phishing UI, driving the
+victim's own authenticated `/api/*` calls, or prompting the victim's connected
+wallet for an unexpected signature/transaction (user-gated by the wallet prompt;
+`personal_sign` proves control, it does not move funds). The paired open redirect
+(`authorize_confirm` → arbitrary `redirect_uri` with a valid `code`+`state`) is
+the same dev surface now public; the `code` maps only to a mock persona, so its
+value is low. **This becomes critical the instant the demo framing is copied
+toward a real login page or the origin is treated as more than a throwaway** —
+escape `redirect_uri`/`state`/`nonce`/`scope` before that ever happens. Fix
+direction (not applied): HTML-escape the reflected params in the mock authorize
+page regardless of gating; and if the public demo does not actually need the mock
+mounted, reconsider shipping `DEMO_MODE=1` by default.
+
+### Low — `.dockerignore` excludes only `frontend/.env.local`, not `backend/.env` or a root `.env`
+
+**Location:** `.dockerignore` (pattern list).
+**Confidence:** certain (dockerignore emulation) — but no such file exists today
+and the backend loads no dotenv, so it is latent, not live.
+`**/registry.db*` and `frontend/.env.local` are covered (verified: both are
+excluded from the build context, so `registry.db`/`.env.local` stay out of the
+image, as the brief requires). But a `backend/.env` or a repo-root `.env` would
+**not** be matched and would be copied in by `COPY backend/ backend/`. Today this
+is inert: no such file exists, and `app.py` reads secrets from real env vars
+(`os.getenv`), not a dotenv file, so even a stray `.env` would not be loaded.
+Flagging only as hardening — broaden to `**/.env*` (with `!frontend/.env.example`
+if that must ship) so a future `.env` cannot be baked into a layer. Not a bug in
+this diff.
+
+### Low/info — `/api/me` advertises `demo`, `dev`, and `public_origin` to unauthenticated callers
+
+**Location:** `backend/app.py:415-416`.
+The unauthenticated branch now returns `demo`, `dev`, and `public_origin`. This is
+intended: the SPA uses `public_origin` to detect a `PUBLIC_URL` misconfiguration
+and `demo`/`dev` to gate affordances. `public_origin` is deployment-controlled
+config (env-only — see verified-safe), `dev` is `false` in every production
+posture, and `demo` merely says "this is the mock-persona demo," which the login
+screen already announces. No security decision hinges on any of them. On record;
+not a bug.
+
+### Verified safe (actively attacked, held)
+
+- **Secure cookie, both paths, dev unchanged.** In a production posture the
+  `Set-Cookie` on the login-rotation set path (`app.py:182-184`) AND the logout
+  delete path (`app.py:188-192`) both carry `Secure`, alongside `HttpOnly`,
+  `SameSite=Lax`, `Max-Age=0` on delete. Verified end to end on the DEMO instance
+  with a manual sid: `/login` set → `Secure`; post-callback rotate → `Secure` and
+  the sid changed (fixation rotation intact); `/logout` delete → `Secure`+`Max-Age=0`
+  and the old sid no longer authenticates. `SameSite=Lax` still lets the top-level
+  `/callback` navigation carry the cookie (the round trip completed). In dev
+  (`DEV_MODE` true) neither path appends `Secure`, so an http localhost jar still
+  works and `t.py`'s single-origin flow is unaffected. The opaque-sid + HMAC +
+  server-side design is untouched — only the attribute string changed.
+- **No API route is shadowed by the SPA catch-all.** The catch-all
+  (`app.py:563`) is registered last; every real route — `/login`, `/callback`,
+  `/logout`, all `/api/*`, `/config.js`, the `/assets` mount, and the mock router
+  when mounted — is registered earlier and wins by order. Confirmed live: unknown
+  `/api/foo` → 404 JSON (`{"detail":"not found"}`), not the HTML shell; unknown
+  GET page → 200 index.html; `/config.js` → the JS, not the shell; DEMO `/authorize`
+  → 200 mock page; plain-prod `/authorize` → 404. A non-GET/HEAD to any unmatched
+  path → 404 (not 405), matching the pre-SPA behaviour the comment claims.
+- **Path traversal cannot escape `dist`.** `../backend/app.py`, `../../etc/passwd`,
+  `%2e%2e/...`, double-encoded `%252e%252e`, backslash, and nested `foo/../../...`
+  all returned **index.html (200), never the target file's bytes** — the
+  `resolve()` + `is_relative_to(DIST.resolve())` guard rejects the escape and falls
+  through to the shell. The `/assets` StaticFiles mount 404s traversal outright
+  (Starlette's own check). No file outside `dist` was served by any vector tried.
+- **Origin derivation is env-only; no request can influence it.** `PUBLIC`
+  (`app.py:51-53`) and `BASE` (`:48`), and `verify.py`'s `URI`/`DOMAIN`
+  (`verify.py:24-30`), read only `PUBLIC_URL`/`RENDER_EXTERNAL_URL`/`BASE_URL`/`PORT`
+  from the environment. Spoofing `Host: evil.attacker.com` (and adding
+  `X-Forwarded-Host`) changed neither `public_origin` in `/api/me` nor the `/login`
+  redirect `Location` — both stayed the configured origin. The signed message's
+  stated URI is display-only anyway: verification always runs against the message
+  reloaded from `consume_nonce`, never a rebuilt one, so URI/DOMAIN/`expires_at`
+  cannot alter a verification outcome.
+- **`/config.js` has no injection path.** The value is emitted via `json.dumps`,
+  which produces a correctly-escaped JS string literal (quotes, backslashes,
+  newlines, and non-ASCII incl. U+2028/2029 all escaped). It is served as an
+  **external** script (`<script src="/config.js">`), so a `</script>` in the value
+  cannot break HTML parsing. `PRIVY_APP_ID` is deployment-controlled (env, not
+  attacker input) and is a documented public identifier; `render.yaml` sets it
+  `sync: false` (manual), so no generated secret lands there.
+- **DEMO_MODE does not reach the destructive dev surface and does not weaken the
+  guards.** `/api/dev/reset`, `/api/dev/fast-forward`, `/api/dev/test-wallet` are
+  gated by `if DEV_MODE:` alone (`app.py:461`) — all three 404 in DEMO (verified,
+  and pinned by new test 20). The secrets guard (`app.py:90-98`) is keyed on
+  `not DEV_MODE`, so DEMO still refuses to start without `SESSION_SECRET`/
+  `FIN_PEPPER` (verified: `RuntimeError: refusing to start`). H1/H2/H3 remain
+  closed under DEMO.
+- **Provenance persists (test 19 backs it).** `create_binding` now names
+  `proof_method` in both the column list and `VALUES` (`store.py:322-329`),
+  `consume_nonce` returns the server-recorded `issued_via` (`store.py:249`), and
+  `wallet_bind` passes it through (`app.py:390`). The prior round's Medium (silent
+  default to `'wallet'`) is resolved, and test 19 asserts the persisted value.
+- **Dockerfile / render.yaml / DEPLOY.md match the code.** Multi-stage build
+  (Node build → python-slim runtime, no Node in runtime); `CMD uvicorn app:app
+  --host 0.0.0.0 --port ${PORT:-10000}` with `BASE` derived from the same `PORT`,
+  so the OIDC self-calls match the listen port; `healthCheckPath: /api/me` returns
+  JSON with `demo: true` (verified); `PUBLIC_URL` left unset so the origin derives
+  from `RENDER_EXTERNAL_URL` (verified: DEMO `/login` → `https://demo.example.com/
+  authorize`). `SESSION_SECRET`/`FIN_PEPPER` `generateValue`, `PRIVY_APP_ID`
+  `sync:false`. Consistent.
+- **t.py green on a fresh DB — 20/20**, including the new provenance (19) and
+  DEMO-mode gating + Secure-cookie + `RENDER_EXTERNAL_URL` derivation (20). No raw
+  FIN in the prod server log or any `/api/me` body across the DEMO round trip; the
+  claims echoed are only the whitelist (`name`, `birthdate`, `gender`,
+  `residenceStatus`, `address`).
+
+### Verdict
+
+Safe to build on — **yes**, with respect to these deploy deltas. The Secure-cookie
+change is correct on both set and delete and leaves dev untouched; the SPA
+catch-all shadows no API route and its traversal guard holds against every vector
+tried; origin derivation is strictly env-only; `/config.js` cannot inject; and
+DEMO_MODE neither reaches the destructive dev endpoints nor weakens the secrets
+guard or the FIN whitelist. The one substantive item — the mock IdP's reflected
+XSS / open redirect, now exposed on a real public origin because `render.yaml`
+ships `DEMO_MODE=1` by default — has been **fixed and re-verified in this pass**:
+all four reflected params are HTML-escaped and `redirect_uri` is constrained to
+`/callback` at both handlers (21/21, plus direct probes showing the payload
+escaped and foreign paths 400ing). The only residual is a path-only redirect check
+that still permits `<any-host>/callback`; it is inconsequential in the mock demo
+(the leaked code is unexchangeable without the server-held client-assertion key
+and maps only to a public persona) but must become a full host+path match if real
+Fayda credentials ever replace the mock. Pre-existing mediums (unbounded
+`sessions`/`auth_nonces`, write-on-read under the global lock, non-atomic logout,
+M4 migration hazard) remain open and untouched by this diff.
+
+New criticals: 0, new highs: 0.
+
+---
+
+## Diff review — 2026-07-24 (Privy React/Vite frontend rebuild + backend provenance deltas)
+
+Scope: the uncommitted working tree — the frontend rebuilt as React + Vite +
+Tailwind with a Privy wallet connector (`frontend/src/**`, all new), plus five
+backend deltas (`verify.py` env-derived DOMAIN/URI + `expires_at`; `store.py`
+`issued_via`/`proof_method`; `app.py` provenance plumbing + `public_origin`;
+`mock_esignet.py` cosmetic label). Prior rounds cleared the backend core; I
+re-derived only the deltas and independently attacked the Privy seam, the
+origin split, the bind byte-path, and the provenance plumbing.
+
+Method: read every changed backend hunk and every hand-written frontend source
+file; grepped `src/` for off-origin sinks, `@privy` imports, and any storage of
+identity data; traced the personal_sign byte-path against `encode_defunct`;
+read `App.jsx sign()` for the cancel guard. Live: killed the stale :8000
+server, deleted `backend/registry.db` (schema changed), started `APP_ENV=dev
+python backend/app.py` with **PUBLIC_URL unset**, ran `python backend/t.py`:
+**ALL 18 CHECKS PASSED**. Then reproduced the one real finding empirically by
+inspecting `proof_method` against each binding's originating nonce.
+
+**Counts: 0 critical · 0 high · 1 medium · 2 low.**
+
+### Medium — `proof_method` is never persisted; every binding is silently recorded as `'wallet'`, defeating the exact anti-masquerade purpose of this diff — **RESOLVED**
+**Resolution (re-verified 2026-07-24):** the INSERT in `create_binding`
+(`backend/store.py:321-327`) now names `proof_method` in both the column list
+and the `VALUES` clause; the root cause was a whitespace-mismatched patch that
+had silently failed to update the SQL. `backend/t.py` gained test 19 asserting
+the **persisted** value. Re-verified independently of the test: a fresh run on a
+recreated DB passes **19/19**, and a direct read of `registry.db` shows the 3
+bindings whose nonce `issued_via='dev-test-key'` now persist
+`proof_method='dev-test-key'` while real-wallet nonces persist `'wallet'` — the
+audit trail now distinguishes them. Original finding retained below for the record.
+
+**Location:** `backend/store.py:294-342` (`create_binding` INSERT), schema
+`store.py:45`
+**Confidence:** certain (measured)
+**Invariant broken:** the stated purpose of the store.py/app.py delta —
+*"Recorded server-side at issue time so a test-key binding can never masquerade
+as a real wallet attestation in the audit trail"* (`store.py:80-82`).
+
+`create_binding` gained a `proof_method` parameter, threads
+`issued_via` through from `consume_nonce`, and puts `"proof_method":
+proof_method` into the `row` dict — but the `INSERT INTO wallet_bindings (…)`
+column list (`store.py:321-325`) was **not** updated to include the column, and
+neither was the `VALUES (…)` list. sqlite3 named-parameter binding silently
+ignores the extra `row` key, so the column always falls back to its schema
+`DEFAULT 'wallet'`. Every binding — including dev-test-key ones — records
+`proof_method='wallet'`. The server-derived provenance is computed correctly
+and then dropped on the floor.
+
+Reproduced live after the fresh t.py run: the first three bindings were produced
+by nonces whose `issued_via='dev-test-key'`, yet all three persisted
+`proof_method='wallet'` (verified by joining `wallet_bindings.proof_nonce` to
+`auth_nonces.issued_via`). Every row in the table read `proof_method='wallet'`
+regardless of origin. A test-key binding is therefore indistinguishable from a
+real wallet attestation in the audit trail — precisely the masquerade the delta
+was written to prevent.
+
+Scope of impact, stated honestly: this breaks a **diff-local** goal, not a
+CLAUDE.md non-negotiable. The one property that IS sound is that provenance is
+server-derived, not client-claimed — the client never sends `proof_method`;
+`wallet_bind` passes the server-recorded `issued_via` (verified). And in
+production the dev-test-key path does not exist (`DEV_MODE` off → route
+unregistered), so all real bindings genuinely originate from wallets and
+`'wallet'` is coincidentally correct — there is **no production data-integrity
+consequence and no attack**. What makes it a medium rather than a low: it is a
+security-relevant safeguard that silently does nothing, it fails without error
+(the bind still returns 200), and — against the CLAUDE.md convention *"New
+invariants get a test in t.py; a test that cannot fail is not a test"* — the new
+provenance invariant ships with **no test**, which is exactly why a broken
+INSERT reached this audit. An audit trail that cannot tell a real attestation
+from a throwaway is a false assurance. Fix direction (not applied): add
+`proof_method` to both the column list and the `VALUES` clause, and assert in
+t.py that a `/api/dev/test-wallet` binding stores `proof_method='dev-test-key'`.
+
+### Low — Privy's SDK runs same-origin and can read the DOM-rendered claims (neighbourhood PII + `fin_hmac`); inherent third-party exposure, no app-introduced sink
+**Location:** `frontend/src/wallet/index.jsx:36-52`, `components/IdentityRecord.jsx:63-70`
+**Confidence:** certain (that the surface exists); the leak is latent, not observed
+The Privy provider is a first-party React component; its bundle executes in the
+main page context, same-origin with the SPA. `IdentityRecord` renders the full
+`me.claims` blob (name, birthdate, `residenceStatus`, `address.{kebele, woreda,
+region, zone}` — neighbourhood-level location) and `fin_hmac` into the DOM. Any
+same-origin script, Privy's included, can in principle read that DOM; Privy also
+loads cross-origin iframes/config from its own hosts. Two mitigations make this a
+low, not a high: (1) the **raw FIN never reaches the browser** — worst-case DOM
+scraping yields only the whitelisted claims (already the owner's own data) plus
+the peppered HMAC, so non-negotiable #1 is intact; (2) the app introduces **no
+sink of its own** — it passes Privy only `appId` + static config, never identity
+data, and the HttpOnly `session` cookie is unreadable to any script (confirmed:
+the only `localStorage` write is the theme; the only `fetch` is `api.js` on
+relative paths; the only `@privy` import is the seam module). This is the
+inherent cost of loading a third-party connector on a page that also displays
+PII, not a bug in this diff. On record so a future hardening pass can consider
+rendering the neighbourhood claims lazily / behind the connector, or isolating
+Privy, if the PII sensitivity warrants it.
+
+### Low — mock `/authorize` reflected XSS persists (unchanged, dev-only)
+**Location:** `backend/mock_esignet.py` authorize page
+**Confidence:** certain (dev-only)
+The delta to `mock_esignet.py` is a one-word label change; the prior-round
+reflected-XSS in the authorize page (unescaped `state`/`nonce`/`redirect_uri`/
+`scope`) is untouched and still present. The whole mock router mounts only under
+`DEV_MODE` (t.py test 13 confirms 404 in production), so it cannot ship, and the
+Vite proxy still raises its blast radius to the SPA origin in a dev run. No
+change from the prior record; re-flagged only because the file was in this diff.
+
+### Verified safe (actively attacked, held)
+
+- **The bind byte-path cannot be diverted.** `signEvm` hex-encodes the UTF-8
+  bytes of the server message and `personal_sign`s them (EIP-191); the backend
+  `encode_defunct(text=message)` prefixes the identical UTF-8 bytes. More
+  decisively: `wallet_bind` verifies against the message it **reloaded from
+  `consume_nonce`**, never the client's copy — so even a frontend that signed
+  different bytes would simply fail verification. Non-negotiable #2 holds
+  regardless of frontend behaviour. The crypto in `verify.py` (secp256k1
+  `recover_message`, ed25519 `VerifyKey.verify`) is byte-identical to prior
+  rounds (confirmed by diff) — only DOMAIN/URI derivation, `expires_at`, and
+  copy changed.
+- **The client cannot claim binding provenance.** `wallet_bind` passes the
+  server-recorded `issued_via` from `consume_nonce` as `proof_method`; no client
+  field feeds it. A dev-test-key nonce can never be bound as `'wallet'` by client
+  request. (It is never bound as `'dev-test-key'` either — see the Medium — but
+  the *client-can't-claim-it* property is intact.)
+- **No off-origin exfiltration; nothing identity-bearing reaches Privy or any
+  third party.** Only `@privy-io` import is `src/wallet/index.jsx`; the only
+  network sink is `fetch` on relative paths in `api.js`; the only `localStorage`
+  write is `theme`; no `sessionStorage`/`window.name`/query-param/`document.cookie`
+  identity write anywhere in `src/`. Privy receives `appId` + static config only.
+- **`PRIVY_CONFIGURED` placeholder detection is sound enough, and a hostile
+  `VITE_PRIVY_APP_ID` cannot inject.** `.env.example` ships empty → `''` → not
+  configured → null connector (designed setup notice). The regex rejects
+  `your…`/`<…>` placeholders; real Privy ids (random alphanumeric) pass. The id
+  is baked at build as a JS string literal and passed as a React prop
+  (`appId={…}`) — no HTML interpolation, no injection. A malicious value is
+  deployment-controlled (not external-attacker-controlled) and at worst points
+  Privy at another Privy app, touching wallet connection only, never identity/FIN.
+- **The origin split adds no spoofing/phishing surface.** `public_origin`
+  (`/api/me` unauth, verified `= "http://127.0.0.1:8000"` with PUBLIC_URL unset)
+  is deployment-controlled config, echoed by `OriginMismatch` through React
+  (auto-escaped — no XSS), and shown **only when unauthenticated**; no security
+  decision hinges on it. The verify.py message DOMAIN/URI derive from the same
+  deployment env, so the signed message's stated origin matches the browser
+  origin — a phishing-reduction, not a new surface.
+- **The cancel generation guard prevents a bind after abandonment.** In
+  `App.jsx sign()`, `gen = attestGen.current` is captured before the wallet
+  prompt; `closeAttest()` bumps `attestGen.current`; the post-`signEvm` check
+  `if (attestGen.current !== gen) return` fires before `/api/wallet/bind` is
+  called. The nonce is single-use and TTL-bound, so abandoning is safe. (Even
+  without the guard this would bind only the user's own validly-signed wallet —
+  not a security issue.)
+- **No newline/label injection into the signed message via `display_name`.** The
+  only user-influenced inputs to `build_message` are `address` (strictly
+  format-validated; a non-hex/oversized value can never reach an active binding
+  because recovery won't match the claimed address) and `identity_label`
+  (`display_name` from the Fayda `name` claim — IdP-sourced, not user-settable in
+  this trust model). Even a newline-bearing name only alters the requester's own
+  signing message; it cannot cross bindings, break the sybil/nonce constraints,
+  or change the recovered-signer check. Worth sanitizing as defense-in-depth; not
+  a live break.
+- **t.py green on a fresh schema-changed DB** — 18/18 including the FIN/claims
+  fixation asserts (3b/3c), sybil race (17), and dev-surface gating (13/14). No
+  raw FIN in the server log or any response body.
+
+### Verdict
+Safe to build on — **yes**, with respect to this diff. The frontend rebuild
+introduces no off-origin sink, no embedded-wallet custody, and no path that
+hands the session cookie, claims, or FIN-derived data to Privy or any third
+party; the origin split is fail-safe and escape-free; the bind byte-path is
+irrelevant to soundness because the server verifies its own stored message. The
+single real defect is a **silently broken safeguard** — `proof_method` is never
+written, so this diff's own anti-masquerade audit-trail feature does nothing —
+but it breaks no CLAUDE.md non-negotiable and has no production exploitability
+(the only non-`wallet` source, the dev endpoint, cannot exist in production).
+Fix the INSERT and add the missing test before relying on the provenance field.
+Pre-existing mediums (unbounded `sessions`/`auth_nonces`, write-on-read under the
+global lock, non-atomic logout, M4 migration hazard) remain open and untouched.
+
+New criticals: 0, new highs: 0.
+
+---
 
 Scope: the uncommitted restructure only. Backend logic is UNCHANGED from the five
 prior rounds except the five items below; I did not re-derive the binding/crypto/

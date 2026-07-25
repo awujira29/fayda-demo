@@ -273,4 +273,66 @@ except st.BindingConflict as e:
     assert "reload and retry" in str(e), str(e)
 print("  both unique-index flavors translate to BindingConflict: ok")
 
+step("19. provenance: a dev test-key binding is recorded as such, server-side")
+# The nonce records how the proof will be produced at ISSUE time; the binding
+# copies it at commit. A client cannot claim 'wallet' for a test-key proof —
+# and a marker that silently defaults to 'wallet' is a test-shaped hole, so
+# assert the persisted value, not the code path.
+me=c.get(f"{B}/api/me").json()
+methods={b["proof_method"] for b in me["history"]}
+assert methods=={"dev-test-key"}, ("every binding here came from the dev endpoint", methods)
+print("  all", len(me["history"]), "bindings persisted proof_method=dev-test-key: ok")
+
+step("20. DEMO_MODE: mock IdP mounts, /api/dev/* stays 404, cookie is Secure")
+# The shared-demo posture: a visitor can log in with a persona but can never
+# wipe the DB (H1) or collapse cooling (H2). The public origin derives from
+# the platform env (RENDER_EXTERNAL_URL), and the session cookie is Secure.
+P=8098
+srv=server(P, {"APP_ENV":"production","DEMO_MODE":"1","SESSION_SECRET":"s"*32,
+               "FIN_PEPPER":"p"*32,"BASE_URL":f"http://127.0.0.1:{P}",
+               "RENDER_EXTERNAL_URL":"https://demo.example.com/"})
+try:
+    assert wait_up(P), "demo-mode server never came up"
+    pb=f"http://127.0.0.1:{P}"
+    r=httpx.get(f"{pb}/login", timeout=5, follow_redirects=False)
+    sc=r.headers.get("set-cookie","")
+    assert "Secure" in sc and "HttpOnly" in sc and "SameSite=Lax" in sc, sc
+    assert r.headers["location"].startswith("https://demo.example.com/authorize"),         r.headers["location"]
+    print("  Secure cookie set; authorize URL derives from RENDER_EXTERNAL_URL: ok")
+    r=httpx.get(f"{pb}/authorize", params={"client_id":"fayda-wallet-demo",
+                "redirect_uri":f"{pb}/callback","state":"s","nonce":"n"}, timeout=5)
+    assert r.status_code==200 and 'name="fin"' in r.text, r.status_code
+    print("  mock IdP mounted in demo mode, personas served: ok")
+    for route in ("/api/dev/reset","/api/dev/fast-forward","/api/dev/test-wallet"):
+        r=httpx.post(f"{pb}{route}", json={"chain":"evm"}, timeout=5)
+        assert r.status_code==404, (route, r.status_code)
+    print("  every /api/dev/* route 404s in demo mode: ok")
+    r=httpx.get(f"{pb}/api/me", timeout=5).json()
+    assert r["demo"] is True and r["dev"] is False, r
+    assert r["public_origin"]=="https://demo.example.com", r["public_origin"]
+    print("  /api/me: demo=True dev=False, public_origin from platform env: ok")
+finally:
+    srv.terminate()
+    try: srv.wait(timeout=10)
+    except Exception: srv.kill()
+
+step("21. mock IdP: reflected params escaped, redirect_uri constrained to /callback")
+# DEMO_MODE publishes the mock on a real origin, so its reflected inputs must
+# not be an XSS or open-redirect surface. Runs against the dev server (mock mounted).
+xss='"><script>alert(document.domain)</script>'
+r=c.get(f"{B}/authorize", params={"client_id":"fayda-wallet-demo",
+        "redirect_uri":f"{B}/callback","state":xss,"nonce":"n","scope":xss})
+assert r.status_code==200, r.status_code
+assert "<script>alert" not in r.text, "reflected state/scope not escaped — XSS live"
+assert "&lt;script&gt;" in r.text, "expected escaped payload in output"
+print("  reflected state/scope HTML-escaped: ok")
+# Open redirect: a non-/callback target is rejected at authorize and at confirm.
+r=c.get(f"{B}/authorize", params={"client_id":"fayda-wallet-demo",
+        "redirect_uri":"https://evil.example.com/phish","state":"s","nonce":"n"})
+assert r.status_code==400, ("authorize accepted foreign redirect_uri", r.status_code)
+r=c.post(f"{B}/authorize/confirm", data={"fin":fins[0],
+        "redirect_uri":"https://evil.example.com/phish","state":"s","nonce":"n"})
+assert r.status_code==400, ("confirm accepted foreign redirect_uri", r.status_code)
+print("  redirect_uri outside /callback rejected at authorize and confirm: ok")
+
 print("\n\nALL CHECKS PASSED")

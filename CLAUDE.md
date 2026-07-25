@@ -9,8 +9,11 @@ self-custodied wallet per chain (Ethereum, Solana). Takes no custody, holds no
 private keys. Stores only cryptographic proof that a verified person controls an address.
 
 Two processes: a Python / FastAPI / SQLite API in backend/, and a React + Vite
-frontend in frontend/. The frontend proxies every backend path so the browser
-never leaves its own origin — the session cookie depends on it.
++ Tailwind v4 frontend in frontend/. The wallet connector is Privy
+(@privy-io/react-auth), used for connection only — identity always comes from
+Fayda, embedded wallets are off, external self-custody only. The frontend
+proxies every backend path so the browser never leaves its own origin — the
+session cookie depends on it.
 
 ## Non-negotiables
 
@@ -58,19 +61,25 @@ existing wallet must keep working. Do not simplify this into an instant swap.
 | backend/verify.py | secp256k1 recovery (EVM), ed25519 verification (Solana) |
 | backend/mock_esignet.py | Throwaway. Deleted in production. |
 | backend/t.py | End-to-end tests |
-| frontend/src/wallet.js | THE Privy seam (R2). The only file that may import @privy-io. |
-| frontend/src/App.jsx | State + flow composition |
-| frontend/src/components.jsx | UI components |
-| frontend/src/tokens.css | Design tokens — the single source of visual values |
+| frontend/src/wallet/ | THE Privy seam (R2). The only module that may import @privy-io. |
+| frontend/src/App.jsx | State machine + composition; direction contract in its header |
+| frontend/src/components/ | UI (shadcn-style primitives in ui/, product components beside) |
+| frontend/src/styles/tokens.css | Design tokens (OKLCH) — the single source of visual values |
 
 Two base URLs on the backend: BASE_URL is where the process is reachable for
 server-to-server calls (token, userinfo); PUBLIC_URL is the origin the browser
 stays on (the Vite server in dev). redirect_uri and the authorize URL are built
 from PUBLIC_URL. Get this wrong and the session cookie lands on the wrong origin.
 
-Design values (colour, type scale, spacing) live in frontend/src/tokens.css —
-change them there, never as literals in components. The visual language is
-specified in .claude/agents/design-critic.md.
+Design values (colour, type scale, spacing) live in
+frontend/src/styles/tokens.css — change them there, never as literals in
+components. The visual world (civil-registry record: Source Serif 4 300/700
+display, Public Sans UI, Spline Sans Mono machine values, one Fayda green-teal
+accent reserved for identity/verification/active) is recorded in DESIGN.md;
+product truth in PRODUCT.md; review protocol in .claude/agents/design-critic.md.
+Solana wallet connection is intentionally disabled (SOLANA_WALLETS_ENABLED in
+frontend/src/wallet/index.jsx) until external-wallet support in the connector
+is verified — never fake a chain.
 
 No blockchain connection anywhere. Signature verification is pure cryptography. No RPC,
 no gas, no testnet. Keep it that way absent a specific reason to read chain state.
@@ -97,6 +106,14 @@ runs with a setup notice and the dev test-key path.
 
 Production refuses to start without SESSION_SECRET and FIN_PEPPER, and registers none
 of the dev surface.
+
+DEPLOY: one FastAPI process serves the API and the built SPA (frontend/dist)
+same-origin — see DEPLOY.md + render.yaml + Dockerfile. Outside dev the cookie
+is Secure and the public origin derives from PUBLIC_URL || RENDER_EXTERNAL_URL.
+DEMO_MODE mounts the mock IdP (personas) for a credential-less shared demo but
+NEVER /api/dev/* — a demo visitor cannot wipe the DB or skip cooling. SQLite
+resets on every redeploy/spin-down (fine for the mock; a real deploy needs
+Postgres — see M4).
 
 ## Testing
 
