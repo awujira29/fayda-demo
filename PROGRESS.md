@@ -323,3 +323,51 @@ cookie) on the same day.
 ### N1 - APP_ENV defaulted open - resolved 2026-07-24
 Default inverted to production so a forgotten env var fails closed.
 ### M3 - Dev surface unguarded - resolved as side effect of H1/H2/H3
+
+---
+
+## Now
+
+### F1 - Transaction history tied to a verified user
+**Status:** todo
+**Severity:** feature (boss-requested; mirrors Sumsub Transaction/Crypto Monitoring)
+**Why:** The identity-to-wallet binding exists precisely so a verified person can be
+tied to on-chain activity. This is the payoff feature -- pick a verified identity,
+see everything their bound wallets did, plus every in-app event. It is also the
+first piece of the compliance/monitoring layer that turns identity-proofing into
+something closer to full KYC/AML.
+
+**Two data sources, both required ("both" per boss):**
+1. IN-APP event history -- already have the raw material. Every bind, verification,
+   pending replacement, cancel, promotion, and archive is a row or a derivable event.
+   Build a per-identity timeline from wallet_bindings (+ their status transitions and
+   timestamps) and the verification/login events. This is local, cheap, and exact.
+2. ON-CHAIN transaction history -- for each active bound wallet, fetch its
+   transactions from a chain data provider (e.g. an EVM explorer API / RPC for
+   Ethereum, and the Solana equivalent if/when Solana ships). Read-only, public data.
+   Show tx list per wallet: hash, timestamp, direction, counterparty, value.
+
+**Do:**
+- A per-identity view: identity header (name, residenceStatus), their active +
+  historical wallets, an interleaved timeline of in-app events and on-chain txs.
+- Gate it: this is sensitive. It must be an authenticated, authorized view (a
+  compliance/operator role), NOT the public registry. Decide the auth model before
+  building -- who is allowed to pull another person's history.
+- On-chain fetching is external I/O: cache it, handle provider failure gracefully,
+  never block the page on a slow explorer call. Show in-app history immediately,
+  stream on-chain in progressively.
+- Do NOT store on-chain data as source of truth -- it's public and refetchable;
+  cache with a TTL at most.
+- Privacy note: binding a national identity to a full on-chain history is exactly
+  the kind of surveillance capability that needs a clear lawful basis. Flag for the
+  same NBE/NIDP data-protection review as the rest of the identity data. Record the
+  question; do not assume it's permitted.
+
+**Done when:**
+- Given a verified identity, an authorized operator sees a combined timeline of
+  in-app events and on-chain transactions for the bound wallet(s)
+- The view is access-controlled, never public
+- On-chain fetch is cached, non-blocking, and degrades cleanly when the provider is down
+- A test covers the in-app timeline assembly; the on-chain path is mockable in tests
+- The auditor reviews the new authorization boundary specifically
+- The lawful-basis/privacy question is recorded as an open item for NBE/NIDP
