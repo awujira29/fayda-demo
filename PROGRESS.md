@@ -411,3 +411,53 @@ and RLS becomes possible. backend/t.py must pass against Postgres.
   a national ID to full financial history is the most sensitive thing the app does.
 
 Do not bundle these. Each is one goal, reviewed and audited on its own.
+
+---
+
+## DEMO -> REAL APP roadmap
+
+The switch from demo to production. Ordered; earlier items are prerequisites for later.
+Persistence requirement (explicit): data must NEVER be lost on deploy/restart/scale.
+Supabase chosen as the base -- it is managed Postgres + Auth + Row-Level Security in
+one platform, which collapses persistence, the login layer, and RLS into one decision.
+
+### R1 - Migrate to Supabase Postgres (KEYSTONE)
+Move storage from ephemeral SQLite to Supabase Postgres. Data persists independently
+of the app process. All SQL isolated in store.py; partial unique indexes port
+unchanged; sqlite3.IntegrityError -> psycopg UniqueViolation; drop the _DB_LOCK
+(Postgres has real concurrency). Fixes at once: durable data, sybil-across-instances,
+and makes RLS possible. Connection via Supabase connection string (env var, pooled).
+backend/t.py passes against Postgres. This unblocks R2 and R4.
+
+### R2 - Supabase Auth + passkey return-login + RLS
+Real accounts. Fayda once to establish identity, then register a passkey (WebAuthn)
+for biometric return-login. Postgres RLS policies so every user session reads/writes
+ONLY its own rows -- enforced by the DB. User dashboard shows only the signed-in
+person's identity/wallets/history. Public registry stops being public.
+
+### R3 - Operator role + immutable access logging
+Privileged role that can look up other identities. Every operator lookup written to
+an append-only access log (who viewed whom, when, why). Mandatory before any
+cross-user visibility ships.
+
+### R4 - Transaction history (F1), behind the operator role
+Combined in-app event timeline + on-chain tx history per bound wallet. Operator-only.
+Never public, never in the user view. Needs R1 (Postgres) and R3 (operator + logging).
+
+### R5 - Real Fayda credentials
+Replace the mock IdP with live partner.fayda.et integration. External dependency:
+apply for partner credentials. mock_esignet.py is the only thing that should change
+(the OIDC client code is already written against the real contract). Confirm the real
+userinfo claim names against what the mock assumes.
+
+### R6 - Production hardening
+AML/sanctions screening layer (the Sumsub-style compliance piece), rate limiting on
+all endpoints, the deferred audit mediums (unbounded tables, mock /authorize XSS,
+etc.), error monitoring, Supabase automated backups verified, structured logging.
+
+### R7 - Real domain + HTTPS
+Custom domain, cookie/OIDC origin updated, Privy allowed-origins updated.
+
+Lawful-basis / data-protection review with NBE/NIDP runs alongside R3-R5 -- binding
+a national ID to persistent, queryable financial history is the most sensitive thing
+this app does and needs a documented legal basis before it goes live with real users.
