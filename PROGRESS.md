@@ -371,3 +371,43 @@ something closer to full KYC/AML.
 - A test covers the in-app timeline assembly; the on-chain path is mockable in tests
 - The auditor reviews the new authorization boundary specifically
 - The lawful-basis/privacy question is recorded as an open item for NBE/NIDP
+
+---
+
+## Login, RLS, and roles -- sequenced (do IN ORDER)
+
+Requested: a login layer so users see their own data, with Row-Level Security,
+plus an operator/compliance role. RLS as asked for is a Postgres feature; SQLite
+can only fake it in app code (one missed WHERE clause = full leak). So Postgres
+is now a PREREQUISITE, not a someday. Three ordered goals:
+
+### G1 - Migrate SQLite -> Postgres (prerequisite, was M4)
+All SQL is isolated in store.py. Partial unique indexes (ux_active_chain_address,
+ux_pending_chain_address) port to Postgres unchanged. Replace sqlite3.IntegrityError
+handling with psycopg UniqueViolation. Drop the process-global _DB_LOCK -- Postgres
+has real concurrency, so the deadlock fix and the write-on-read serialization go
+away. Fixes three things at once: data survives deploy, sybil holds across instances,
+and RLS becomes possible. backend/t.py must pass against Postgres.
+
+### G2 - Login layer + Row-Level Security
+- Return-login: Fayda once to establish the identity, then register a passkey
+  (WebAuthn) so the user returns with device biometric (Face ID / fingerprint),
+  phishing-resistant, without re-running the full Fayda flow.
+- Postgres RLS: every table carrying user data gets a row policy so a user session
+  can only read/write its OWN rows -- enforced by the database, not just app code.
+- A user dashboard: the signed-in person sees ONLY their identity, their wallets,
+  their in-app history. Nothing of anyone else's.
+- The public registry stops being public once real identities exist -- decide what,
+  if anything, stays publicly visible.
+
+### G3 - Operator/compliance role + F1 transaction history
+- A privileged role that CAN look up other identities (this is the F1 feature).
+- Every operator lookup is written to an IMMUTABLE access log: who viewed whose
+  data, when, why. This is mandatory for the surveillance capability F1 represents
+  -- Sumsub calls it Case Management; regulators call it access logging.
+- F1 (combined in-app + on-chain transaction history) lives HERE, behind the
+  operator role, never in the user or public view.
+- Lawful-basis / data-protection review with NBE/NIDP before this ships -- binding
+  a national ID to full financial history is the most sensitive thing the app does.
+
+Do not bundle these. Each is one goal, reviewed and audited on its own.
