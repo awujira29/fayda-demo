@@ -29,6 +29,12 @@ services:
       # demo with the designed "connector not configured" state.
       - key: PRIVY_APP_ID
         sync: false
+      # Supabase Postgres connection string (R1). A live credential — set it
+      # in the dashboard, never commit it. Without it the app refuses to
+      # start: there is no SQLite fallback, and silently losing persistence
+      # would be worse than failing loudly.
+      - key: SUPABASE_DB_URL
+        sync: false
       # The public origin (PUBLIC_URL) is NOT set here on purpose: app.py
       # derives it from RENDER_EXTERNAL_URL, which Render injects
       # automatically. Set PUBLIC_URL only for a custom domain.

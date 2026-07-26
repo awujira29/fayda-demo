@@ -12,3 +12,6 @@ PyNaCl==1.6.2              # ed25519 verification (Solana)
 base58==2.1.1              # Solana address and signature encoding
 
 httpx==0.28.1              # OIDC token/userinfo calls, and t.py
+
+psycopg[binary,pool]==3.3.4  # Supabase Postgres (R1) — durable storage, real
+                             # concurrency, and the base for RLS (R2)

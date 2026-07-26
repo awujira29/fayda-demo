@@ -10,7 +10,10 @@ import hmac
 import json
 import os
 import secrets
+import sys
+import threading
 import time
+from contextlib import asynccontextmanager
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -114,6 +117,15 @@ mock_esignet.TOKEN_ENDPOINT = TOKEN_URL
 mock_esignet.EXPECTED_CLIENT_ID = CLIENT_ID
 
 SESSION_TTL_HOURS = 12
+# A session that has not completed the Fayda round trip holds only oidc_state,
+# which is dead the moment /callback runs and useless after the dance's natural
+# lifetime of about a minute. Giving it the full authenticated TTL is what let
+# an anonymous request loop park 12-hour rows in a database that no longer
+# resets itself: a sweep can only bound a table at arrival-rate x TTL, and this
+# is the term we control. Half an hour still cuts the reachable steady state
+# by 24x while leaving room for a real biometric or OTP capture; ten minutes
+# risked expiring a slow but legitimate login.
+PRE_AUTH_SESSION_TTL_HOURS = 0.5
 
 
 def _sign_sid(sid: str) -> str:
@@ -176,11 +188,15 @@ class ServerSideSessionMiddleware:
                 if session:
                     if sid is None:
                         sid = secrets.token_urlsafe(32)
-                    store.save_session(sid, session, SESSION_TTL_HOURS)
+                    # An anonymous, mid-login session gets minutes; only a
+                    # completed Fayda authentication earns the full TTL.
+                    ttl = (SESSION_TTL_HOURS if session.get("identity_id")
+                           else PRE_AUTH_SESSION_TTL_HOURS)
+                    store.save_session(sid, session, ttl)
                     headers.append(
                         "set-cookie",
                         f"{self.COOKIE}={sid}.{_sign_sid(sid)}; Path=/; HttpOnly; "
-                        f"SameSite=Lax; Max-Age={SESSION_TTL_HOURS * 3600}"
+                        f"SameSite=Lax; Max-Age={int(ttl * 3600)}"
                         + ("" if DEV_MODE else "; Secure"),
                     )
                 elif sid is not None:
@@ -196,7 +212,42 @@ class ServerSideSessionMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
-app = FastAPI(title="Fayda wallet registry")
+# Storage is durable now (R1): nothing wipes the database on redeploy, and
+# sessions/auth_nonces grow with unauthenticated traffic. Each process sweeps
+# TTL-dead rows on boot and every ten minutes; the DELETEs are idempotent, so
+# several instances sweeping concurrently is harmless.
+SWEEP_INTERVAL_SECONDS = 600
+
+
+def _sweep_loop():
+    failures = 0
+    while True:
+        try:
+            store.sweep_expired()
+            failures = 0
+        except Exception as e:
+            # Hygiene must not die on a transient DB error — a dead sweeper
+            # silently returns the tables to growing forever. But it must not
+            # fail *silently* either: this is the only thing bounding them, so
+            # a sweeper broken for days has to be visible somewhere.
+            failures += 1
+            print(f"[sweep] failed {failures}x: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+        time.sleep(SWEEP_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # lifespan, not @app.on_event("startup"): on_event is deprecated, and if a
+    # version bump drops it the thread would simply never start — no error, no
+    # failed request, no test failure, just the tables quietly growing forever.
+    # The sweeper is load-bearing for durability, so it hangs off the
+    # supported hook.
+    threading.Thread(target=_sweep_loop, daemon=True, name="ttl-sweeper").start()
+    yield
+
+
+app = FastAPI(title="Fayda wallet registry", lifespan=lifespan)
 app.add_middleware(ServerSideSessionMiddleware)
 
 # The mock IdP mounts in dev, and in an explicitly opted-in demo deploy.
@@ -228,8 +279,24 @@ SAFE_CLAIMS = frozenset({
 })
 
 
+def _strip_nul(v):
+    """
+    Postgres rejects NUL (0x00) in text and JSONB. An IdP claim carrying one
+    would raise inside the session save — which happens in the ASGI send
+    wrapper, after the response has started, so the connection is torn and the
+    login silently fails. Drop them at the boundary instead.
+    """
+    if isinstance(v, str):
+        return v.replace("\x00", "")
+    if isinstance(v, dict):
+        return {k: _strip_nul(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_strip_nul(x) for x in v]
+    return v
+
+
 def safe_claims(claims: dict) -> dict:
-    return {k: v for k, v in claims.items() if k in SAFE_CLAIMS}
+    return {k: _strip_nul(v) for k, v in claims.items() if k in SAFE_CLAIMS}
 
 
 def client_assertion() -> str:
@@ -268,6 +335,13 @@ async def callback(request: Request, code: str = "", state: str = ""):
     if not code:
         raise HTTPException(400, "no authorization code returned")
     if state != request.session.get("oidc_state"):
+        # Distinguish the two causes. A session carrying no oidc_state at all
+        # is almost always the pre-auth row having expired mid-login (a slow
+        # biometric capture), not an attack — reporting that as CSRF sends the
+        # user hunting for a security problem instead of pressing sign-in
+        # again. A state that is present but WRONG is the real CSRF shape.
+        if not request.session.get("oidc_state"):
+            raise HTTPException(400, "sign-in took too long and expired — start again")
         raise HTTPException(400, "state mismatch — possible CSRF")
     request.session.pop("oidc_state", None)
 
@@ -336,11 +410,26 @@ class BindReq(BaseModel):
     signature: str
 
 
+def _clean_token(value: str, label: str) -> str:
+    """
+    Reject the shapes that cannot be a real nonce or signature before they
+    reach storage: a NUL byte is unrepresentable in Postgres text (it would
+    become a 500 instead of the 400 this is), and an oversized value is only
+    ever an attempt to write junk into a durable table.
+    """
+    if "\x00" in value or len(value) > 512:
+        raise HTTPException(400, f"malformed {label}")
+    return value
+
+
 @app.post("/api/wallet/nonce")
 def wallet_nonce(req: NonceReq, request: Request):
     iid = current(request)
     if req.chain not in ("evm", "solana"):
         raise HTTPException(400, "chain must be evm or solana")
+    # A NUL-bearing EVM-shaped address passes the shape check but is
+    # unrepresentable in Postgres text — reject it as the 400 it is.
+    _clean_token(req.address, "address")
     if not vf.looks_like_address(req.chain, req.address):
         raise HTTPException(400, "that does not look like a valid address for this chain")
 
@@ -360,6 +449,16 @@ def wallet_nonce(req: NonceReq, request: Request):
 @app.post("/api/wallet/bind")
 def wallet_bind(req: BindReq, request: Request):
     iid = current(request)
+    # Same gates as /api/wallet/nonce, re-applied here: bind must stand alone.
+    # An unrecognized chain string must never fall through to the base58
+    # branch of the shape check, where it would buy quadratic decode CPU.
+    if req.chain not in ("evm", "solana"):
+        raise HTTPException(400, "chain must be evm or solana")
+    _clean_token(req.nonce, "nonce")
+    _clean_token(req.signature, "signature")
+    _clean_token(req.address, "address")
+    if not vf.looks_like_address(req.chain, req.address):
+        raise HTTPException(400, "that does not look like a valid address for this chain")
 
     # Consuming the nonce returns the exact message the server issued. The
     # signature is verified against that, never against anything the client sent.
@@ -376,7 +475,10 @@ def wallet_bind(req: BindReq, request: Request):
         raise HTTPException(400, f"proof of control failed: {verr}")
 
     incumbent = store.active_binding(iid, req.chain)
-    if incumbent and incumbent["address"].lower() == req.address.lower():
+    # Canonical comparison, not blanket .lower(): Solana base58 is
+    # case-sensitive, so lowercasing would equate two different public keys.
+    if incumbent and (store.normalize_address(req.chain, incumbent["address"])
+                      == store.normalize_address(req.chain, req.address)):
         raise HTTPException(409, "that wallet is already the active one for this chain")
     if store.pending_binding(iid, req.chain):
         raise HTTPException(409, "a change is already pending on this chain — cancel it first")
@@ -416,6 +518,15 @@ def api_me(request: Request):
                 "dev": DEV_MODE, "demo": DEMO_MODE, "public_origin": PUBLIC}
     store.promote_due(iid)
     ident = store.get_identity(iid)
+    # One query for all of this identity's bindings, sliced locally. Asking
+    # the database separately for each active/pending slot cost five extra
+    # round trips per page load against a managed Postgres.
+    rows = store.bindings_of(iid)
+
+    def one(status: str, chain: str):
+        return next((r for r in rows
+                     if r["status"] == status and r["chain"] == chain), None)
+
     return {
         "authenticated": True,
         "dev": DEV_MODE,
@@ -429,14 +540,14 @@ def api_me(request: Request):
         },
         "claims": request.session.get("claims", {}),
         "active": {
-            "evm": store.active_binding(iid, "evm"),
-            "solana": store.active_binding(iid, "solana"),
+            "evm": one("active", "evm"),
+            "solana": one("active", "solana"),
         },
         "pending": {
-            "evm": store.pending_binding(iid, "evm"),
-            "solana": store.pending_binding(iid, "solana"),
+            "evm": one("pending", "evm"),
+            "solana": one("pending", "solana"),
         },
-        "history": store.history(iid),
+        "history": rows,
         "cooling_hours": COOLING_HOURS,
     }
 

@@ -1,10 +1,34 @@
 import re, httpx, sys, base64, subprocess, os, time
 B="http://127.0.0.1:8000"
-c=httpx.Client(follow_redirects=False, timeout=10)
+# 30s, not 10: every store call is a network round trip to managed Postgres,
+# so a bind is seconds, not milliseconds. This is a transport timeout, never
+# an assertion — nothing in the suite passes *because* it is generous.
+c=httpx.Client(follow_redirects=False, timeout=30)
 
 def step(n): print(f"\n--- {n}")
 
 HERE=os.path.dirname(os.path.abspath(__file__))
+
+# R1 made storage durable: the database persists across suite runs, so the
+# suite must start from a known-empty registry or test 4's first-time bind
+# meets last run's bindings. Reset directly through the store — the HTTP
+# endpoint needs an authenticated session that does not exist yet.
+#
+# This file must NOT set APP_ENV itself. An earlier cut did, two lines above
+# this call, which satisfied reset()'s own guard and turned the most-run
+# command in the repo into a one-command wipe of whatever SUPABASE_DB_URL
+# happened to name. Both gates now have to be cleared from outside: the human
+# passes APP_ENV=dev, and the target database must itself carry the disposable
+# marker. Point .env at production and this refuses instead of destroying it.
+sys.path.insert(0, HERE)
+import store as st
+try:
+    st.reset()
+except RuntimeError as e:
+    print(f"\nCannot prepare a clean registry: {e}\n\n"
+          f"Run the suite as:  APP_ENV=dev python backend/t.py\n"
+          f"against a throwaway database, not the production project.")
+    sys.exit(2)
 
 def server(port, env_extra):
     env=dict(os.environ); env.update(env_extra)
@@ -119,7 +143,7 @@ print("  old binding archived: ok")
 
 step("10. SYBIL: second identity cannot claim the same wallet")
 taken=me["active"]["evm"]["address"]
-c2=httpx.Client(follow_redirects=False, timeout=10)
+c2=httpx.Client(follow_redirects=False, timeout=30)
 r=c2.get(f"{B}/login"); loc=r.headers["location"]
 r=c2.get(loc); state=re.search(r'name="state" value="([^"]*)"', r.text).group(1)
 r=c2.post(f"{B}/authorize/confirm", data={"fin":fins[2],"redirect_uri":f"{B}/callback",
@@ -137,7 +161,7 @@ r=c.post(f"{B}/api/wallet/bind", json={"chain":"solana","address":t["address"],
 print("  ", r.status_code, r.json().get("detail","")[:60]); assert r.status_code==400
 
 step("12. H1: /api/dev/reset rejects an unauthenticated caller")
-anon=httpx.Client(follow_redirects=False, timeout=10)
+anon=httpx.Client(follow_redirects=False, timeout=30)
 r=anon.post(f"{B}/api/dev/reset")
 print("  ", r.status_code, r.json().get("detail","")); assert r.status_code==401, r.status_code
 
@@ -177,7 +201,8 @@ step("15. M2: raced cross-identity pending cannot wedge the registry")
 # pending-vs-pending case; the un-indexable variant — active for one identity,
 # pending for another — must survive promotion without wedging every read.
 # Plant that state directly through the store, as the race would.
-import secrets, sqlite3
+import secrets
+import psycopg
 import store as st
 def rnd_addr(): return "0x"+secrets.token_hex(20)
 A=st.upsert_identity(secrets.token_hex(16), "Race Winner", "")
@@ -211,7 +236,7 @@ try:
     raise AssertionError("second cross-identity pending on one address was accepted")
 except st.BindingConflict as e:
     # the rejection must come from the DB index, not an application check
-    assert isinstance(e.__cause__, sqlite3.IntegrityError), e.__cause__
+    assert isinstance(e.__cause__, psycopg.errors.UniqueViolation), e.__cause__
     print("  ux_pending_chain_address rejects the duplicate pending: ok")
 
 step("17. M1: raced first-time binds of one address -> one wins, loser 409s, never 500")
@@ -222,7 +247,7 @@ step("17. M1: raced first-time binds of one address -> one wins, loser 409s, nev
 import threading
 from eth_account import Account
 from eth_account.messages import encode_defunct
-c3=httpx.Client(follow_redirects=False, timeout=10)
+c3=httpx.Client(follow_redirects=False, timeout=30)
 r=c3.get(f"{B}/login"); loc=r.headers["location"]
 r=c3.get(loc); state=re.search(r'name="state" value="([^"]*)"', r.text).group(1)
 r=c3.post(f"{B}/authorize/confirm", data={"fin":fins[1],"redirect_uri":f"{B}/callback",
@@ -248,7 +273,7 @@ for _ in range(10):
                               [v.text[:120] for v in res.values()])
     # archive the winner's row so the next round is a first-time bind again
     with st.conn() as sc:
-        sc.execute("UPDATE wallet_bindings SET status='archived', archived_at=? WHERE address=?",
+        sc.execute("UPDATE wallet_bindings SET status='archived', archived_at=%s WHERE address=%s",
                    (st.iso(st.now()), addr))
 print("  10 raced rounds, every loser got 409 and no 500 ever: ok")
 
@@ -334,5 +359,215 @@ r=c.post(f"{B}/authorize/confirm", data={"fin":fins[0],
         "redirect_uri":"https://evil.example.com/phish","state":"s","nonce":"n"})
 assert r.status_code==400, ("confirm accepted foreign redirect_uri", r.status_code)
 print("  redirect_uri outside /callback rejected at authorize and confirm: ok")
+
+step("22. SYBIL under case variance: two identities racing one wallet, different case")
+# The sybil unique indexes compare exact strings, but EVM hex is
+# case-insensitive: '0xAbC…' and '0xabc…' are the same wallet and were two
+# different rows to Postgres. Two identities racing the check-then-insert
+# window with different-cased spellings of ONE address therefore both landed
+# active — non-negotiable #3 broken with no luck required. Addresses are
+# normalised at every write now; this asserts the race resolves.
+for _ in range(4):
+    acct=Account.create()
+    cs=acct.address                      # EIP-55 checksummed
+    lc=cs.lower()
+    assert cs!=lc, "need a mixed-case checksum address for this test to mean anything"
+    def payload_cased(cl, a):
+        n=cl.post(f"{B}/api/wallet/nonce", json={"chain":"evm","address":a}).json()
+        sig=Account.sign_message(encode_defunct(text=n["message"]), acct.key).signature.hex()
+        return {"chain":"evm","address":a,"nonce":n["nonce"],"signature":sig}
+    p2,p3=payload_cased(c2,cs),payload_cased(c3,lc)
+    gate=threading.Barrier(2); res={}
+    def fire2(k, cl, p):
+        gate.wait(); res[k]=cl.post(f"{B}/api/wallet/bind", json=p)
+    ths=[threading.Thread(target=fire2,args=("a",c2,p2)),
+         threading.Thread(target=fire2,args=("b",c3,p3))]
+    for th in ths: th.start()
+    for th in ths: th.join()
+    codes=sorted(v.status_code for v in res.values())
+    assert codes==[200,409], ("case-variant race broke the sybil contract", codes,
+                              [v.text[:120] for v in res.values()])
+    with st.conn() as sc:
+        live=sc.execute(
+            "SELECT identity_id, address FROM wallet_bindings "
+            "WHERE chain='evm' AND LOWER(address)=%s AND status IN ('active','pending')",
+            (lc,)).fetchall()
+    assert len(live)==1, ("one wallet, two live identities — sybil broken", live)
+    with st.conn() as sc:
+        sc.execute("UPDATE wallet_bindings SET status='archived', archived_at=%s "
+                   "WHERE LOWER(address)=%s", (st.iso(st.now()), lc))
+print("  4 case-variant races, exactly one live claim every time: ok")
+
+step("23. cooling: a committed cancel is never reverted by a concurrent promotion")
+# promote_due runs on every read (including the unauthenticated /api/registry),
+# so it races the user's cancel. Without a row lock and a status guard, a
+# promotion holding a stale snapshot re-activated the row the user had just
+# cancelled — the attacker's swap goes live even though the victim cancelled
+# it in time, which is exactly what the cooling period exists to prevent.
+# The mirror failure is as bad: rolling the incumbent's archival forward while
+# the replacement is cancelled leaves the identity with NO active wallet.
+for rnd in range(6):
+    ident=st.upsert_identity(secrets.token_hex(16), f"Cooling {rnd}", "")
+    incumbent, replacement = rnd_addr(), rnd_addr()
+    st.create_binding(ident["id"], "evm", incumbent, secrets.token_hex(8), "s", "m", 72)
+    st.create_binding(ident["id"], "evm", replacement, secrets.token_hex(8), "s", "m", 72)
+    st.force_due(ident["id"], "evm")
+    gate=threading.Barrier(2); out={}
+    def do_cancel():
+        gate.wait(); out["cancelled"]=st.cancel_pending(ident["id"], "evm")
+    def do_promote():
+        gate.wait(); st.promote_due()
+    ths=[threading.Thread(target=do_cancel), threading.Thread(target=do_promote)]
+    for th in ths: th.start()
+    for th in ths: th.join()
+    rows={r["address"]: r["status"] for r in st.history(ident["id"])}
+    if out["cancelled"]:
+        assert rows[replacement]=="cancelled", \
+            ("cancel returned True but the promotion revived the row", rows)
+        assert rows[incumbent]=="active", \
+            ("cancel succeeded but the incumbent was archived anyway", rows)
+    else:
+        assert rows[replacement]=="active", \
+            ("cancel returned False so the promotion must have won", rows)
+        assert rows[incumbent]=="archived", rows
+    # Either way the identity must end with exactly one active wallet.
+    act=[a for a,s in rows.items() if s=="active"]
+    assert len(act)==1, ("identity left without exactly one active wallet", rows)
+print("  6 cancel-vs-promote races, cancel always honoured, never zero active: ok")
+
+step("24. junk-priced junk: oversized or malformed bind inputs rejected before any decode")
+# b58decode is quadratic in input length. Without a length gate an oversized
+# "address" (or any unrecognized chain string falling through to the base58
+# branch) buys seconds of GIL-held CPU per request, unauthenticated-adjacent
+# DoS on a sync endpoint. All three probes below must be refused by shape
+# checks alone — fast — and a NUL-bearing address must 400 at the boundary,
+# not 500 inside Postgres. 'z', not '1': leading '1's are base58 zero-bytes
+# and decode in linear time — only non-zero digits exercise the quadratic
+# big-integer path (measured: 'z'*60000 = 5.6s, '1'*100000 = 0.00s).
+big = "z" * 60_000
+t0 = time.time()
+r = c.post(f"{B}/api/wallet/nonce", json={"chain": "solana", "address": big})
+assert r.status_code == 400, (r.status_code, r.text[:120])
+r = c.post(f"{B}/api/wallet/bind",
+           json={"chain": "solana", "address": big, "nonce": "n", "signature": "s"})
+assert r.status_code == 400, (r.status_code, r.text[:120])
+r = c.post(f"{B}/api/wallet/bind",
+           json={"chain": "not-a-chain", "address": big, "nonce": "n", "signature": "s"})
+assert r.status_code == 400, (r.status_code, r.text[:120])
+elapsed = time.time() - t0
+# Pre-fix, each probe cost ~3.5 s of quadratic decode (>10 s for the trio);
+# post-fix all three are shape-check rejections plus a session round trip to
+# the managed database. 6 s cleanly separates those worlds while tolerating
+# remote-Postgres latency.
+assert elapsed < 6.0, f"oversized inputs took {elapsed:.1f}s — something is decoding them"
+r = c.post(f"{B}/api/wallet/nonce", json={"chain": "evm", "address": "0x" + "a" * 39 + "\x00"})
+assert r.status_code == 400, ("NUL address must 400 at the boundary", r.status_code)
+print(f"  oversized/foreign-chain/NUL inputs all 400 in {elapsed:.2f}s: ok")
+
+step("25. R1 durability hygiene: expired sessions and nonces are reclaimed, live ones kept")
+# Storage no longer resets on redeploy, so TTL-dead rows must be deleted by
+# the sweep or the tables grow forever from unauthenticated traffic.
+from psycopg.types.json import Json
+dead_sid, live_sid = "t25-dead-" + secrets.token_hex(4), "t25-live-" + secrets.token_hex(4)
+dead_nonce, live_nonce = "t25-dn-" + secrets.token_hex(4), "t25-ln-" + secrets.token_hex(4)
+with st.conn() as sc:
+    for sid, delta in ((dead_sid, -1), (live_sid, +1)):
+        sc.execute(
+            "INSERT INTO sessions (sid, data, created_at, expires_at) VALUES (%s,%s,%s,%s)",
+            (sid, Json({}), st.iso(st.now()),
+             st.iso(st.now() + st.timedelta(hours=delta))))
+    for nn, delta in ((dead_nonce, -1), (live_nonce, +1)):
+        sc.execute(
+            "INSERT INTO auth_nonces (nonce, address, chain, message, expires_at) "
+            "VALUES (%s,%s,%s,%s,%s)",
+            (nn, "0x0", "evm", "m", st.iso(st.now() + st.timedelta(hours=delta))))
+swept_s, swept_n = st.sweep_expired()
+assert swept_s >= 1 and swept_n >= 1, (swept_s, swept_n)
+with st.conn() as sc:
+    sids = {r["sid"] for r in sc.execute(
+        "SELECT sid FROM sessions WHERE sid IN (%s,%s)", (dead_sid, live_sid)).fetchall()}
+    nonces = {r["nonce"] for r in sc.execute(
+        "SELECT nonce FROM auth_nonces WHERE nonce IN (%s,%s)",
+        (dead_nonce, live_nonce)).fetchall()}
+assert sids == {live_sid}, ("sweep must delete exactly the expired session", sids)
+assert nonces == {live_nonce}, ("sweep must delete exactly the expired nonce", nonces)
+# The signed-in session driving this suite has a future expiry — it must survive.
+assert c.get(f"{B}/api/me").json()["authenticated"], "sweep destroyed a live session"
+with st.conn() as sc:
+    sc.execute("DELETE FROM sessions WHERE sid = %s", (live_sid,))
+    sc.execute("DELETE FROM auth_nonces WHERE nonce = %s", (live_nonce,))
+print("  expired rows reclaimed, live session survives the sweep: ok")
+
+# The sweep's predicate and its index must share a collation. They did not on
+# the first cut: expires_at is TEXT, the sweep compares COLLATE "C" (the
+# default collation does not order ISO-8601 chronologically below one second),
+# and an index built in the default collation is UNUSABLE by that comparison —
+# so the sweep silently seq-scanned the one table an attacker grows. Assert
+# the planner can actually reach the index, not merely that one exists.
+with st.conn() as sc:
+    for idx in ("ix_sessions_expires", "ix_auth_nonces_expires"):
+        d = sc.execute("SELECT indexdef FROM pg_indexes WHERE schemaname='public' "
+                       "AND indexname=%s", (idx,)).fetchone()
+        assert d, f"{idx} is missing — the sweep would scan the whole table"
+        assert 'COLLATE "C"' in d["indexdef"], \
+            (f"{idx} collation does not match the sweep predicate", d["indexdef"])
+    sc.execute("SET enable_seqscan = off")
+    for tbl in ("sessions", "auth_nonces"):
+        plan = " ".join(r["QUERY PLAN"] for r in sc.execute(
+            f'EXPLAIN DELETE FROM {tbl} WHERE expires_at COLLATE "C" < %s',
+            (st.iso(st.now()),)).fetchall())
+        assert "Index" in plan, (f"sweep on {tbl} cannot use its index", plan)
+print("  sweep predicate and index share a collation; planner reaches it: ok")
+
+step("26. destruction is gated on the TARGET database, not the caller's environment")
+# R1 made the database durable, which made reset() capable of irreversible
+# loss. A guard reading the caller's own APP_ENV is not a guard — the caller
+# sets it. Both gates must refuse independently, and the marker must name the
+# database it was written for so a dev dump restored onto production does not
+# carry permission to wipe it.
+saved_env = os.environ.get("APP_ENV")
+os.environ.pop("APP_ENV", None)
+try:
+    st.reset()
+    raise AssertionError("reset() dropped tables with APP_ENV unset")
+except RuntimeError as e:
+    assert "dev-only" in str(e), e
+if saved_env is not None:
+    os.environ["APP_ENV"] = saved_env
+else:
+    os.environ["APP_ENV"] = "dev"
+print("  gate 1: refuses when the caller is not dev: ok")
+
+with st.conn() as sc:
+    marker = sc.execute(
+        "SELECT value FROM registry_meta WHERE key='disposable_registry'").fetchone()
+assert marker, "suite ran against a database with no disposable marker"
+original_marker = marker["value"]
+with st.conn() as sc:
+    sc.execute("UPDATE registry_meta SET value=%s WHERE key='disposable_registry'",
+               ("db.some-other-project.supabase.co:5432/postgres",))
+try:
+    st.reset()
+    raise AssertionError("reset() honoured a marker naming a different database")
+except RuntimeError as e:
+    assert "marker names" in str(e), e
+print("  gate 2: refuses when the marker names another database: ok")
+
+with st.conn() as sc:
+    sc.execute("DELETE FROM registry_meta WHERE key='disposable_registry'")
+try:
+    st.reset()
+    raise AssertionError("reset() dropped an unmarked database")
+except RuntimeError as e:
+    assert "not marked disposable" in str(e), e
+print("  gate 2: refuses when the database is unmarked: ok")
+
+# Restore the marker so the next run can prepare a clean registry.
+with st.conn() as sc:
+    sc.execute("INSERT INTO registry_meta (key,value,set_at) VALUES "
+               "('disposable_registry',%s,%s) ON CONFLICT (key) DO UPDATE SET "
+               "value=excluded.value, set_at=excluded.set_at", (original_marker, st.iso(st.now())))
+assert st.disposable()[0], "failed to restore the disposable marker"
+print("  marker restored; both gates verified independent: ok")
 
 print("\n\nALL CHECKS PASSED")

@@ -7,4 +7,8 @@ screenshots/
 .git/
 *.md
 !REBUILD.md
-frontend/.env.local
+# No dotenv file may ever be baked into an image layer. backend/.env holds
+# SUPABASE_DB_URL (a live database credential) — production reads it from the
+# platform's env vars, never from a copied file.
+**/.env
+**/.env.*

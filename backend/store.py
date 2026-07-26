@@ -1,5 +1,5 @@
 """
-SQLite storage layer.
+Postgres (Supabase) storage layer.
 
 The two partial unique indexes below are the whole point of this demo:
   - one ACTIVE wallet per (identity, chain)
@@ -8,22 +8,40 @@ The two partial unique indexes below are the whole point of this demo:
 The second is the sybil constraint. Without it, one wallet could be claimed
 by two different Fayda identities, and the "one verified person, one wallet"
 guarantee collapses.
+
+R1 (Supabase keystone): data lives in managed Postgres, not a file on the
+container's ephemeral disk — it survives deploy, restart, and scale-out, and
+the sybil unique indexes hold across every app instance because they live in
+the one shared database. Postgres is also what makes R2's Row-Level Security
+possible at all. The connection string comes ONLY from SUPABASE_DB_URL (env
+or backend/.env, which is gitignored); it is never hardcoded here.
 """
 
-import json
-import sqlite3
+import atexit
+import os
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 
-DB_PATH = Path(__file__).parent / "registry.db"
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Json
+from psycopg_pool import ConnectionPool
 
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
+# EVM hex is case-insensitive — the EIP-55 mixed case is a display checksum,
+# not part of the identifier — while Solana base58 IS case-sensitive. The
+# unique indexes compare exact strings, so without one canonical form per chain
+# '0xAbC…' and '0xabc…' are two rows to Postgres and two identities can hold
+# one wallet. Deriving the canonical form as a GENERATED column means the
+# database computes it: no code path, present or future, can write a row that
+# escapes the sybil index, and `address` keeps its checksummed spelling for
+# display.
+ADDRESS_NORM = ("CASE WHEN chain = 'evm' THEN lower(address) ELSE address END")
 
+SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS identities (
     id            TEXT PRIMARY KEY,
     fin_hmac      TEXT NOT NULL UNIQUE,   -- HMAC-SHA256(pepper, FIN). Raw FIN is never stored.
@@ -49,26 +67,6 @@ CREATE TABLE IF NOT EXISTS wallet_bindings (
     archived_at   TEXT
 );
 
--- One ACTIVE wallet per identity per chain.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_active_identity_chain
-    ON wallet_bindings (identity_id, chain) WHERE status = 'active';
-
--- One ACTIVE identity per address per chain. This is the sybil constraint.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_active_chain_address
-    ON wallet_bindings (chain, address) WHERE status = 'active';
-
--- Only one pending replacement in flight per identity per chain.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_identity_chain
-    ON wallet_bindings (identity_id, chain) WHERE status = 'pending';
-
--- One PENDING claim per address per chain, across identities. The app-level
--- sybil check covers pending rows but is check-then-insert; two identities
--- racing that window could each park a pending row on the same address, and
--- the loser would then hit ux_active_chain_address inside promote_due on every
--- read. Close the window at the DB layer, like the active tier.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_chain_address
-    ON wallet_bindings (chain, address) WHERE status = 'pending';
-
 CREATE TABLE IF NOT EXISTS auth_nonces (
     nonce       TEXT PRIMARY KEY,
     address     TEXT NOT NULL,
@@ -88,10 +86,55 @@ CREATE TABLE IF NOT EXISTS auth_nonces (
 -- gets only the opaque sid.
 CREATE TABLE IF NOT EXISTS sessions (
     sid         TEXT PRIMARY KEY,
-    data        TEXT NOT NULL,   -- JSON
+    data        JSONB NOT NULL,
     created_at  TEXT NOT NULL,
     expires_at  TEXT NOT NULL
 );
+
+-- Properties of THIS database, as opposed to the process talking to it. The
+-- disposable marker (see reset) lives here because a guard that reads the
+-- caller's own environment is not a guard: the caller sets the environment.
+CREATE TABLE IF NOT EXISTS registry_meta (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL,
+    set_at  TEXT NOT NULL
+);
+"""
+
+# Created after the canonical-address column exists (see init).
+SCHEMA_INDEXES = """
+-- One ACTIVE wallet per identity per chain.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_active_identity_chain
+    ON wallet_bindings (identity_id, chain) WHERE status = 'active';
+
+-- One ACTIVE identity per address per chain. This is the sybil constraint.
+-- Keyed on the canonical address so a differently-cased spelling of one
+-- wallet cannot be a second row.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_active_chain_address
+    ON wallet_bindings (chain, address_norm) WHERE status = 'active';
+
+-- Only one pending replacement in flight per identity per chain.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_identity_chain
+    ON wallet_bindings (identity_id, chain) WHERE status = 'pending';
+
+-- One PENDING claim per address per chain, across identities. The app-level
+-- sybil check covers pending rows but is check-then-insert; two identities
+-- racing that window could each park a pending row on the same address, and
+-- the loser would then hit ux_active_chain_address inside promote_due on every
+-- read. Close the window at the DB layer, like the active tier.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_chain_address
+    ON wallet_bindings (chain, address_norm) WHERE status = 'pending';
+
+-- The TTL sweep deletes by expires_at on exactly the two tables unauthenticated
+-- traffic grows. Without these it seq-scans the attacker's own variable every
+-- cycle: the defence gets more expensive the more it is needed.
+--
+-- COLLATE "C" here is not decoration: it must MATCH the sweep's predicate. An
+-- index in the default collation is unusable by a `COLLATE "C"` comparison —
+-- verified with EXPLAIN, which fell back to a sequential scan — so the two
+-- fixes would have silently cancelled each other out.
+CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions (expires_at COLLATE "C");
+CREATE INDEX IF NOT EXISTS ix_auth_nonces_expires ON auth_nonces (expires_at COLLATE "C");
 """
 
 
@@ -107,42 +150,329 @@ def parse(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
-# One connection at a time per process. Concurrent open/close of the same
-# SQLite file across threads can deadlock inside the OS sqlite library (seen
-# on macOS: connection_close in sqlite3WalClose and connection_init in
-# findReusableFd wait on the same inode mutex forever), hanging every request
-# — a two-users-clicking-at-once denial of service. SQLite serializes writers
-# anyway; this only serializes the open/close churn that triggers the hang.
-# No store function opens a second connection while holding one, so a plain
-# (non-reentrant) lock cannot self-deadlock.
-_DB_LOCK = threading.Lock()
+# Only this key may be loaded from the dotenv file. A .env that reaches a
+# server must never be able to flip APP_ENV to dev (arming the whole dev
+# surface) or plant SESSION_SECRET/FIN_PEPPER/PRIVY_APP_ID behind the
+# operator's back — those come from the real environment or not at all.
+_DOTENV_ALLOWED = frozenset({"SUPABASE_DB_URL"})
+
+
+def _load_dotenv() -> None:
+    """
+    Minimal loader for backend/.env (gitignored) so local dev and t.py find
+    SUPABASE_DB_URL without exporting it. Real env vars always win. No comment
+    stripping mid-line: a DB password may legitimately contain '#'.
+    """
+    p = Path(__file__).parent / ".env"
+    if not p.exists():
+        return
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        if k in _DOTENV_ALLOWED and k not in os.environ:
+            os.environ[k] = v
+
+
+def _conninfo() -> str:
+    """
+    Parse SUPABASE_DB_URL by hand instead of handing it to libpq's URI parser:
+    a password containing raw '#' or '?' breaks both urllib.parse and libpq
+    URI splitting, and a mangled password shows up only as a confusing auth
+    failure. Percent-escapes are honoured so a properly-encoded URL works too.
+    """
+    _load_dotenv()
+    url = os.getenv("SUPABASE_DB_URL")
+    if not url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL must be set (env or backend/.env) — R1 moved "
+            "storage to Supabase Postgres; there is no SQLite fallback"
+        )
+    scheme, _, rest = url.partition("://")
+    if scheme not in ("postgres", "postgresql"):
+        raise RuntimeError("SUPABASE_DB_URL must be a postgresql:// URL")
+    userinfo, _, hostpart = rest.rpartition("@")
+    user, _, password = userinfo.partition(":")
+    hostport, _, path = hostpart.partition("/")
+    host, _, port = hostport.partition(":")
+    dbname, _, query = path.partition("?")
+    # Honour explicit URL query params (a deliberate sslmode=verify-full must
+    # not be silently discarded), but default sslmode=require: 'prefer' would
+    # fall back to PLAINTEXT if a middlebox strips TLS, sending the credential
+    # and all registry PII in the clear.
+    kw: dict = {
+        "host": host, "port": int(port or 5432), "dbname": dbname or "postgres",
+        "user": unquote(user), "password": unquote(password),
+    }
+    for p in query.split("&"):
+        if "=" in p:
+            k, _, v = p.partition("=")
+            kw[k] = unquote(v)
+    kw.setdefault("sslmode", "require")
+    return psycopg.conninfo.make_conninfo(**kw)
+
+
+# The old process-global _DB_LOCK is gone: it existed to serialize SQLite
+# open/close churn that deadlocked inside the OS sqlite library. Postgres has
+# real concurrency — the pool below hands out independent connections and the
+# unique indexes arbitrate races server-side. The only lock left guards lazy
+# pool creation, never queries.
+_POOL: ConnectionPool | None = None
+_POOL_LOCK = threading.Lock()
+
+
+def _configure(c: psycopg.Connection) -> None:
+    # Supabase ships its own auth.identities / auth.sessions tables. Every
+    # statement here is schema-unqualified, so pin the search path to public —
+    # a surprise search_path must never let reset()'s DROP or any query
+    # resolve to Supabase's auth schema.
+    c.execute("SET search_path TO public")
+    c.commit()
+
+
+def _pool() -> ConnectionPool:
+    global _POOL
+    if _POOL is None:
+        with _POOL_LOCK:
+            if _POOL is None:
+                _POOL = ConnectionPool(
+                    _conninfo(),
+                    configure=_configure,
+                    min_size=1,
+                    # Every store call takes a checkout, and each checkout
+                    # costs a remote round trip to a managed database — a
+                    # ceiling of 4 made concurrent readers queue for tens of
+                    # seconds. Still bounded: Supabase's session-mode pooler
+                    # holds one server session per open client connection, and
+                    # several processes (app, tests) may share the project.
+                    max_size=12,
+                    # Recycle connections the platform pooler may have dropped
+                    # while they sat idle, instead of discovering it mid-request.
+                    max_idle=120.0,
+                    # prepare_threshold=None: /api/dev/reset drops and
+                    # recreates tables, which would invalidate auto-prepared
+                    # statements on other pooled connections ("cached plan
+                    # must not change result type").
+                    kwargs={"row_factory": dict_row, "prepare_threshold": None},
+                    # Revalidate pooled connections so an idle disconnect by
+                    # the platform pooler surfaces as a fresh connection, not
+                    # a failed request.
+                    check=ConnectionPool.check_connection,
+                    timeout=30,
+                    open=True,
+                )
+                # Close worker threads before interpreter teardown; without
+                # this, short-lived processes (t.py) exit with a noisy
+                # PythonFinalizationError from the pool's finalizer.
+                atexit.register(_POOL.close)
+    return _POOL
 
 
 @contextmanager
 def conn():
-    with _DB_LOCK:
-        c = sqlite3.connect(DB_PATH)
-        c.row_factory = sqlite3.Row
-        try:
-            yield c
-            c.commit()
-        finally:
-            c.close()
+    # pool.connection() commits on clean exit and rolls back on exception —
+    # the same semantics the SQLite context manager had.
+    with _pool().connection() as c:
+        yield c
+
+
+def normalize_address(chain: str, address: str) -> str:
+    """
+    The canonical form of an address, mirroring the ADDRESS_NORM generated
+    column. Used wherever application code compares two addresses, so the app
+    and the sybil indexes agree on what "the same wallet" means. EVM hex is
+    case-insensitive; Solana base58 is not and passes through untouched.
+    """
+    return address.lower() if chain == "evm" else address
+
+
+def _create_schema(c: psycopg.Connection) -> None:
+    """
+    The whole schema, on a caller-supplied connection so init() and reset()
+    can each run it inside their own single transaction.
+    """
+    # Serialize concurrent boots: two instances racing CREATE ... IF NOT
+    # EXISTS can still collide inside Postgres' catalog. Transaction-scoped,
+    # so it releases at commit.
+    c.execute("SELECT pg_advisory_xact_lock(727401)")
+    c.execute(SCHEMA_TABLES)
+
+    # Canonical-address column, then the indexes that depend on it. Adding
+    # it separately (rather than in the CREATE TABLE) is what lets a
+    # database created before this change migrate in place.
+    c.execute(
+        "ALTER TABLE wallet_bindings ADD COLUMN IF NOT EXISTS address_norm "
+        f"TEXT GENERATED ALWAYS AS ({ADDRESS_NORM}) STORED"
+    )
+
+    # A database written before the canonical column existed may already
+    # hold two live rows that differ only in case — exactly what the new
+    # index forbids. Creating it would then raise inside init() at import
+    # time and the app would refuse to boot, turning a data problem into a
+    # hard outage. Resolve first: keep the oldest claim per (chain,
+    # canonical address, tier) and cancel the rest, which is the same
+    # outcome the index would have produced had it existed.
+    c.execute(
+        """WITH dupes AS (
+               SELECT id, ROW_NUMBER() OVER (
+                   PARTITION BY chain, address_norm, status
+                   ORDER BY requested_at) AS rn
+               FROM wallet_bindings
+               WHERE status IN ('active','pending'))
+           UPDATE wallet_bindings SET status='cancelled', archived_at=%s
+           WHERE id IN (SELECT id FROM dupes WHERE rn > 1)""",
+        (iso(now()),),
+    )
+
+    # Replace any address-keyed index left from before the canonical column.
+    # Same names, so nothing else in the code or the docs has to know.
+    for name in ("ux_active_chain_address", "ux_pending_chain_address"):
+        stale = c.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname='public' "
+            "AND indexname=%s AND indexdef NOT LIKE %s",
+            (name, "%address_norm%"),
+        ).fetchone()
+        if stale:
+            c.execute(f"DROP INDEX {name}")
+
+    # Same migration for the TTL indexes: an earlier cut created them in the
+    # default collation, which the sweep's COLLATE "C" predicate cannot use.
+    # CREATE INDEX IF NOT EXISTS would leave the useless one in place.
+    for name in ("ix_sessions_expires", "ix_auth_nonces_expires"):
+        stale = c.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname='public' "
+            "AND indexname=%s AND indexdef NOT LIKE %s",
+            (name, '%COLLATE "C"%'),
+        ).fetchone()
+        if stale:
+            c.execute(f"DROP INDEX {name}")
+
+    c.execute(SCHEMA_INDEXES)
 
 
 def init():
     with conn() as c:
-        c.executescript(SCHEMA)
+        _create_schema(c)
+
+
+_DISPOSABLE_KEY = "disposable_registry"
+
+
+def _target(c: psycopg.Connection) -> str:
+    """
+    Which database this connection actually reached, as attested by the SERVER.
+
+    Not host:port/dbname. Behind Supabase's session pooler every project in a
+    region answers on the same hostname and database name, so that fingerprint
+    is byte-identical for the dev and production projects — it would have
+    happily transferred a dev grant to production, the exact case this exists
+    to stop. And the host is echoed conninfo: caller-supplied config, not
+    something the server told us.
+
+    system_identifier is generated at initdb, is unique per cluster, is not
+    carried by pg_dump, and comes from the server. A dev dump restored onto a
+    production cluster therefore arrives carrying a marker that no longer
+    matches, and the grant does not travel with the data.
+    """
+    row = c.execute(
+        "SELECT system_identifier FROM pg_control_system()"
+    ).fetchone()
+    return f"pg{row['system_identifier']}/{c.info.dbname}"
+
+
+def mark_disposable() -> str:
+    """
+    Declare THIS database throwaway, so reset() may drop it. A deliberate,
+    explicit act against one specific database — never a side effect of
+    running the app or the tests. Run once per dev database:
+
+        APP_ENV=dev python backend/store.py mark-disposable
+    """
+    if os.getenv("APP_ENV") != "dev":
+        raise RuntimeError("refusing to mark a database disposable outside dev")
+    with conn() as c:
+        target = _target(c)
+        # A database holding real identities is not a throwaway. This is the
+        # one command that can authorize destruction, so it refuses the shape
+        # of a mistake — aiming it at a populated registry — rather than
+        # trusting that whoever typed it checked which .env was loaded.
+        n = c.execute("SELECT count(*) AS n FROM identities").fetchone()["n"]
+        if n and os.getenv("MARK_DISPOSABLE_ANYWAY") != "1":
+            raise RuntimeError(
+                f"{target} holds {n} identities — refusing to mark a populated "
+                f"registry disposable. If this really is throwaway data, set "
+                f"MARK_DISPOSABLE_ANYWAY=1."
+            )
+        c.execute(
+            """INSERT INTO registry_meta (key, value, set_at) VALUES (%s,%s,%s)
+               ON CONFLICT (key) DO UPDATE SET value = excluded.value,
+                                               set_at = excluded.set_at""",
+            (_DISPOSABLE_KEY, target, iso(now())),
+        )
+    return target
+
+
+def disposable() -> tuple[bool, str]:
+    """
+    Whether the database in hand has declared itself throwaway. The marker
+    records the target it was written for and must still match, so a dump of a
+    dev database restored onto a production host does not carry permission to
+    wipe it along with the data.
+    """
+    with conn() as c:
+        target = _target(c)
+        try:
+            row = c.execute(
+                "SELECT value FROM registry_meta WHERE key = %s", (_DISPOSABLE_KEY,)
+            ).fetchone()
+        except psycopg.errors.UndefinedTable:
+            # Never initialised. Report it as "not disposable" so callers get
+            # the guidance path rather than a raw driver traceback.
+            return False, f"{target} has no registry schema yet"
+    if not row:
+        return False, f"{target} is not marked disposable"
+    if row["value"] != target:
+        return False, (f"the disposable marker names {row['value']}, "
+                       f"but this connection reached {target}")
+    return True, target
 
 
 def reset():
-    if DB_PATH.exists():
-        DB_PATH.unlink()
-    for suffix in ("-wal", "-shm"):
-        p = Path(str(DB_PATH) + suffix)
-        if p.exists():
-            p.unlink()
-    init()
+    """DEV ONLY (reached via /api/dev/reset). Drops and recreates the schema."""
+    # Two independent gates, and — this is the point — the second one asks the
+    # TARGET, not the caller. APP_ENV alone was not a guard: any caller can set
+    # it, and the test suite did exactly that two lines before calling this,
+    # turning `python backend/t.py` into a one-command wipe of whatever
+    # SUPABASE_DB_URL happened to name. A production database has never been
+    # marked disposable, so it now refuses no matter what the caller's
+    # environment claims.
+    if os.getenv("APP_ENV") != "dev":
+        raise RuntimeError("store.reset() is dev-only — refusing to drop tables")
+    ok, why = disposable()
+    if not ok:
+        raise RuntimeError(
+            f"refusing to drop tables: {why}. If this really is a throwaway "
+            f"database, run: APP_ENV=dev python backend/store.py mark-disposable"
+        )
+    with conn() as c:
+        # Take the advisory lock BEFORE the DROP. _create_schema acquires it
+        # first and then touches tables; dropping first and acquiring second
+        # inverts that order against a concurrently booting instance, which is
+        # a genuine deadlock (reproduced). One lock order everywhere.
+        c.execute("SELECT pg_advisory_xact_lock(727401)")
+        # Drop and recreate in ONE transaction: committing the DROP separately
+        # left a window where the tables did not exist and every concurrent
+        # request 500'd. Harmless against a local file; not against a shared
+        # database other processes are querying. registry_meta is deliberately
+        # not dropped — it holds no registry data, and dropping it would
+        # discard the marker that authorized this.
+        c.execute(
+            "DROP TABLE IF EXISTS wallet_bindings, auth_nonces, sessions, "
+            "identities CASCADE"
+        )
+        _create_schema(c)
 
 
 # ---------------------------------------------------------------- identities
@@ -151,11 +481,11 @@ def upsert_identity(fin_hmac: str, display_name: str, birthdate: str) -> dict:
     """Called after a successful Fayda authentication."""
     with conn() as c:
         row = c.execute(
-            "SELECT * FROM identities WHERE fin_hmac = ?", (fin_hmac,)
+            "SELECT * FROM identities WHERE fin_hmac = %s", (fin_hmac,)
         ).fetchone()
         if row:
             c.execute(
-                "UPDATE identities SET last_seen_at = ? WHERE id = ?",
+                "UPDATE identities SET last_seen_at = %s WHERE id = %s",
                 (iso(now()), row["id"]),
             )
             return dict(row)
@@ -168,20 +498,27 @@ def upsert_identity(fin_hmac: str, display_name: str, birthdate: str) -> dict:
             "verified_at": iso(now()),
             "last_seen_at": iso(now()),
         }
-        c.execute(
+        # ON CONFLICT, not a bare INSERT: this is check-then-insert, and two
+        # concurrent first logins of one identity (a double-clicked login, or
+        # two demo visitors picking the same persona) would otherwise make the
+        # loser's INSERT violate identities_fin_hmac_key and 500 the OIDC
+        # callback. The loser must land on the winner's row, not an error.
+        row = c.execute(
             """INSERT INTO identities (id, fin_hmac, display_name, birthdate,
                                        verified_at, last_seen_at)
-               VALUES (:id, :fin_hmac, :display_name, :birthdate,
-                       :verified_at, :last_seen_at)""",
+               VALUES (%(id)s, %(fin_hmac)s, %(display_name)s, %(birthdate)s,
+                       %(verified_at)s, %(last_seen_at)s)
+               ON CONFLICT (fin_hmac) DO UPDATE SET last_seen_at = excluded.last_seen_at
+               RETURNING *""",
             ident,
-        )
-        return ident
+        ).fetchone()
+        return dict(row)
 
 
 def get_identity(identity_id: str) -> dict | None:
     with conn() as c:
         row = c.execute(
-            "SELECT * FROM identities WHERE id = ?", (identity_id,)
+            "SELECT * FROM identities WHERE id = %s", (identity_id,)
         ).fetchone()
         return dict(row) if row else None
 
@@ -190,30 +527,58 @@ def get_identity(identity_id: str) -> dict | None:
 
 def load_session(sid: str) -> dict | None:
     with conn() as c:
-        row = c.execute("SELECT * FROM sessions WHERE sid = ?", (sid,)).fetchone()
+        row = c.execute("SELECT * FROM sessions WHERE sid = %s", (sid,)).fetchone()
         if not row:
             return None
         if parse(row["expires_at"]) < now():
-            c.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+            c.execute("DELETE FROM sessions WHERE sid = %s", (sid,))
             return None
-        return json.loads(row["data"])
+        return row["data"]
 
 
-def save_session(sid: str, data: dict, ttl_hours: int) -> None:
+def save_session(sid: str, data: dict, ttl_hours: float) -> None:
     with conn() as c:
         c.execute(
             """INSERT INTO sessions (sid, data, created_at, expires_at)
-               VALUES (?,?,?,?)
+               VALUES (%s,%s,%s,%s)
                ON CONFLICT(sid) DO UPDATE SET
                    data = excluded.data, expires_at = excluded.expires_at""",
-            (sid, json.dumps(data), iso(now()),
+            (sid, Json(data), iso(now()),
              iso(now() + timedelta(hours=ttl_hours))),
         )
 
 
 def delete_session(sid: str) -> None:
     with conn() as c:
-        c.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+        c.execute("DELETE FROM sessions WHERE sid = %s", (sid,))
+
+
+def sweep_expired() -> tuple[int, int]:
+    """
+    Reclaim TTL-dead rows from the two tables that grow with traffic. R1 made
+    storage durable — nothing resets the database anymore — and both tables
+    are attacker-growable without credentials (every /login persists a session
+    row; expired rows were only ever swept lazily, on a load of that exact
+    sid, which an anonymous row never gets). Without this, an unauthenticated
+    loop grows the database forever.
+
+    COLLATE "C" is load-bearing. These timestamps are TEXT, and this database's
+    default collation (en_US.UTF-8) does NOT order ISO-8601 strings
+    chronologically — it ignores punctuation weight, so
+    '…12:00:00+00:00' < '…12:00:00.500000+00:00' is false. The error is
+    sub-second and would be harmless here, but the next comparison added
+    against these columns might not be; C collation is plain byte order, under
+    which fixed-width ISO-8601 UTC does sort chronologically.
+    """
+    with conn() as c:
+        cutoff = iso(now())
+        s = c.execute(
+            'DELETE FROM sessions WHERE expires_at COLLATE "C" < %s', (cutoff,)
+        ).rowcount
+        n = c.execute(
+            'DELETE FROM auth_nonces WHERE expires_at COLLATE "C" < %s', (cutoff,)
+        ).rowcount
+    return s, n
 
 
 # ------------------------------------------------------------------- nonces
@@ -223,7 +588,7 @@ def issue_nonce(nonce: str, address: str, chain: str, message: str,
     with conn() as c:
         c.execute(
             "INSERT INTO auth_nonces (nonce, address, chain, message, expires_at, issued_via) "
-            "VALUES (?,?,?,?,?,?)",
+            "VALUES (%s,%s,%s,%s,%s,%s)",
             (nonce, address, chain, message,
              iso(now() + timedelta(seconds=ttl_seconds)), issued_via),
         )
@@ -238,8 +603,12 @@ def consume_nonce(nonce: str, address: str, chain: str) -> tuple[bool, str, str,
     claimed by the client.
     """
     with conn() as c:
+        # FOR UPDATE + the consumed check inside one transaction: two racing
+        # binds presenting the same nonce serialize here, and the loser sees
+        # consumed=1. SQLite got this for free from its single-writer model;
+        # real concurrency has to ask for the row lock.
         row = c.execute(
-            "SELECT * FROM auth_nonces WHERE nonce = ?", (nonce,)
+            "SELECT * FROM auth_nonces WHERE nonce = %s FOR UPDATE", (nonce,)
         ).fetchone()
         if not row:
             return False, "unknown nonce", "", ""
@@ -247,9 +616,13 @@ def consume_nonce(nonce: str, address: str, chain: str) -> tuple[bool, str, str,
             return False, "nonce already used", "", ""
         if parse(row["expires_at"]) < now():
             return False, "nonce expired", "", ""
-        if row["address"].lower() != address.lower() or row["chain"] != chain:
+        # Compare in the canonical form, not blanket .lower(): base58 is
+        # case-sensitive, so lowercasing a Solana address would treat two
+        # different public keys as one.
+        if (normalize_address(chain, row["address"]) != normalize_address(chain, address)
+                or row["chain"] != chain):
             return False, "nonce was issued for a different address or chain", "", ""
-        c.execute("UPDATE auth_nonces SET consumed = 1 WHERE nonce = ?", (nonce,))
+        c.execute("UPDATE auth_nonces SET consumed = 1 WHERE nonce = %s", (nonce,))
         return True, "", row["message"], row["issued_via"]
 
 
@@ -259,11 +632,15 @@ class BindingConflict(Exception):
     """A bind lost a race to a unique index. The message is safe for the client."""
 
 
+class _NotPending(Exception):
+    """Internal: a promotion candidate stopped being pending under us."""
+
+
 def active_binding(identity_id: str, chain: str) -> dict | None:
     with conn() as c:
         row = c.execute(
             """SELECT * FROM wallet_bindings
-               WHERE identity_id = ? AND chain = ? AND status = 'active'""",
+               WHERE identity_id = %s AND chain = %s AND status = 'active'""",
             (identity_id, chain),
         ).fetchone()
         return dict(row) if row else None
@@ -273,20 +650,25 @@ def pending_binding(identity_id: str, chain: str) -> dict | None:
     with conn() as c:
         row = c.execute(
             """SELECT * FROM wallet_bindings
-               WHERE identity_id = ? AND chain = ? AND status = 'pending'""",
+               WHERE identity_id = %s AND chain = %s AND status = 'pending'""",
             (identity_id, chain),
         ).fetchone()
         return dict(row) if row else None
 
 
 def address_claimed_by_other(chain: str, address: str, identity_id: str) -> bool:
-    """The sybil check, enforced in code as well as by the index."""
+    """
+    The sybil check, enforced in code as well as by the index. Compares the
+    canonical address so this check and the unique indexes agree on what "the
+    same address" means — a mismatch there is how a case-variant race slips
+    past both.
+    """
     with conn() as c:
         row = c.execute(
             """SELECT identity_id FROM wallet_bindings
-               WHERE chain = ? AND LOWER(address) = LOWER(?)
+               WHERE chain = %s AND address_norm = %s
                  AND status IN ('active','pending')""",
-            (chain, address),
+            (chain, normalize_address(chain, address)),
         ).fetchone()
         return bool(row) and row["identity_id"] != identity_id
 
@@ -304,6 +686,9 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
         "id": str(uuid.uuid4()),
         "identity_id": identity_id,
         "chain": chain,
+        # Stored as the wallet spelled it (EIP-55 checksum is a typo-catching
+        # display feature worth keeping). Uniqueness is enforced on the
+        # database-generated address_norm, so case cannot fork a row.
         "address": address,
         "proof_nonce": nonce,
         "proof_sig": sig,
@@ -322,19 +707,22 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
                    (id, identity_id, chain, address, status, proof_nonce, proof_sig,
                     proof_message, proof_method, requested_at, activates_at,
                     activated_at, archived_at)
-                   VALUES (:id,:identity_id,:chain,:address,:status,:proof_nonce,:proof_sig,
-                           :proof_message,:proof_method,:requested_at,:activates_at,
-                           :activated_at,:archived_at)""",
+                   VALUES (%(id)s,%(identity_id)s,%(chain)s,%(address)s,%(status)s,
+                           %(proof_nonce)s,%(proof_sig)s,%(proof_message)s,
+                           %(proof_method)s,%(requested_at)s,%(activates_at)s,
+                           %(activated_at)s,%(archived_at)s)""",
                 row,
             )
-        except sqlite3.IntegrityError as e:
+        except psycopg.errors.UniqueViolation as e:
             # The app-level checks are check-then-insert; a concurrent bind can
             # land between them and this INSERT. The unique indexes hold the
             # invariant — this only translates the loss into a client-safe
-            # message instead of a 500. SQLite names the violated columns:
-            # (chain, address) means another identity claimed this wallet;
-            # (identity_id, chain) means this identity double-submitted.
-            if "wallet_bindings.address" in str(e):
+            # message instead of a 500. Postgres names the violated index in
+            # diag.constraint_name: a *_chain_address index means another
+            # identity claimed this wallet; *_identity_chain means this
+            # identity double-submitted.
+            name = (e.diag.constraint_name or "")
+            if name.endswith("_chain_address"):
                 raise BindingConflict(
                     "this wallet is already bound to a different Fayda identity"
                 ) from e
@@ -346,15 +734,31 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
 
 def cancel_pending(identity_id: str, chain: str) -> bool:
     """The escape hatch. If an attacker initiates a swap, the real user kills it here."""
-    p = pending_binding(identity_id, chain)
-    if not p:
-        return False
     with conn() as c:
-        c.execute(
-            "UPDATE wallet_bindings SET status='cancelled', archived_at=? WHERE id=?",
+        # Read and write in ONE transaction, holding the row lock: promote_due
+        # runs on every read (including the unauthenticated /api/registry) and
+        # takes the same lock, so cancel either happens entirely before a
+        # promotion or entirely after it. Under the old SQLite global lock this
+        # atomicity was free; with real concurrency an unguarded
+        # read-then-write let a concurrent promotion resurrect the cancelled
+        # row and activate an attacker's swap — the precise failure the cooling
+        # period exists to prevent.
+        p = c.execute(
+            """SELECT id FROM wallet_bindings
+               WHERE identity_id = %s AND chain = %s AND status = 'pending'
+               FOR UPDATE""",
+            (identity_id, chain),
+        ).fetchone()
+        if not p:
+            return False
+        # AND status='pending' so the UPDATE is a no-op if the row stopped
+        # being pending after the lock was granted.
+        n = c.execute(
+            "UPDATE wallet_bindings SET status='cancelled', archived_at=%s "
+            "WHERE id=%s AND status='pending'",
             (iso(now()), p["id"]),
-        )
-    return True
+        ).rowcount
+    return n == 1
 
 
 def promote_due(identity_id: str | None = None) -> int:
@@ -364,11 +768,24 @@ def promote_due(identity_id: str | None = None) -> int:
     """
     promoted = 0
     with conn() as c:
-        q = "SELECT * FROM wallet_bindings WHERE status='pending'"
-        args: tuple = ()
+        # Lock the candidate rows and re-read them under the lock. Without
+        # this, a cancel committed between the SELECT and the UPDATE was
+        # overwritten by the stale snapshot below and the cancelled row went
+        # active. ORDER BY id keeps two concurrent promoters taking locks in
+        # the same sequence, so they queue instead of deadlocking; SKIP LOCKED
+        # leaves rows another promoter already holds to that promoter rather
+        # than blocking a read behind it.
+        # COLLATE "C": activates_at is TEXT and this database's default
+        # collation does not order ISO-8601 chronologically below one second
+        # (see sweep_expired). Byte order does. The row is re-checked in Python
+        # below regardless, so this is defence in depth, not the only guard.
+        q = ('SELECT * FROM wallet_bindings WHERE status=\'pending\''
+             ' AND activates_at COLLATE "C" <= %s')
+        args: tuple = (iso(now()),)
         if identity_id:
-            q += " AND identity_id = ?"
-            args = (identity_id,)
+            q += " AND identity_id = %s"
+            args = (iso(now()), identity_id)
+        q += " ORDER BY id FOR UPDATE SKIP LOCKED"
         for p in c.execute(q, args).fetchall():
             if parse(p["activates_at"]) > now():
                 continue
@@ -378,28 +795,45 @@ def promote_due(identity_id: str | None = None) -> int:
             # runs on every /api/me and /api/registry read, so an uncaught
             # IntegrityError would 500 every read forever. Roll back just this
             # promotion — keeping the loser's incumbent active — and cancel the
-            # conflicting row so it never retries.
+            # conflicting row so it never retries. ROLLBACK TO also clears the
+            # aborted-transaction state Postgres enters on the failed INSERT.
             c.execute("SAVEPOINT promote_one")
             try:
                 c.execute(
-                    """UPDATE wallet_bindings SET status='archived', archived_at=?
-                       WHERE identity_id=? AND chain=? AND status='active'""",
+                    """UPDATE wallet_bindings SET status='archived', archived_at=%s
+                       WHERE identity_id=%s AND chain=%s AND status='active'""",
                     (iso(now()), p["identity_id"], p["chain"]),
                 )
-                c.execute(
-                    "UPDATE wallet_bindings SET status='active', activated_at=? WHERE id=?",
+                # AND status='pending': belt to the row lock's braces. If this
+                # row stopped being pending, promote nothing — a cancelled
+                # binding must never come back to life.
+                if c.execute(
+                    "UPDATE wallet_bindings SET status='active', activated_at=%s "
+                    "WHERE id=%s AND status='pending'",
                     (iso(now()), p["id"]),
-                )
-            except sqlite3.IntegrityError:
+                ).rowcount != 1:
+                    raise _NotPending
+            except psycopg.errors.UniqueViolation:
+                # Undo this promotion only — the loser's incumbent stays
+                # active — then cancel the conflicting row so it cannot
+                # re-detonate on the next read.
                 c.execute("ROLLBACK TO promote_one")
                 c.execute(
-                    "UPDATE wallet_bindings SET status='cancelled', archived_at=? WHERE id=?",
+                    "UPDATE wallet_bindings SET status='cancelled', archived_at=%s "
+                    "WHERE id=%s AND status='pending'",
                     (iso(now()), p["id"]),
                 )
-            else:
-                promoted += 1
-            finally:
                 c.execute("RELEASE promote_one")
+            except _NotPending:
+                # Undo the incumbent archival: the replacement it was making
+                # room for is no longer promotable.
+                c.execute("ROLLBACK TO promote_one")
+                c.execute("RELEASE promote_one")
+            else:
+                # RELEASE only on the success path: ROLLBACK TO would undo the
+                # promotion this iteration just made.
+                c.execute("RELEASE promote_one")
+                promoted += 1
     return promoted
 
 
@@ -410,16 +844,26 @@ def force_due(identity_id: str, chain: str) -> bool:
         return False
     with conn() as c:
         c.execute(
-            "UPDATE wallet_bindings SET activates_at=? WHERE id=?",
+            "UPDATE wallet_bindings SET activates_at=%s WHERE id=%s",
             (iso(now() - timedelta(seconds=1)), p["id"]),
         )
     return True
 
 
+def bindings_of(identity_id: str) -> list[dict]:
+    """
+    Every binding for an identity, newest first — one query the caller slices
+    into active/pending/history. /api/me needs all three; asking separately
+    cost five pool checkouts, and a checkout on a managed database is a
+    network round trip, not a function call.
+    """
+    return history(identity_id)
+
+
 def history(identity_id: str) -> list[dict]:
     with conn() as c:
         rows = c.execute(
-            """SELECT * FROM wallet_bindings WHERE identity_id = ?
+            """SELECT * FROM wallet_bindings WHERE identity_id = %s
                ORDER BY requested_at DESC""",
             (identity_id,),
         ).fetchall()
@@ -438,3 +882,24 @@ def registry() -> list[dict]:
                FROM identities i ORDER BY i.verified_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+if __name__ == "__main__":
+    import sys
+
+    # The only supported way to authorize reset() against a database. Deliberate,
+    # explicit, and aimed at one target — never a side effect of running the app
+    # or the test suite.
+    if sys.argv[1:2] == ["mark-disposable"]:
+        init()
+        try:
+            target = mark_disposable()
+        except RuntimeError as e:
+            # A refusal is an expected outcome of this command, not a crash.
+            print(f"refused: {e}")
+            sys.exit(1)
+        print(f"marked disposable: {target}")
+        print("store.reset() and /api/dev/reset may now drop this database's tables.")
+    else:
+        print("usage: APP_ENV=dev python backend/store.py mark-disposable")
+        sys.exit(2)

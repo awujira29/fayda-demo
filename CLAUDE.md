@@ -8,8 +8,9 @@ A registry binding one Fayda-verified Ethiopian identity to at most one verified
 self-custodied wallet per chain (Ethereum, Solana). Takes no custody, holds no
 private keys. Stores only cryptographic proof that a verified person controls an address.
 
-Two processes: a Python / FastAPI / SQLite API in backend/, and a React + Vite
-+ Tailwind v4 frontend in frontend/. The wallet connector is Privy
+Two processes: a Python / FastAPI API in backend/ (storage: Supabase Postgres,
+connection string in SUPABASE_DB_URL — env or the gitignored backend/.env; no
+SQLite fallback), and a React + Vite + Tailwind v4 frontend in frontend/. The wallet connector is Privy
 (@privy-io/react-auth), used for connection only — identity always comes from
 Fayda, embedded wallets are off, external self-custody only. The frontend
 proxies every backend path so the browser never leaves its own origin — the
@@ -57,7 +58,7 @@ existing wallet must keep working. Do not simplify this into an instant swap.
 | File | Role |
 |---|---|
 | backend/app.py | OIDC client, session middleware, binding endpoints, registry API |
-| backend/store.py | Schema and queries. Unique indexes live here. |
+| backend/store.py | Schema and queries (psycopg / Supabase Postgres). Unique indexes live here. |
 | backend/verify.py | secp256k1 recovery (EVM), ed25519 verification (Solana) |
 | backend/mock_esignet.py | Throwaway. Deleted in production. |
 | backend/t.py | End-to-end tests |
@@ -99,6 +100,10 @@ Two shells:
     PUBLIC_URL=http://localhost:5173 APP_ENV=dev python backend/app.py
     cd frontend && npm run dev        # then open http://localhost:5173
 
+Storage needs SUPABASE_DB_URL — normally supplied by the gitignored
+backend/.env, which store.py loads (real env vars win). Without it the app
+refuses to start.
+
 Use localhost consistently in the browser — localhost and 127.0.0.1 are
 different cookie origins. Real wallet connection additionally needs
 VITE_PRIVY_APP_ID in frontend/.env.local (see README); without it the app
@@ -111,16 +116,27 @@ DEPLOY: one FastAPI process serves the API and the built SPA (frontend/dist)
 same-origin — see DEPLOY.md + render.yaml + Dockerfile. Outside dev the cookie
 is Secure and the public origin derives from PUBLIC_URL || RENDER_EXTERNAL_URL.
 DEMO_MODE mounts the mock IdP (personas) for a credential-less shared demo but
-NEVER /api/dev/* — a demo visitor cannot wipe the DB or skip cooling. SQLite
-resets on every redeploy/spin-down (fine for the mock; a real deploy needs
-Postgres — see M4).
+NEVER /api/dev/* — a demo visitor cannot wipe the DB or skip cooling. Storage
+is Supabase Postgres (R1): data survives redeploy/restart/scale, and the
+deploy must set SUPABASE_DB_URL or the app refuses to start.
 
 ## Testing
 
 APP_ENV=dev python backend/app.py in one shell (PUBLIC_URL unset — the tests
-drive the backend origin directly), python backend/t.py in another. All checks
-pass before anything is done. Add to t.py rather than creating parallel test
-files. For UI states: cd frontend && npm run shots regenerates screenshots/.
+drive the backend origin directly), APP_ENV=dev python backend/t.py in another.
+All checks pass before anything is done. Add to t.py rather than creating
+parallel test files. For UI states: cd frontend && npm run shots regenerates
+screenshots/.
+
+The suite starts by resetting the registry, so it runs only against a database
+that has been explicitly marked throwaway — once per dev database:
+
+    APP_ENV=dev python backend/store.py mark-disposable
+
+Storage is durable now, so nothing may drop tables on the strength of the
+caller's own APP_ENV alone: the marker records the host it was written for and
+must still match. Point backend/.env at production and both t.py and
+/api/dev/reset refuse rather than destroying it.
 
 ## What done means
 

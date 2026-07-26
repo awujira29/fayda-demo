@@ -156,6 +156,72 @@ Ethiopian data-protection rules. Unanswered. Do not integrate before it is.
 
 ## Done
 
+### R1 - Supabase Postgres migration (KEYSTONE) - done 2026-07-26
+Storage is managed Postgres, not a file on the container's disk. Data survives
+deploy, restart and scale-out, the sybil indexes hold across every instance
+because they live in one shared database, and RLS (R2) becomes possible at all.
+`SUPABASE_DB_URL` only — env or the gitignored `backend/.env`; no SQLite
+fallback, and the app refuses to start without it rather than silently
+reverting to disposable storage.
+
+**The migration itself:** psycopg3 + `ConnectionPool` (max_size 12, idle
+recycle, `check_connection` so a pooler-dropped connection surfaces as a fresh
+one rather than a failed request). Partial unique indexes ported unchanged;
+`sqlite3.IntegrityError` → `psycopg.errors.UniqueViolation`, distinguished by
+`e.diag.constraint_name`. The process-global `_DB_LOCK` is gone.
+
+**What real concurrency then required** (SQLite's single-writer model had been
+providing these for free): `consume_nonce` takes `FOR UPDATE` so two racing
+binds serialize and the loser sees `consumed=1`; `cancel_pending` reads and
+writes under one row lock, because an unguarded read-then-write let a
+concurrent promotion resurrect the cancelled row and activate an attacker's
+swap — precisely what the cooling period exists to prevent; `promote_due` uses
+`FOR UPDATE SKIP LOCKED` with `ORDER BY id` and re-checks status under the
+lock; `upsert_identity` uses `ON CONFLICT` so two first logins of one persona
+don't 500 the callback. Tests 22 and 23 are new and both were verified to fail
+against the unguarded code.
+
+**A sybil hole found and closed en route:** the indexes compared exact strings
+while the app lowercased, so `0xAbC…` and `0xabc…` were two rows to Postgres —
+two identities could hold one wallet with no race needed. Canonical form is now
+a GENERATED column (`address_norm`), so the *database* computes it and no code
+path, present or future, can write a row that escapes the index. Test 22 races
+case-variant spellings and asserts exactly one live claim.
+
+**Auditor: 0 criticals. Three highs found across three rounds, all resolved:**
+(1) quadratic base58 decode on an uncapped address — 1 MB body ≈ 345 s of
+GIL-held CPU, and `wallet_bind` never validated `chain`, so any payload could
+reach that branch. Now gated three ways; re-verified flat across a 2000x size
+range, and measured against 200,000 random keys to confirm no legitimate
+address is rejected (test 24). (2) Durability removed the redeploy-wipe that
+had been the only thing reclaiming `sessions`/`auth_nonces` — added a
+`lifespan` sweeper thread plus a 30-minute TTL for pre-auth rows (down from 12 h;
+a sweep bounds a table at rate × TTL and TTL is the term we control). Session
+table steady state at 500 req/s: 0.25 GB, from 18 GB (test 25).
+(3) **Self-inflicted, and the one worth remembering:** the fix for the suite's
+non-idempotency set `APP_ENV=dev` two lines before calling `store.reset()`,
+satisfying reset's own guard — turning the most-run command in the repo into a
+one-command wipe of whatever `SUPABASE_DB_URL` named. A guard that reads the
+caller's environment is not a guard. Destruction is now gated on the TARGET:
+`registry_meta` carries a marker naming the cluster's `system_identifier`
+(server-attested, unique per cluster, not carried by `pg_dump` — host:port/dbname
+would NOT have worked, since every Supabase project in a region shares them
+behind the session pooler). Both gates refuse independently (test 26), and
+`mark-disposable` additionally refuses a populated registry.
+
+**Verification:** `APP_ENV=dev python backend/t.py` — 26/26, twice consecutively
+(idempotency), each new test verified to fail against the code it guards. The
+suite now resets first, so it runs only against a database explicitly marked
+throwaway; point `.env` at production and it refuses instead of destroying it.
+
+**Deferred to R6, recorded honestly:** the pool saturates under ~30 concurrent
+authenticated reads (p50 22 s) — recovers, never wedges, but needs fewer
+checkouts per request and the M6 write-on-read fix; `sslmode=require` encrypts
+without authenticating the server (`verify-full` needs Supabase's root cert
+shipped); a nonce is not bound to the issuing identity, so a durable
+`proof_message` can name a different person than the binding's owner; and there
+is still no rate limiting anywhere.
+
 ### D1 - Single-service Render deploy (API + SPA, DEMO_MODE) - done 2026-07-24
 One FastAPI process serves the API and the built React SPA (frontend/dist),
 same-origin, so the cookie/OIDC flow is unchanged and there is no CORS. Vite
@@ -421,13 +487,7 @@ Persistence requirement (explicit): data must NEVER be lost on deploy/restart/sc
 Supabase chosen as the base -- it is managed Postgres + Auth + Row-Level Security in
 one platform, which collapses persistence, the login layer, and RLS into one decision.
 
-### R1 - Migrate to Supabase Postgres (KEYSTONE)
-Move storage from ephemeral SQLite to Supabase Postgres. Data persists independently
-of the app process. All SQL isolated in store.py; partial unique indexes port
-unchanged; sqlite3.IntegrityError -> psycopg UniqueViolation; drop the _DB_LOCK
-(Postgres has real concurrency). Fixes at once: durable data, sybil-across-instances,
-and makes RLS possible. Connection via Supabase connection string (env var, pooled).
-backend/t.py passes against Postgres. This unblocks R2 and R4.
+### R1 - Migrate to Supabase Postgres (KEYSTONE) - DONE 2026-07-26 (see Done)
 
 ### R2 - Supabase Auth + passkey return-login + RLS
 Real accounts. Fayda once to establish identity, then register a passkey (WebAuthn)

@@ -38,6 +38,7 @@ returned 404 (`backend/t.py` test 20 pins this).
    | `FIN_PEPPER` | generated (`generateValue: true`) | HMAC pepper for FIN hashing. **Treat as permanent** — rotating orphans every identity row (CLAUDE.md) |
    | `PRIVY_APP_ID` | your app id (set manually) | Wallet connector. Runtime config via `/config.js` — set or change it without rebuilding. Leave unset and the UI shows a designed "connector not configured" state; personas still work |
    | `PUBLIC_URL` | *(leave unset)* | The app derives the public origin from `RENDER_EXTERNAL_URL`, which Render injects (e.g. `https://fayda-wallet-registry.onrender.com`). Set `PUBLIC_URL` only for a custom domain |
+   | `SUPABASE_DB_URL` | your Supabase connection string (set manually) | Postgres storage (R1). Session-pooler string from the Supabase dashboard. Required — the app refuses to start without it |
 
 4. **Privy dashboard step** (for real wallet connections): at
    [dashboard.privy.io](https://dashboard.privy.io) create an app (free under
@@ -75,20 +76,21 @@ credentials replace the mock, redirect_uri validation must match the full
 registered URI (host *and* path)**, because the code will then have real value.
 Tracked with B1 (live Fayda integration).
 
-## The SQLite caveat — read this before sharing the link
+## Storage: Supabase Postgres (R1)
 
-**The database resets on every redeploy and on free-tier spin-down.** SQLite
-lives on the container's ephemeral disk; Render free instances spin down
-after ~15 minutes idle and get a fresh filesystem on wake. Every cold start
-is an empty registry: identities, bindings and cooling timers vanish.
+Storage moved from ephemeral SQLite to Supabase Postgres. **Data now survives
+redeploys, restarts and free-tier spin-down** — identities, bindings, cooling
+timers and sessions all live in the managed database, independent of the app
+container. The deploy MUST set `SUPABASE_DB_URL` (Supabase dashboard →
+Connect → Session pooler string); without it the app refuses to start rather
+than silently reverting to disposable storage. The credential is a secret:
+env var only, never committed, never baked into the image (`.dockerignore`
+excludes every `.env`).
 
-That is acceptable — arguably convenient — for a mock-persona demo. It is
-one of the two reasons a real deployment needs Postgres (the other being the
-migration/startup hazards already tracked as M4 in PROGRESS.md; the
-schema-on-fresh-DB pattern assumes a throwaway database). Do not attach a
-Render persistent disk as a fix: the demo's per-boot secrets/pepper semantics
-assume a fresh DB, and a durable deployment should move the storage layer,
-not pin the demo's.
+One consequence for the demo posture: because data persists, `FIN_PEPPER`
+and `SESSION_SECRET` genuinely must be treated as permanent now — rotating
+the pepper orphans every identity row in a database that no longer resets
+itself on redeploy.
 
 ## Local rehearsal (what CI or a fresh clone should do)
 
@@ -98,11 +100,21 @@ docker run --rm -p 10000:10000 \
   -e PORT=10000 -e APP_ENV=production -e DEMO_MODE=1 \
   -e SESSION_SECRET=$(openssl rand -hex 32) \
   -e FIN_PEPPER=$(openssl rand -hex 32) \
+  -e SUPABASE_DB_URL="$(grep '^SUPABASE_DB_URL=' backend/.env | cut -d= -f2-)" \
   fayda-registry
 # open http://127.0.0.1:10000 — SPA loads, persona login works,
 # /api/dev/* → 404. (Browsers accept Secure cookies on localhost.)
 ```
 
 Tests: `APP_ENV=dev python backend/app.py` in one shell,
-`python backend/t.py` in another — 20 checks, including the demo-mode gating
-and the Secure-cookie/`RENDER_EXTERNAL_URL` derivation (test 20).
+`APP_ENV=dev python backend/t.py` in another — 26 checks, including the
+demo-mode gating and the Secure-cookie/`RENDER_EXTERNAL_URL` derivation
+(test 20).
+
+The suite resets the registry before it runs, so it works only against a
+database explicitly marked throwaway (`APP_ENV=dev python backend/store.py
+mark-disposable`, once per dev database). **Never mark the production
+database.** The marker records the host it was written for, so pointing
+`backend/.env` at production makes both the suite and `/api/dev/reset` refuse
+instead of dropping the registry — the destructive path checks the target,
+not the caller's environment variable.

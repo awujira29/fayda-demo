@@ -5,6 +5,1272 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Fix review 2 — 2026-07-26 (target-gated reset, COLLATE "C", lifespan sweeper, pre-auth TTL)
+
+Scope: the second fix round only — `store.py` (`registry_meta` table,
+`_target`, `mark_disposable`, `disposable`, two-gate `reset`, `_create_schema`
+refactor, single-transaction reset, `COLLATE "C"` in `sweep_expired` and
+`promote_due`, `ix_sessions_expires` / `ix_auth_nonces_expires`, the
+`__main__` mark-disposable command), `app.py` (`lifespan` replacing
+`on_event`, `_sweep_loop` failure reporting, `PRE_AUTH_SESSION_TTL_HOURS`
+and TTL selection in the middleware), `t.py` (no `APP_ENV` write, exit-2
+guidance, test 26).
+
+Method: read every hunk, then attacked the fixed server on 127.0.0.1:8000 and
+the live database. Enumerated `reset()`'s refusal matrix by patching `_target`
+and `_DISPOSABLE_KEY` in my own process so no real marker was touched;
+decomposed `_target()`'s fingerprint against the actual Supabase topology (all
+values redacted below); proved the index/collation question on an isolated
+40,000-row ANALYZEd scratch table rather than trusting `EXPLAIN` on the live
+near-empty ones — my first attempt at that measurement was planner noise and I
+threw it out; reproduced the reset/init lock interaction with two real
+concurrent transactions on a scratch table; verified the sweeper actually
+starts by planting an expired row and booting a fresh uvicorn subprocess
+against the same database; and measured the pre-auth TTL end to end including
+a login deliberately aged past it. Scratch objects were dropped after use.
+
+**Counts (this review): 0 critical / 0 high / 1 medium / 5 low.**
+
+**Status carried forward: the round-1 High (`t.py` as a one-command production
+wipe) is RESOLVED — evidence under its original heading below. R1 High #2's
+residual drops again, from Medium to Low. Of the five Lows this round set out
+to fix, four are fixed; one is not, and one fix introduced a new one.**
+
+---
+
+### Medium (new) — the disposable marker's target fingerprint cannot tell two Supabase projects apart, which is exactly the case its docstring says it defends
+
+**Location:** `backend/store.py:346-351` (`_target`), relied on by
+`disposable()` (`:375-392`) and therefore by `reset()` (`:395-423`).
+**Confidence:** certain — decomposed against the live connection.
+**Invariant strained:** the stated purpose of putting a target in the marker at
+all — *"so a dump of a dev database restored onto a production host does not
+carry permission to wipe it along with the data."*
+
+`_target()` is `f"{c.info.host}:{c.info.port}/{c.info.dbname}"`. Decomposed
+against this project's actual connection (identifiers redacted, structure
+intact):
+
+```
+host   : aws-1-us-west-2.pooler.<REDACTED>.com     <- shared by every project in the region
+port   : 5432                                      <- same for every project
+dbname : postgres                                  <- same for every project
+user   : <REDACTED>.<REDACTED>                     <- the ONLY field naming the project…
+                                                      …and it is not in the fingerprint
+
+_target() = aws-1-us-west-2.pooler.<REDACTED>.com:5432/postgres
+```
+
+Every Supabase project in a region, reached through the session pooler the
+`DEPLOY.md` instructions specify, produces a **byte-identical** fingerprint.
+Project identity lives entirely in the username (`postgres.<project-ref>`),
+which `_target()` omits.
+
+The consequence is precisely the scenario the docstring names. Restore a dump
+of the marked dev database onto a same-region production project — an ordinary
+"seed prod from a known-good snapshot" or "reproduce the bug on staging"
+action — and the dump carries the `registry_meta` row with it. `disposable()`
+then compares the restored marker's value against the live target, both are
+`aws-1-us-west-2.pooler.<REDACTED>.com:5432/postgres`, they match, and the
+grant transfers to production. The one defence the target comparison exists to
+provide is the one it does not provide.
+
+Two smaller things fall out of the same decomposition, worth stating because
+the docstring asserts otherwise. `_target()` reads `c.info.host/port/dbname`,
+described as *"read from the live connection, not from configuration a caller
+could have rewritten."* libpq's `PQhost`/`PQport`/`PQdb` echo the **connection
+parameters**; I confirmed `conninfo['host'] == c.info.host`. So the fingerprint
+is caller-supplied configuration after all — it just happens not to help an
+attacker, because the marker is read *out of* whatever database was reached.
+And because the fingerprint is the pooler hostname, marking through the session
+pooler and later connecting via the direct `db.<ref>.supabase.co:5432` string
+(or the transaction pooler on 6543) makes `disposable()` refuse on the same
+database. That direction is safe — it fails closed, with a clear message — but
+it means the marker is bound to the *route*, not the database.
+
+The fix is available and server-attested:
+`SELECT system_identifier FROM pg_control_system()` — I confirmed it is
+readable on this Supabase project (returned a 19-digit value). It is unique per
+physical cluster, so it distinguishes two projects, and `pg_dump`/`pg_restore`
+does not carry it, so a dev dump restored onto production would *not* match and
+the grant would correctly fail to transfer. Adding `c.info.user` to the string
+fixes the project-collision half but not the dump-restore half; the system
+identifier fixes both.
+
+---
+
+### Low (new) — the two new `expires_at` indexes cannot be used by the queries they were added for, because the other fix in the same diff forces a different collation
+
+**Location:** `backend/store.py:128-132` (indexes created with no `COLLATE`
+clause, i.e. the database default) versus `:523-528` (`sweep_expired` filters
+on `expires_at COLLATE "C"`).
+**Confidence:** certain — measured on an isolated table with realistic
+cardinality and fresh statistics.
+**Status:** round-1 Low ("no index on `expires_at`") is reported fixed. It is
+not fixed.
+
+The `COLLATE "C"` change (correct, see below) and the index change (correct in
+isolation) collided. A btree on a text column is ordered in the column's
+collation; a predicate that forces a different collation cannot use it. The
+catalog confirms both indexes recorded `collname: default`.
+
+I initially ran `EXPLAIN` against the live tables and got contradictory results
+between two runs — the tables held single-digit rows and the plans were noise.
+Discarded that and built an isolated 40,000-row table with the same column type
+and the exact index DDL `SCHEMA_INDEXES` ships, then `ANALYZE`d it:
+
+```
+predicate  expires_at COLLATE "C" < ?   ->  Seq Scan                     <- what the code does
+predicate  expires_at < ?               ->  Index Scan using ix_probe_default
+after adding an index on (expires_at COLLATE "C"):
+predicate  expires_at COLLATE "C" < ?   ->  Index Scan using ix_probe_c
+```
+
+So `sweep_expired` still sequentially scans both tables every 600 seconds —
+the "defence gets more expensive the more it is needed" property the index
+comment names is still live — and the app now additionally pays btree
+maintenance on every session write and every nonce issue for two indexes no
+query can use. Net effect versus before this round: slightly worse.
+`CREATE INDEX … ON sessions (expires_at COLLATE "C")` (and likewise for
+`auth_nonces`) closes it; the third line above is that index, proven usable.
+
+`promote_due`'s `activates_at COLLATE "C"` is unaffected — there is no index on
+`activates_at` to lose.
+
+---
+
+### Low (new) — the single-transaction reset inverts lock order against `init()`; I reproduced a real deadlock
+
+**Location:** `backend/store.py:412-423` — `reset()` executes
+`DROP TABLE … CASCADE` (ACCESS EXCLUSIVE on the four tables) and *then* calls
+`_create_schema(c)`, whose first statement is
+`SELECT pg_advisory_xact_lock(727401)` (`:294`). `init()` (`:338-340`) reaches
+`_create_schema` directly, so it takes the advisory lock **first** and the
+table locks second.
+**Confidence:** certain — reproduced with two concurrent transactions.
+**Status:** round-1 Low ("reset is not atomic") is genuinely fixed — there is no
+longer a committed window with no tables — but the refactor that fixed it
+created this.
+
+Reproduced on a scratch table with a scratch advisory lock id, mirroring the
+two orderings exactly:
+
+```
+reset-shaped  (table lock, then advisory):  acquired both
+init-shaped   (advisory, then table lock):  DeadlockDetected: deadlock detected
+```
+
+Postgres detects it and aborts one side, so there is no corruption and no
+partial schema — the transaction is all-or-nothing, which is the point of the
+refactor. The cost is which side loses. If `init()` loses, a booting instance
+raises at import and **fails to start**. If `reset()` loses, the exception is
+`psycopg.errors.DeadlockDetected`, which is not a `RuntimeError`, so `t.py`'s
+`except RuntimeError` guidance path at `:26-31` is skipped and the suite
+tracebacks instead of printing its message.
+
+Reachability is genuinely low: `reset()` is dev-gated and marker-gated, so it
+can only meet `init()` in a dev environment where a server boots while a reset
+runs (a `--reload` restart, or a second shell). Moving
+`pg_advisory_xact_lock(727401)` to before the `DROP` in `reset()` makes both
+callers take the locks in the same order and removes it entirely.
+
+---
+
+### Low (new) — `mark_disposable()` is gated only on `APP_ENV`, and the grant it writes is permanent and non-revocable
+
+**Location:** `backend/store.py:354-372`.
+
+The two-gate design moved the *check* onto the target, which is the right move
+and resolves the High. The *grant*, though, is still authorized by the same
+mutable in-process value the original finding was about:
+`if os.getenv("APP_ENV") != "dev"`. The bypass therefore did not disappear, it
+got one line longer — `os.environ["APP_ENV"]="dev"; store.mark_disposable();
+store.reset()` still wipes an unmarked production database from inside any
+process.
+
+That is a real difference in kind, not just degree, and I do not want to
+overstate it: the round-1 High was severe because a file the team runs
+constantly performed the bypass *by accident*. Nothing routine calls
+`mark_disposable()` — not `app.py`, not `t.py` — and there is no reason for
+anything to. So the accident is gone and only a deliberate act remains, which
+is the correct place to land.
+
+What is worth fixing is the grant's lifetime. There is no `unmark`, no expiry,
+and `set_at` is recorded but never compared against anything (confirmed: no
+comparison on `set_at` exists anywhere in `store.py`). `reset()` deliberately
+preserves `registry_meta`, so the grant also survives every reset it authorizes.
+A database marked disposable once is disposable forever — including a dev
+project that later accumulates real data, or gets promoted, or has its
+connection string reused. An `unmark-disposable` command and a `set_at`-based
+expiry (re-confirm every N days) would make the grant match the risk.
+
+---
+
+### Low (new) — `t.py` tracebacks instead of guiding when pointed at a database that has never been initialised
+
+`backend/t.py:24-31` calls `st.reset()` and catches `RuntimeError` to print the
+"run as `APP_ENV=dev python backend/t.py`" guidance and exit 2. But `reset()`
+reaches `disposable()`, which does `SELECT value FROM registry_meta` — and on a
+database where `init()` has never run, that table does not exist. Confirmed the
+exception class: `psycopg.errors.UndefinedTable`, not a `RuntimeError`. So a
+fresh clone pointed at a brand-new empty Supabase project gets a traceback
+instead of the message telling it to run `store.py mark-disposable` (which does
+call `init()` first, so the documented setup path itself is fine). Catching
+`Exception` there, or having `disposable()` treat a missing `registry_meta` as
+"not marked", closes it.
+
+Related and smaller: test 26 deletes the marker and restores it at the end. If
+the suite dies in between, the dev database is left unmarked and the next run
+exits 2 — fail-closed and recoverable with one command, but worth knowing that
+is the cause rather than hunting a phantom.
+
+---
+
+### Low (new) — a login slower than the pre-auth TTL fails with "possible CSRF"
+
+`backend/app.py:126` sets `PRE_AUTH_SESSION_TTL_HOURS = 1/6`. Measured on the
+fixed server: an anonymous `GET /login` row now carries `TTL = 0:10:00` holding
+only `oidc_state`, with a matching `Max-Age=600` cookie. Correct and effective
+(see High #2 below). The consequence at the boundary: once the row expires,
+`request.session.get("oidc_state")` is `None`, and `/callback` compares the
+returned `state` against it. Reproduced by aging a real in-flight login past
+its TTL:
+
+```
+/callback after the pre-auth row expired -> 400 {"detail":"state mismatch — possible CSRF"}
+```
+
+It fails closed, which is the right posture, and the CSRF check itself is
+untouched. Two notes. The diagnostic is misleading — the operator debugging a
+user's failed login sees a CSRF accusation for what is a timeout, and there is
+no way to tell them apart from the response. And ten minutes is comfortable for
+clicking a mock persona but not obviously comfortable for the real flow
+`mock_esignet.py` stands in for: a biometric capture with retries, or an OTP
+over a rural mobile network. Distinguishing "no oidc_state at all" (expired)
+from "oidc_state present but different" (actual CSRF) costs one branch and
+makes both the message and the TTL choice defensible.
+
+---
+
+### Verified safe (this round, actively attacked)
+
+- **`reset()` refuses on every path I could reach.** APP_ENV unset,
+  `APP_ENV=production`, `APP_ENV=dev` with the marker absent, and `APP_ENV=dev`
+  with a marker naming another database — all four refused with the correct
+  distinct message. Both gates are genuinely independent. The `__main__` block
+  exposes only `mark-disposable` (anything else prints usage and exits 2) and
+  never calls `reset()`; nothing in `app.py` or `t.py` calls
+  `mark_disposable()`; importing `store` has no destructive side effect. The
+  only remaining route is a caller that deliberately marks first, recorded as a
+  Low above.
+- **`COLLATE "C"` genuinely fixes the ordering.** All four comparisons that were
+  wrong in round 2 are now correct, including the two that were wrong in the
+  dangerous direction:
+  `'…12:00:00+00:00' < '…12:00:00.500000+00:00'` → True,
+  `'…12:00:00.500000+00:00' < '…12:00:00+00:00'` → False,
+  `'…12:00:00.000001+00:00' < '…12:00:00+00:00'` → False,
+  `'…12:00:01+00:00' < '…12:00:00.900000+00:00'` → False. The corrected comments
+  now state the true reason (the default collation does **not** order ISO-8601
+  chronologically) instead of the false one. `promote_due` keeps its Python
+  re-check as defence in depth.
+- **The lifespan sweeper really starts, under a real uvicorn.** Planted a
+  five-hours-expired session row, booted a fresh `uvicorn app:app` subprocess
+  against the same database, and the row was gone within seconds of the port
+  opening — so the boot sweep runs and `lifespan` fires where `on_event` used
+  to. Clean startup output, no deprecation warning. `store.init()` still runs at
+  import, i.e. before `lifespan`, so schema creation still precedes the first
+  sweep. `_sweep_loop` now reports to stderr with a consecutive-failure count
+  and still cannot die.
+- **Single-transaction reset removed the no-tables window.** `DROP` and
+  `_create_schema` share one transaction, so concurrent statements block rather
+  than hitting `UndefinedTable`; `registry_meta` is correctly excluded from the
+  `DROP` so the marker that authorized the reset survives it. (Its only cost is
+  the lock-order Low above.)
+- **The pre-auth TTL breaks nothing in the working flow.** A prompt login still
+  completes (`/callback` 307, `authenticated: true`), the session id still
+  rotates at login — so test 3b's fixation assertion is unaffected — and the
+  authenticated row measured `12:00:02`, i.e. the full TTL is earned only once
+  `identity_id` is set. The TTL is chosen in the send wrapper *after* the
+  handler has populated the session, so the rotation-and-elevate path gets 12 h
+  on the very response that authenticates, not 10 minutes.
+- **Test 26 is a real test.** It asserts each gate refuses *independently*
+  (APP_ENV unset; marker naming another host; marker absent), matches on the
+  distinct message each path produces rather than just "it raised", and restores
+  the marker so the suite stays runnable. It would fail if either gate were
+  removed.
+- **Nothing in this round touched the correctness core.** Re-read the diff for
+  changes to `promote_due`'s savepoint logic, `consume_nonce`'s `FOR UPDATE`,
+  the generated `address_norm` column, the unique indexes, or the round-1
+  address gates: none. The `_create_schema` refactor is a pure extraction —
+  same statements, same order, now taking a caller-supplied connection.
+
+---
+
+### Verdict
+
+**New criticals: 0, new highs: 0.** The round-1 High is dead, and it died the
+right way.
+
+The reset gate is now the shape it should have been from the start: the
+destructive path asks the database whether it consents, not the caller whether
+it feels like a developer. All four refusal paths hold, the bypass is no longer
+something a routine command performs by accident, and test 26 pins each gate
+separately. That closes the finding.
+
+The one Medium is that the marker's notion of "which database" is too coarse to
+do the job it was given. `host:port/dbname` is identical for every Supabase
+project in a region behind the pooler, so the dump-restore case named in the
+docstring — dev snapshot onto production — transfers the grant intact.
+`pg_control_system().system_identifier` is readable here and is exactly the
+right primitive: unique per cluster, and not carried by a dump. That is a
+small change to a function that is otherwise well designed.
+
+The rest is bookkeeping, but two pieces matter more than their severity. The
+`COLLATE "C"` fix and the `expires_at` index fix landed in the same diff and
+cancelled each other — the indexes are unusable by the only queries they exist
+for, so a Low reported fixed is not, and there is now write cost for no read
+benefit. And making the reset atomic introduced a lock-order inversion I was
+able to turn into a real `DeadlockDetected`. Both are one-line fixes, and both
+are the kind of thing that only shows up if you measure rather than read.
+
+R1 High #2 is now effectively closed: at 500 anonymous requests per second the
+session table settles at 0.25 GB against a 0.49 GB quota, where before it was
+18 GB. Downgrading its residual from Medium to Low — the remaining gap is that
+there is still no rate limit anywhere, so a large enough flood gets there
+eventually, but it would have to exhaust the web tier first.
+
+Safe to build on once the target fingerprint is widened. Nothing outstanding is
+attacker-reachable.
+
+---
+
+## Fix review — 2026-07-26 (fixes for the two R1 highs)
+
+Scope: the fix deltas only, on top of the R1 audit below —
+`backend/verify.py` (`looks_like_address` length gate), `backend/app.py`
+(chain validation + `_clean_token(address)` on both wallet routes, TTL sweeper
+thread), `backend/store.py` (`sweep_expired`), `backend/t.py` (tests 24/25,
+transport timeouts 10→30 s, `store.reset()` prologue).
+
+Method: read every changed hunk, then attacked the fixed server on
+127.0.0.1:8000. Re-fired the exact High #1 payloads; measured the base58
+encoded-length distribution over 200,000 random 32-byte values plus the
+extremes of the 32-byte space to test the new gate's bounds for false
+rejections; ran a full EVM bind round trip and six real ed25519 keys as
+regression; planted expired/live sessions at 1 h, 300 ms and microsecond-0
+boundaries and ran the sweep against them; read `pg_constraint` for foreign
+keys; measured the database collation's effect on every TEXT timestamp
+comparison in the codebase; and traced `t.py`'s new prologue. The suite passes
+25/25 twice consecutively per the coordinator; I did not re-run it, because
+running it is itself one of my findings.
+
+**Counts (this review): 0 critical / 1 high / 0 medium / 5 low.**
+
+**Status of the two originals: High #1 RESOLVED. High #2 partially resolved —
+the permanent/unrecoverable property is fixed, the reachable-peak property is
+not; downgraded to Medium.** Evidence for both is recorded inline in the R1
+section below, under the original headings.
+
+---
+
+### High (new) — `python backend/t.py` is now a one-command production wipe, and the guard that used to stop it is defeated by the two lines above the call — **RESOLVED**
+
+**Resolution (re-verified 2026-07-26, second fix diff):** fixed the way it
+needed to be fixed — the destructive path now interrogates the *target*, not
+the caller. `store.reset()` (`store.py:395-423`) requires two independent
+gates: `APP_ENV == 'dev'` **and** `disposable()`, which reads a
+`registry_meta` marker out of the database in hand and requires it to name that
+same database. `t.py:12-31` no longer sets `APP_ENV`; the human must pass it,
+and on refusal the suite prints guidance and exits 2. `mark_disposable()` is
+exposed only as a deliberate one-off command
+(`APP_ENV=dev python backend/store.py mark-disposable`) and is called by
+neither `app.py` nor `t.py`.
+
+I enumerated the refusal paths against the live database, patching `_target`
+and `_DISPOSABLE_KEY` in my own process so no real marker was touched:
+
+```
+APP_ENV unset                          -> refused: "store.reset() is dev-only…"
+APP_ENV=production                     -> refused: "store.reset() is dev-only…"
+APP_ENV=dev, marker absent             -> refused: "…is not marked disposable"
+APP_ENV=dev, marker names another host -> refused: "the disposable marker names X,
+                                                    but this connection reached Y"
+```
+
+The finding's actual claim was that a *routinely-run* file performed the
+bypass, turning two ordinary acts into irreversible loss. That is gone: `t.py`
+no longer sets `APP_ENV` and never marks anything, so pointing `backend/.env`
+at production and running the suite now refuses instead of destroying —
+production has never been marked, and no code path marks it as a side effect.
+**High resolved.**
+
+Two residuals, both recorded as new Lows/Mediums in the round-2 section above
+rather than left implied: the marker's target fingerprint cannot tell two
+Supabase projects apart (Medium), and `mark_disposable()` — the thing that
+authorizes destruction — is itself still gated only on `APP_ENV`, granting a
+permanent, non-revocable permission (Low).
+
+Original finding retained below.
+
+**Location:** `backend/t.py:17-21`, against `backend/store.py:320-332`.
+**Confidence:** certain — mechanism confirmed by reading and by evaluating the
+guard predicate under t.py's own prologue. I did not execute it, for obvious
+reasons.
+**Invariant broken:** the second of the two gates I credited as *verified safe*
+in the R1 section below ("Two independent exact-match gates, both failing
+closed"). That statement is no longer true, and the bypass now ships in the
+repository as a copy-pasteable idiom with a comment endorsing it.
+
+The new prologue runs at import, before any server contact, before any
+argument parsing, as the first thing the suite does:
+
+```
+t.py:17  # the APP_ENV guard in store.reset() exists to stop production processes.
+t.py:18  os.environ["APP_ENV"] = "dev"
+t.py:19  sys.path.insert(0, HERE)
+t.py:20  import store as st
+t.py:21  st.reset()
+```
+
+and the guard it satisfies is:
+
+```
+store.py:325  if os.getenv("APP_ENV") != "dev":
+store.py:326      raise RuntimeError("store.reset() is dev-only — refusing to drop tables")
+```
+
+Evaluated with the prologue applied: `os.getenv('APP_ENV') != 'dev'` → `False`,
+so `reset()` proceeds and executes
+`DROP TABLE IF EXISTS wallet_bindings, auth_nonces, sessions, identities CASCADE`
+against whatever `SUPABASE_DB_URL` names. I confirmed `t.py` contains no
+reference to `SUPABASE`, `current_database`, or any other check of *which*
+database it is about to drop.
+
+The reason this is a High and not a Low footgun is that every precondition is a
+documented, recommended workflow, and they compose:
+
+- `CLAUDE.md` ("Testing") gives `python backend/t.py` as the way to test.
+- `CLAUDE.md` ("Running locally") and `DEPLOY.md` both tell the operator that
+  `SUPABASE_DB_URL` normally comes from `backend/.env`.
+- `DEPLOY.md:100-106`'s local-rehearsal step reads the connection string out of
+  `backend/.env` with `grep`, i.e. the file is expected to hold a real one.
+
+So the sequence "point `backend/.env` at the production project for an
+afternoon of debugging, then run the test suite" — two independently reasonable
+acts — irreversibly destroys the durable registry: every identity, every wallet
+binding, every in-flight cooling timer, every live session, and any R2
+Row-Level Security policy attached to the dropped tables. No confirmation, no
+dry run, no target check, no backup step. This is precisely the data R1 exists
+to protect, and the change that made the data worth protecting is the same
+change that armed the wipe.
+
+This is operator-triggered, not attacker-triggered, and I have ranked
+everything else in this audit by exploitability — so I want the reasoning
+visible rather than hidden behind the label. I am rating it High on blast
+radius and on how ordinary the trigger is, and the coordinator should feel free
+to re-rank it. What is not a judgement call is that it **regresses a control I
+previously verified as holding**, so it must not be filed as pre-existing.
+
+It also inherits Medium #5 below: the guard cannot see which database it is
+pointed at. `t.py` cannot either. Anything that fixes one fixes both — a marker
+row written by `init()` and checked by `reset()`, a `current_database()`
+allowlist, or an explicit `ALLOW_DESTRUCTIVE_RESET=<dbname>` that must name the
+target. A guard on the process's own mutable environment is not a guard against
+a caller that sets that environment two lines earlier.
+
+Separately, and much smaller: the fix is solving a real problem the right way
+round (the suite genuinely was non-idempotent against durable storage — test 4's
+first-time bind used to meet the previous run's rows). The reset itself is the
+correct remedy. Only its blindness to the target is the finding.
+
+---
+
+### Low (new) — the TEXT timestamp comparison is *not* lexicographic under this database's collation; the sweep is safe for a different reason than its comment claims, and my own round-1 clearance of `promote_due` was wrong
+
+**Location:** `backend/store.py:420-427` (the comment "all timestamps are
+written by `iso(now()+delta)` as ISO-8601 UTC, which orders lexicographically",
+and the two `expires_at < %s` predicates), `backend/store.py:607-613`
+(`promote_due`'s `activates_at <= %s`).
+**Confidence:** certain — measured against the live database.
+
+The database is `en_US.UTF-8` (`datcollate`/`datctype`), the columns carry no
+`COLLATE` override, and Postgres compares TEXT under the collation, not
+byte-wise. It does not order these strings lexicographically. Measured:
+
+```
+'2026-07-26T12:00:00+00:00'        < '2026-07-26T12:00:00.500000+00:00'  -> False  (want True)
+'2026-07-26T12:00:00.500000+00:00' < '2026-07-26T12:00:00+00:00'         -> True   (want False)
+'2026-07-26T12:00:00.000001+00:00' < '2026-07-26T12:00:00+00:00'         -> True   (want False)
+same comparisons COLLATE "C"                                             -> all correct
+```
+
+I mapped the blast radius rather than stopping at "it's wrong". Pairing a
+timestamp against another at increasing distance, the mis-ordering is confined
+to **sub-second** differences and disappears at one second and coarser, in both
+directions — `+1 s`, `+10 s`, `+61 s`, `+10 min`, `+1 h`, `+72 h` all compare
+correctly. Confirmed independently by the live sweep: a session 300 ms from
+expiry was deleted 300 ms early, while a `+1 h` row was correctly kept.
+
+Consequences, all benign, which is why this is a Low:
+
+- `sweep_expired` may reclaim a row up to ~1 s early or late against TTLs of
+  300 s and 12 h.
+- `promote_due` may complete a **72-hour** cooling period up to ~1 s early. That
+  is not a cooling-period bypass in any meaningful sense.
+- The comparisons that actually make security decisions — "is this nonce
+  expired?" (`consume_nonce`) and "is this session expired?" (`load_session`) —
+  are done in Python via `parse()`, which is chronologically exact and
+  unaffected. That is the reason the system is safe here, and it is not the
+  reason the comment gives.
+
+Two things follow. First, a correction to my own work: in the R1 section below I
+cleared `promote_due`'s `activates_at <= now` by reasoning about byte ordering
+(`+` is 0x2B, `.` is 0x2E). The bytes were right; the premise that Postgres
+compares bytes was wrong. Same conclusion, wrong derivation — recording it so
+the next run does not inherit a load-bearing argument that does not hold.
+Second, the comment now asserts a property the database does not provide, so
+the next person to add a timestamp comparison will trust it. The real fix is
+`timestamptz` columns rather than TEXT; `COLLATE "C"` on the two columns is the
+cheap interim.
+
+Test 25 cannot catch any of this: it plants rows at ±1 hour, which is exactly
+the range where the collation behaves.
+
+---
+
+### Low (new) — the sweep's effectiveness is `rate x TTL`, and an anonymous pre-auth row still gets the full 12-hour authenticated-session TTL
+
+`backend/app.py:270-279` writes `oidc_state` into the session; the middleware
+persists it with `SESSION_TTL_HOURS = 12` (`app.py:116`, `:179`). Re-verified on
+the fixed server: an anonymous `GET /login` still produces a row with
+`TTL=12:00:00` holding nothing but an `oidc_state` that is dead the moment
+`/callback` runs, and useless after the OIDC round trip's natural lifetime of
+about a minute. Since a sweep can only bound a table at arrival-rate times TTL,
+this single constant is what keeps High #2's residual alive (see the arithmetic
+under that finding). A short dedicated TTL for pre-auth rows — sixty seconds
+would be generous — cuts the reachable steady state by a factor of ~720 for the
+one row type an unauthenticated visitor can create. Cheapest available
+mitigation by a wide margin.
+
+---
+
+### Low (new) — no index on `expires_at`, so every sweep sequentially scans exactly the table an attacker is growing
+
+`backend/store.py:426-427`; confirmed against the live schema — `sessions` has
+only `sessions_pkey (sid)` and `auth_nonces` only `auth_nonces_pkey (nonce)`.
+Both DELETEs therefore seq-scan, every 600 s, in one transaction, over the two
+tables whose size is the attacker's variable. Under the load that makes the
+sweep matter this is millions of rows scanned per cycle and a large delete
+holding many row locks. Contention stays low because live rows never match the
+predicate, but the scan cost grows with the attack it is defending against —
+the wrong direction. A plain btree on `expires_at` for each table makes the
+sweep proportional to what it deletes.
+
+---
+
+### Low (new) — the sweeper is the only thing preventing unbounded growth and it hangs off a deprecated hook that fails silently
+
+`backend/app.py:222-224` uses `@app.on_event("startup")`. Verified it still
+fires on the pinned FastAPI 0.139.2, but it emits
+`on_event is deprecated, use lifespan event handlers instead`. If it is ever
+removed by a version bump, the thread simply never starts: no error, no log
+line, no failed request, no test failure — the tables just quietly resume
+growing forever, which is the exact condition this fix exists to prevent. Given
+that the sweeper is now load-bearing for durability, it belongs on the
+supported `lifespan` handler. Related: `_sweep_loop` swallows bare `Exception`
+by design (correct — a dead sweeper is worse than a noisy one) but logs
+nothing, so a sweeper failing every cycle for ten days is indistinguishable from
+one working perfectly.
+
+---
+
+### Low (new) — `reset()` is not atomic: the DROP commits before `init()` recreates
+
+`backend/store.py:327-332`. The `DROP TABLE … CASCADE` runs inside its own
+`with conn()` block, which commits on exit; `init()` then opens a *separate*
+transaction to recreate. Between the two the four tables do not exist, and any
+concurrent statement gets `UndefinedTable`. The new sweeper is safe here — its
+bare `except Exception: pass` covers it — but concurrent HTTP requests 500,
+including the unauthenticated `/api/registry`. Dev-only and transient, and the
+SQLite version had the same shape (unlink, then init). Worth one line only
+because `reset()` now runs against a shared database that other processes are
+actively querying, where before it ran against a local file. Wrapping both in
+one transaction closes it.
+
+---
+
+### Verified safe (this fix diff, actively attacked)
+
+- **The `32..44` gate cannot reject a legitimate Solana address.** Measured over
+  200,000 random 32-byte values (lengths 42/43/44 only) plus the true extremes
+  of the space (`\x00`*32 → 32 chars, `\xff`*32 → 44 chars) and 20,000 real
+  ed25519 verify keys (43-44). `[32,44]` is exactly the achievable range.
+- **`_clean_token(address)` cannot reject a legitimate address.** EVM is 42
+  chars, Solana ≤44, neither contains NUL; the cap is 512. Confirmed live with
+  six ed25519 addresses and a full EVM bind round trip returning `200 active`.
+- **The sweep cannot delete anything load-bearing.** Live sessions and
+  unexpired nonces survive (verified at +1 h). Consumed-but-referenced nonces
+  are not a hazard: there is exactly one foreign key in the whole schema
+  (`wallet_bindings_identity_id_fkey`), and `proof_nonce`/`proof_sig`/
+  `proof_message` are copied into `wallet_bindings` as plain TEXT at
+  `create_binding`, so deleting `auth_nonces` rows cannot orphan or cascade into
+  verification history. A nonce becomes sweepable only after `consume_nonce`
+  would already reject it as expired, so no usable nonce life is shortened.
+- **The chain gate closes the last route into the decoder.** `wallet_bind` now
+  rejects an unrecognized `chain` as its first statement, so the base58 branch
+  is reachable only with `chain == "solana"`, which is then length-gated twice
+  (512 via `_clean_token`, 44 via the shape check). The only other
+  client-controlled `b58decode` is `verify_solana`'s signature argument, bounded
+  to 512 bytes ≈ 0.1 ms.
+- **Test 24 is a real test.** Its `elapsed < 6.0` assertion sits between the
+  pre-fix cost (>10 s for the trio) and the post-fix cost, so it fails if the
+  gate is removed; and the comment correctly explains why the payload is `'z'`
+  and not `'1'` (leading `1`s are base58 zero bytes and decode in linear time —
+  a `'1'`-based test would pass even with the bug present). Test 25 likewise
+  asserts *exactly* which rows survive rather than just counting deletions.
+- **The sweeper is safe against `/api/dev/reset` and `t.py`'s reset.** Its bare
+  `except Exception: pass` covers both the `UndefinedTable` window described
+  above and any pool error; the thread cannot die and take the mitigation with
+  it. Multiple instances sweeping concurrently is harmless — the DELETEs are
+  idempotent and touch only rows nothing else wants.
+- **The R1 findings I cleared before still hold under the fix.** Re-checked that
+  the fix diff does not touch `promote_due`'s savepoint logic, `consume_nonce`'s
+  `FOR UPDATE`, the generated `address_norm` column, or any unique index. The
+  new gates sit strictly in front of existing logic and change no stored value.
+
+---
+
+### Verdict
+
+**New criticals: 0, new highs: 1.** Still not safe to build on, and the reason
+has moved.
+
+High #1 is properly dead: gated in three independent places, verified against
+the original payloads across a 2000x size range with a flat response curve, and
+verified not to reject any legitimate address — I went looking for a false
+rejection in the corners of the 32-byte space and there isn't one. That is a
+clean fix.
+
+High #2 is the more honest story. The sweeper removes the property that made it
+a High — growth is no longer permanent, and recovery no longer needs a human —
+but a sweep bounds a table at arrival-rate times TTL, and the fix touched
+neither term. Ten unauthenticated requests per second still parks the session
+table within a third of the free-tier quota indefinitely. Medium now, and the
+two remaining pieces are small: a short TTL for pre-auth rows, and any rate
+limit at all.
+
+Against that, the fix introduces a new High of a kind worth stating plainly:
+`t.py` now sets `APP_ENV=dev` and calls `store.reset()` at import. The suite
+genuinely needed a reset — durable storage made it non-idempotent, and that
+diagnosis is right — but the implementation defeats the exact second guard I had
+verified as holding one section below, and it does so in the one file a
+developer runs most often, with no check of which database it is about to drop.
+Two reasonable acts now compose into total irreversible loss of the registry.
+Fix that before anything else in this diff, and fix it the same way Medium #5
+needs fixing: make the destructive path verify the *target*, not the caller's
+own environment variable.
+
+---
+
+## Diff review — 2026-07-26 (R1 keystone: SQLite → Supabase Postgres, _DB_LOCK dropped, real concurrency)
+
+Scope: the uncommitted working tree vs HEAD only — `backend/store.py` (full
+rewrite to psycopg3 + `ConnectionPool`, hand-parsed `_conninfo`, restricted
+dotenv loader, advisory-lock `init()`, GENERATED `address_norm` + rebuilt
+partial unique indexes, `FOR UPDATE` nonce consumption, row-locked
+`cancel_pending`, `FOR UPDATE SKIP LOCKED` + savepoint `promote_due`,
+`ON CONFLICT` upsert, APP_ENV guard on `reset()`), `backend/app.py`
+(`_strip_nul`, `_clean_token`, `looks_like_address` pre-check on bind,
+canonical address comparison, `/api/me` batched to one bindings query),
+`backend/t.py` (psycopg errors, `%s` placeholders, tests 22/23),
+`backend/requirements.txt`, `render.yaml`, `.dockerignore`, `CLAUDE.md`,
+`DEPLOY.md`. Prior rounds cleared the crypto/binding/session core; I re-derived
+only what the storage swap touches and what losing the process-global lock
+exposes.
+
+Method: read every changed hunk plus `verify.py` and `mock_esignet.py` for
+reachability. Attacked the running dev server (127.0.0.1:8000, APP_ENV=dev,
+working tree, live Supabase dev project) and queried the database directly via
+`import store`. Everything below was reproduced, not reasoned about in the
+abstract: measured durable-row growth from unauthenticated `/login`; measured
+the base58 cost curve locally and over HTTP; raced 4-way concurrent nonce
+replay; raced cancel against two concurrent global promoters for 12 rounds;
+measured pool contention at 6/20/30 concurrent readers; probed NUL handling on
+every text column the request path writes; verified the generated column
+rejects direct writes; verified the `reset()` guard against five near-miss
+APP_ENV values; verified `sslmode` negotiation and what `verify-ca`/`verify-full`
+actually do against this endpoint. `backend/t.py` passed 23/23 before I started.
+No code was modified. The only rows I deleted were the 24 `sessions` probe rows
+my own growth measurement created.
+
+**One measurement caveat, stated up front:** my client sits on a laptop with
+~340 ms round-trip to the Supabase project, so absolute latencies below are
+inflated relative to a Render→Supabase same-region deploy. The *contention
+ratios* and the *quadratic curve* are environment-independent; the wall-clock
+numbers are not, and I flag where that matters.
+
+**Counts: 0 critical / 2 high / 4 medium / 6 low.**
+
+---
+
+### High — one authenticated request with a 1 MB `address` burns ~5 minutes of GIL-held CPU; `_clean_token` caps every field except the one that is parsed — **RESOLVED**
+
+**Resolution (re-verified 2026-07-26, fix diff):** three independent gates now
+stand in front of the decoder, and I re-fired the exact payloads that worked
+before. `verify.py:96-106` gates `32 <= len(address) <= 44` *before*
+`b58decode`; `app.py:420-421` rejects any `chain` outside `('evm','solana')` as
+the first statement of `wallet_bind`; `app.py:398` and `app.py:425` apply
+`_clean_token` to `address` on both routes. Measured against the fixed server:
+
+```
+1 MB address, chain=solana    -> 400 "malformed address"            991 ms
+1 MB address, chain=anything  -> 400 "chain must be evm or solana"   632 ms
+64 KB address (was 2235 ms)   -> 400 "malformed address"            910 ms
+513-char address              -> 400 "malformed address"            875 ms
+45-char address               -> 400 "does not look like a valid…"   686 ms
+1 MB signature                -> 400 "malformed signature"          860 ms
+```
+
+Flat across a 2000x range of payload size — the residual ~600-990 ms is the
+session-load/save round trip to Supabase, not decode. The quadratic term is
+gone. No regression: 6 real ed25519 verify keys (43-44 chars) accepted, and a
+full EVM round trip with a checksummed 42-char address and 132-char signature
+returned `200 {"status":"active"}`.
+
+The `32..44` bound is tight, not lossy — I checked it rather than trusting the
+comment. Over 200,000 random 32-byte values the encoded length is only ever 42
+(2x), 43, or 44; the extremes of the 32-byte space are `\x00`*32 → 32 chars
+(the true minimum, since each leading zero byte contributes exactly one `1`) and
+`\xff`*32 → 44 chars (the true maximum). 20,000 real ed25519 verify keys were
+all 43-44. So `[32,44]` is exactly the achievable range: it cannot reject a
+legitimate Solana address. `_clean_token`'s 512-byte cap is likewise
+unreachable for legitimate input (EVM 42, Solana ≤44).
+
+The last remaining client-controlled `b58decode` is `verify_solana`'s signature
+argument, and it is bounded by `_clean_token` to 512 bytes — ~0.1 ms on the
+measured curve. No unbounded decode path survives.
+
+Original finding retained below.
+
+**Location:** `backend/app.py:393` (the `looks_like_address` pre-check this diff
+*adds* to the bind path), `backend/app.py:355-364` (`_clean_token` — caps
+`nonce` and `signature` at 512 bytes, never `address`), `backend/app.py:391-394`
+(`req.chain` is never validated against `('evm','solana')` on this route, unlike
+`wallet_nonce` at `:370`), `backend/verify.py:96-102`
+(`len(base58.b58decode(address)) == 32`).
+**Confidence:** certain — measured locally and reproduced over HTTP.
+**Invariant broken:** CLAUDE.md's DoS posture ("expensive unauthenticated
+operations", "no rate limits"). The registry has no other single-request
+amplifier of this size.
+
+`base58.b58decode` builds a Python bignum one digit at a time, which is
+quadratic in input length. `looks_like_address` hands it the raw client string
+with no length bound, and pydantic imposes none:
+
+```
+   2000 chars ->       1.5 ms
+   4000 chars ->       5.6 ms   x3.7 per 2x input
+   8000 chars ->      22.0 ms   x3.9 per 2x input
+  16000 chars ->      87.7 ms   x4.0 per 2x input
+  32000 chars ->     347.6 ms   x4.0 per 2x input
+  64000 chars ->    1411.5 ms   x4.1 per 2x input
+```
+
+Cleanly quadratic. Extrapolating: a 1 MB request body is ~345 seconds of pure
+CPU on one request. Reproduced end to end against the running server:
+
+```
+POST /api/wallet/bind {"chain":"anything","address":"z"*16000,...} -> 400 in  871 ms
+POST /api/wallet/bind {"chain":"anything","address":"z"*64000,...} -> 400 in 2235 ms
+```
+
+`wallet_bind` never checks `req.chain`, so any value other than `"evm"` routes
+straight into the base58 branch — `"chain":"anything"` above is what I sent.
+Because `wallet_bind` is a sync `def`, it runs in Starlette's threadpool and the
+bignum loop holds the GIL, so it starves the whole single process, not just one
+worker. Measured: while one 64 KB request ran, an innocent concurrent
+`GET /api/me` went from a ~1 ms baseline to **293 ms**.
+
+The auth gate does hold — anonymous callers get 401 in 52 ms, confirmed. But
+`render.yaml:14-15` ships `DEMO_MODE=1` as the committed default, and in demo
+mode any internet visitor obtains a session in three unauthenticated requests
+(`/login` → `/authorize/confirm` → `/callback`). So the practical precondition
+is three HTTP requests, and ~40 concurrent 1 MB POSTs pin the process
+indefinitely.
+
+What makes this a finding about *this diff* rather than an inherited one: the
+diff introduces `_clean_token`, whose entire stated purpose is to "reject the
+shapes that cannot be a real nonce or signature before they reach storage… an
+oversized value is only ever an attempt to write junk into a durable table" —
+and it caps the two fields that were already bounded by their own format checks
+while leaving uncapped the one field that feeds an unbounded parser. The same
+diff then adds a *second* call site for that parser at `:393`. The hardening and
+the widening landed together.
+
+---
+
+### High — R1 deleted the only thing that was reclaiming the unbounded tables, and DEPLOY.md advertises the deletion as the feature — **PARTIALLY RESOLVED, downgraded to Medium**
+
+**Resolution (re-verified 2026-07-26, fix diff):** `store.sweep_expired()`
+(`store.py:413-428`) deletes TTL-dead rows from both tables, driven by a daemon
+thread started at FastAPI startup that runs on boot and every 600 s
+(`app.py:208-224`). Verified working, including the boundary cases test 25 does
+not reach: expired-by-1h, expired-by-0.3s and expired-with-microsecond-0 rows
+were all deleted; a live +1h row survived; the authenticated session driving my
+probe survived. Deleting nonce rows cannot orphan anything — I checked
+`pg_constraint` directly and there is exactly one foreign key in the schema
+(`wallet_bindings_identity_id_fkey` → `identities`); `proof_nonce`/`proof_sig`/
+`proof_message` are copied into `wallet_bindings` as plain TEXT, so verification
+history is independent of `auth_nonces`. And a nonce is only ever deletable once
+`consume_nonce` would already have rejected it as expired, so the sweep cannot
+shorten any nonce's usable life.
+
+**What this fixes is the property that made it a High, and I want to be precise
+about that:** the growth was previously *permanent and unrecoverable* — nothing
+in the system ever reclaimed a row, and unlike the SQLite era no redeploy or
+restart helped. That is genuinely gone. Damage now self-heals within the TTL of
+the last row written.
+
+**What it does not fix is the peak.** A sweep bounds a table at
+`arrival rate x TTL`, and neither factor was touched: there is still no rate
+limit anywhere in the process, and `/login` still mints a row with the full
+12-hour session TTL for an unauthenticated visitor whose `oidc_state` is useful
+for about sixty seconds — re-verified on the fixed server (`data={'oidc_state':
+…}`, `TTL=12:00:00`). The arithmetic at ~910 bytes/row:
+
+```
+  10 anonymous /login req/s ->    432,000 rows = 0.37 GB
+ 100 anonymous /login req/s ->  4,320,000 rows = 3.66 GB
+ 500 anonymous /login req/s -> 21,600,000 rows = 18.31 GB
+        (Supabase free tier quota: 0.49 GB — read-only above it)
+```
+
+Ten requests per second — trivially sustainable, well under anything that looks
+like an attack — parks the table within a third of the quota indefinitely. So
+the outage is still reachable; it is now transient rather than permanent, and
+recovery no longer requires a human. Downgrading to **Medium**, tracked with the
+two cheap follow-ups in the new Low findings above (short TTL for pre-auth rows;
+index on `expires_at`).
+
+Original finding retained below.
+
+**Location:** `backend/app.py:270-279` (`/login` writes `oidc_state` into the
+session with no authentication), `backend/app.py:167-185` (the middleware mints
+a sid and persists a row whenever the session is non-empty),
+`backend/store.py:396-405` (`save_session` upsert), `backend/store.py:385-393`
+(the *only* expiry path — lazy, and only when that exact sid is presented
+again), `backend/store.py:415-423` (`issue_nonce`; no sweep of `auth_nonces`
+exists anywhere in the codebase — I grepped, there is no `DELETE FROM
+auth_nonces`), `DEPLOY.md:79-89`.
+**Confidence:** certain — measured.
+**Invariant broken:** CLAUDE.md's DoS posture ("unbounded tables"). Secondary:
+the R1 availability claim itself — quota exhaustion on Supabase flips the
+project read-only, and unlike the SQLite era no redeploy or restart recovers it.
+
+A prior run (2026-07-24) rated the `sessions` growth a **Medium**. It was a
+Medium because the storage was a file on an ephemeral disk that Render wiped on
+every redeploy and every free-tier spin-down — DEPLOY.md said so explicitly, and
+the old text called that reset "acceptable — arguably convenient". This diff
+removes that reclamation and replaces the paragraph with "**Data now survives
+redeploys, restarts and free-tier spin-down**". The garbage now survives too,
+and nothing else collects it. Same code, strictly worse consequence: escalating
+to High.
+
+Measured on the live database:
+
+```
+25 anonymous GET /login  ->  sessions rows 32 -> 57   (delta = exactly 25)
+row content: {"oidc_state": "..."}   ~910 bytes/row   12h TTL that nothing enforces
+auth_nonces: 251 rows, 246 already expired, 180 already consumed, ~1044 bytes/row
+```
+
+246 of 251 nonce rows are dead weight that no code path will ever reclaim. No
+rate limiting exists anywhere in the process (grepped: no `slowapi`, no limiter,
+no throttle). The cheapest attack needs no session at all: `GET /login` is one
+unauthenticated request with no body and writes one permanent row. At ~910 B/row
+a Supabase free-tier 500 MB quota is ~576,000 rows. `auth_nonces` needs a
+session, which DEMO_MODE hands out for free, and costs ~1044 B/row.
+
+The two tables also feed the availability finding below: every row is a row
+`promote_due`'s scans and the session middleware's lookups have to step over.
+
+---
+
+### Medium — a nonce is not bound to the identity that requested it, so a stored proof can attest to a different person than the row it proves
+
+**Location:** `backend/store.py:415-455` (`auth_nonces` has no `identity_id`
+column; `consume_nonce` matches on nonce + address + chain only),
+`backend/app.py:367-385` (issue), `backend/app.py:388-434` (bind).
+**Confidence:** certain — reproduced live against two different Fayda identities.
+**Invariant broken:** not non-negotiable #2 as written (the server does reload
+the server-stored message and verifies against it — that part is sound), but the
+product claim in CLAUDE.md line 9: "Stores only cryptographic proof that a
+verified person controls an address." The stored proof and the row can name
+different people.
+
+The signed message embeds `Identity: <display_name>` precisely so the wallet
+owner can read who they are binding to before signing. Nothing checks that the
+session presenting the nonce at bind time is the session the nonce was issued
+to. Reproduced:
+
+```
+identity A = Meseret Alemu (50576721)   identity B = Hiwot Girma (2ac599f9)
+A requests nonce for addr X -> message says "Identity: Meseret Alemu"
+A signs it.  B (different Fayda identity, different session) submits it:
+  POST /api/wallet/bind -> 200 {"status":"active"}
+
+persisted row on Hiwot Girma:
+  identity_id  : 2ac599f9  (Hiwot Girma)
+  proof_message: "Identity: Meseret Alemu"    <-- attests the wrong person
+  status       : active
+```
+
+This does not break the sybil constraint (`address_claimed_by_other` is checked
+against the *binding* identity, and I could not get two live claims on one
+address by any route). The address-control proof is still cryptographically
+sound — B really does control X. What breaks is the evidentiary value: the
+registry's durable artifact now says a named verified person consented to a
+binding they did not make. The precondition is two Fayda sessions, which is
+free in DEMO_MODE and is exactly the sybil-test scenario the personas exist for.
+
+Pre-existing (the nonce never had an identity column), but R1 is what makes the
+mis-attesting artifact permanent, and `t.py` has no test for it.
+
+Secondary note on the same message: `identity_label` is the display name, which
+is not unique. Two residents with the same name produce byte-identical proof
+text modulo nonce, so binding the nonce to the identity id is the only fix that
+actually closes this.
+
+---
+
+### Medium — `sslmode=require` encrypts without authenticating; the comment claims a protection libpq does not provide, and `verify-full` is not currently reachable
+
+**Location:** `backend/store.py:180-194`, specifically the comment at `:181-184`
+and `kw.setdefault("sslmode", "require")` at `:193`.
+**Confidence:** certain — libpq's documented semantics, plus measured behaviour
+against this endpoint.
+**Invariant broken:** the credential-handling posture the diff sets for itself.
+
+The comment reads: "default `sslmode=require`: 'prefer' would fall back to
+PLAINTEXT if a middlebox strips TLS, sending the credential and all registry PII
+in the clear." That is half right. `require` does block the passive downgrade.
+It performs **no certificate and no hostname verification** — libpq accepts any
+certificate the peer presents. An attacker with a network position (hostile
+egress, DNS or BGP redirection, a compromised sidecar) presents a self-signed
+cert, terminates TLS, relays SCRAM to the real server, and reads and rewrites
+every query: the connection credential, every `fin_hmac`, every wallet binding,
+and the `sessions` JSONB — which holds the kebele/woreda claims the whole
+server-side-session design exists to protect. Rewriting results also defeats the
+sybil check, since `address_claimed_by_other` believes whatever comes back.
+
+Measured against this endpoint, values withheld:
+
+```
+effective TLS settings: {'sslmode': 'require', 'sslrootcert': None, 'sslcert': None,
+                         'sslkey': None, 'sslsni': None, 'channel_binding': None}
+sslmode=require      -> CONNECTED
+sslmode=verify-ca    -> OperationalError: SSL error (public CA bundle rejects it)
+sslmode=verify-full  -> OperationalError: SSL error (public CA bundle rejects it)
+```
+
+Worth stating plainly because it changes the remediation: this is *not* a
+one-line default change. Supabase's pooler presents a Supabase-issued CA, so
+reaching `verify-full` means shipping their root certificate with the image and
+pointing `sslrootcert` at it. Until that happens the credential path is
+encrypted but unauthenticated, and the comment overstates what is in place.
+
+---
+
+### Medium — `reset()`'s guard reads the process's APP_ENV; it cannot see which database it is pointed at, and the comment claims a guarantee it does not provide
+
+**Location:** `backend/store.py:320-332`, especially the comment at `:322-324`
+("a second guard here means no future code path can drop production tables even
+by mistake") and `os.getenv("APP_ENV") != "dev"` at `:325`.
+**Confidence:** certain — structural; the function has no knowledge of the
+target database.
+**Invariant strained:** CLAUDE.md "What done means": "Dev surface unreachable
+when APP_ENV is not dev." That is satisfied. The claim in the code comment is
+not.
+
+The guard itself is well built and I could not defeat it. Verified: `'Dev'`,
+`'DEV'`, `'dev '`, `'production'`, `''` and unset all refuse; the route is
+additionally inside `if DEV_MODE:` and calls `current(request)` first. Two
+independent exact-match gates, both failing closed.
+
+What the guard cannot do is check *where* it is dropping tables. `DROP TABLE …
+wallet_bindings, auth_nonces, sessions, identities CASCADE` executes against
+whatever `SUPABASE_DB_URL` names. The setup described in this very task —
+"a dev server, APP_ENV=dev, connected to the real Supabase dev project" — is the
+shape of the hazard: one authenticated POST to `/api/dev/reset` from a laptop
+drops four tables in a shared durable database. Under SQLite the blast radius
+was a local file that was going to be wiped on the next redeploy anyway. R1
+changed the blast radius by three orders of magnitude and the guard did not
+change with it. It also takes R2's Row-Level Security policies with it, since
+those attach to the dropped tables.
+
+A guard that matched the new blast radius would key on the database (a marker
+row, a `current_database()` allowlist, a required `ALLOW_DESTRUCTIVE_RESET`
+naming the target), not on the process's own env var.
+
+---
+
+### Medium — the read path saturates a 12-connection pool at ~30 concurrent readers, and the failure lands *after* the response has started
+
+**Location:** `backend/store.py:220-245` (`max_size=12`,
+`check=ConnectionPool.check_connection` — a full round trip on every checkout —
+`timeout=30`), `backend/app.py:452-457` (`/api/me` takes three sequential
+checkouts: `promote_due`, `get_identity`, `bindings_of`),
+`backend/app.py:437-440` (`/api/registry` is unauthenticated and runs a *global*
+`promote_due()` plus an unpaginated `registry()`), `backend/app.py:167-185`
+(`store.save_session` runs inside the ASGI send wrapper, after
+`http.response.start`).
+**Confidence:** certain for the contention (measured); likely for the
+torn-connection failure mode (structural, and the diff's own docstring
+describes it).
+**Invariant strained:** DoS posture.
+
+Measured against the running server:
+
+```
+authenticated GET /api/me, idle baseline           1611 ms
+ 6 anonymous /api/registry floodors -> /api/me      1756 - 4394 ms
+20 anonymous /api/registry floodors -> /api/me      6000 - 6880 ms
+30 concurrent authenticated /api/me for 25 s:
+   p50 22312 ms   p95 28290 ms   max 28977 ms   throughput 2.0 req/s   (all 200)
+```
+
+p95 lands within 1.7 s of the 30 s pool timeout. Re-stating my caveat: the
+absolute numbers are inflated by laptop→Supabase RTT (a bare pool checkout plus
+`SELECT 1` measured 373 ms here). The structure is not: `/api/me` is three
+checkouts deep, each checkout pays a `check_connection` round trip, and the
+ceiling is 12 connections. The `/api/me` batching in this diff removed round
+trips *inside* one store call while leaving three separate checkouts in place,
+so it recovers less than the comment at `:454-456` suggests.
+
+The part that matters when the ceiling is crossed: `store.save_session` is
+called from `send_wrapper` after `http.response.start` has been assembled and
+before `await send(message)`. A `PoolTimeout` there does not produce a 5xx — it
+tears the connection with no HTTP response at all. I observed exactly that
+symptom once during probing (`httpx.ReadError: Connection reset by peer` with no
+status line). The diff's own `_strip_nul` docstring names this hazard precisely
+("it would raise inside the session save — which happens in the ASGI send
+wrapper, after the response has started, so the connection is torn and the login
+silently fails") and then fixes only the NUL trigger, leaving the far more
+likely trigger — pool exhaustion against a remote managed database — in place.
+
+`/api/registry` is the amplifier: unauthenticated, no pagination, returns every
+identity with `fin_hmac` (58 identities / 13.7 KB today, unbounded tomorrow),
+and holds its pool connection across a global `promote_due()` whose transaction
+spans every due pending row.
+
+---
+
+### Low — the NUL boundary is incomplete: three paths still hand raw client/IdP text to Postgres
+
+`_strip_nul` (`backend/app.py:231-248`) is applied only inside `safe_claims`,
+which populates `request.session["claims"]`. It does cover the session-save path
+completely — I checked every other key that reaches the session (`oidc_state` is
+`token_urlsafe`, `identity_id` is a uuid). Three writes bypass it:
+
+- `backend/app.py:314-315` — `display_name=claims.get("name")` and
+  `birthdate=claims.get("birthdate")` go to the `identities` INSERT unstripped.
+  Confirmed the failure: `psycopg.DataError: PostgreSQL text fields cannot
+  contain NUL (0x00) bytes`. Needs a nonconforming IdP, so low, but it is the
+  exact hazard the helper was written for and it sits on a durable write.
+- `backend/app.py:372-384` — `req.address` is neither NUL-checked nor
+  length-checked before `address_claimed_by_other`/`issue_nonce`.
+  `"0x" + "\x00"*40` satisfies `looks_like_address` (starts with `0x`, length
+  42). Reproduced: `POST /api/wallet/nonce -> 500 Internal Server Error`.
+  No data impact, no partial write, but an unhandled 500 any authenticated
+  caller can trigger with two JSON fields.
+
+---
+
+### Low — `wallet_bind` never validates `req.chain`
+
+`backend/app.py:389-394`. `wallet_nonce` checks `req.chain not in ("evm",
+"solana")` at `:370`; `wallet_bind` does not. Today it fails closed by accident
+— an unknown chain finds no matching nonce and 400s at `consume_nonce`, and the
+table's `CHECK (chain IN ('evm','solana'))` backstops the INSERT. But "safe
+because an unrelated lookup happens to miss" is the kind of guarantee that stops
+holding when someone reorders the function, and it is what routes the base58
+payload in the first High into the quadratic branch.
+
+---
+
+### Low — `promote_due` catches only `UniqueViolation`; a deadlock or serialization failure 500s an unauthenticated endpoint
+
+`backend/store.py:641-656`. The savepoint handler catches
+`psycopg.errors.UniqueViolation` and `_NotPending`. `DeadlockDetected` and
+`SerializationFailure` propagate out of the loop and out of `with conn()`,
+which is correct-by-accident (the whole thing is one transaction, so it rolls
+back cleanly with no partial state) but surfaces as a 500 on `/api/registry`
+and `/api/me`. I raced two concurrent global promoters against a cancel for 12
+rounds and produced no deadlock and no exception, so this is theoretical today.
+Recording it because `ORDER BY id` was chosen specifically to avoid deadlocks
+and the handler does not cover the case it is guarding against.
+
+---
+
+### Low — `_conninfo` unquotes unconditionally; `_load_dotenv` handles neither quotes nor `export`
+
+`backend/store.py:159-194` and `:140-156`. The parser is genuinely better than
+`urllib.parse` for this job — I confirmed it handles `/`, `?`, `@` and `:` inside
+the password correctly, which is the stated reason it exists. Two residual
+sharp edges, both failing closed but with misleading errors:
+
+- `unquote(user)` / `unquote(password)` run unconditionally, so a password
+  containing a literal `%41` is silently rewritten to `A`. That is precisely the
+  "mangled password shows up only as a confusing auth failure" the docstring
+  says the function exists to prevent.
+- `_load_dotenv` does not strip surrounding quotes (`SUPABASE_DB_URL="postgres://…"`
+  → `RuntimeError: must be a postgresql:// URL`) and does not handle a leading
+  `export ` (key becomes `export SUPABASE_DB_URL`, misses the allowlist, and the
+  app reports the variable as unset). Both are startup-time and loud enough to
+  diagnose, just not from the message.
+
+---
+
+### Low — the OIDC `nonce` is minted, sent, and never verified
+
+`backend/app.py:273` generates a `nonce`, puts it in the authorize URL, and
+never stores it. There is no ID token in this flow — the app authenticates
+purely on `code` → `access_token` → `userinfo` — so nothing is currently broken.
+Flagging it for B1: when real Fayda credentials arrive and an `id_token` comes
+back, that nonce must be persisted at `/login` and checked against the token's
+claim, or the replay protection the parameter exists for is decorative.
+
+---
+
+### Low — pre-existing findings from earlier runs, unchanged but now costlier
+
+Neither is introduced by this diff; both change character under R1 and neither
+has a test:
+
+- **Logout is not atomic** (prior run, 2026-07-24). `save_session` is still an
+  upsert (`store.py:396-405`) and `delete_session` a plain DELETE (`:408-410`);
+  a request in flight when `/logout` runs still re-inserts the row. Unchanged.
+- **Every authenticated request rewrites its session row** (prior run). Still
+  true at `app.py:179`, and each rewrite is now a remote round trip rather than
+  a local file write, which is part of why `/api/me` costs three checkouts.
+
+---
+
+### Verified safe (actively attacked, held)
+
+These are the things I tried hardest to break and could not. Next run should
+spend its budget elsewhere.
+
+- **The sybil constraint is now enforced by the database in a way application
+  code cannot escape.** `address_norm` is `is_generated: ALWAYS` with expression
+  `CASE WHEN chain='evm' THEN lower(address) ELSE address END`, and Postgres
+  rejects a direct write: `GeneratedAlways: cannot insert a non-DEFAULT value
+  into column "address_norm"`. All four partial unique indexes are present on
+  the live database and keyed correctly (`ux_active_chain_address` and
+  `ux_pending_chain_address` on `(chain, address_norm)`). I could not produce
+  two live claims on one address by any route: case-variant races, 4-way
+  concurrent replay, and cross-identity pending all resolved to exactly one live
+  row. This is the strongest part of the diff — moving the canonical form into
+  the schema means no future code path can fork a row on case.
+- **Nonce single-use holds under real concurrency.** `t.py` test 7 only tests
+  *serial* replay, which the old global lock made trivial. I fired 4 threads at
+  one nonce through a `threading.Barrier`, 5 rounds: every round returned
+  `[200, 400, 400, 400]` with exactly 1 live binding row. `SELECT … FOR UPDATE`
+  plus the `consumed` re-check inside one transaction is doing its job — the
+  losers block, then re-evaluate under READ COMMITTED and see `consumed=1`.
+- **The cooling period survives a harder race than test 23 runs.** Test 23 races
+  cancel against one promoter. I raced cancel against **two** concurrent global
+  promoters, 12 rounds: zero broken end-states, zero exceptions. Every round
+  ended with exactly one active wallet, and the two legal outcomes were the only
+  ones observed (cancel wins → replacement `cancelled` + incumbent `active`;
+  promote wins → replacement `active` + incumbent `archived`). No resurrection
+  of a cancelled row, no identity left with zero active wallets. The `FOR UPDATE`
+  + `AND status='pending'` belt-and-braces and the savepoint rollback of the
+  incumbent archival are both load-bearing and both correct.
+- **`init()`'s dupe-cancel UPDATE cannot cancel a row it shouldn't.** Its
+  partition key `(chain, address_norm, status)` is *identical* to the two partial
+  unique indexes' keys, so on an index-consistent database the `rn > 1` set is
+  provably empty — verified empirically on the live database: **0 rows it would
+  cancel right now**. It only ever bites during the one-time migration, and there
+  it produces exactly the outcome the index would have produced. The advisory
+  xact lock correctly serializes concurrent boots, and the stale-index detection
+  (`indexdef NOT LIKE '%address_norm%'`) is the right predicate.
+- **The `reset()` guard is exact-match and fails closed on every near miss.**
+  `'Dev'`, `'DEV'`, `'dev '`, `'production'`, `''`, unset — all refused. Two
+  independent gates (route registration under `if DEV_MODE:` plus the in-function
+  check) plus `current(request)` first. My finding above is about blast radius,
+  not about this guard leaking.
+- **The credential does not leak into responses, the repo, or the image.**
+  `backend/.env` is untracked and matched by `.gitignore:6`; no `.env` has ever
+  been committed on any branch (checked all refs). `.dockerignore` now carries
+  `**/.env` and `**/.env.*`, which do match `backend/.env` and
+  `frontend/.env.local` under Docker's matcher, and the Dockerfile's
+  `COPY backend/ backend/` therefore cannot bake it in. FastAPI's default handler
+  returns a bare `Internal Server Error` body with no exception detail —
+  confirmed by forcing a live psycopg failure. libpq error text includes host and
+  port but scrubs the password, and `psycopg_pool` logs `self.name`, not the
+  conninfo. `render.yaml` sets `sync: false`, so the value is never in the
+  blueprint.
+- **The dotenv allowlist actually holds.** `_DOTENV_ALLOWED` is a
+  `frozenset({"SUPABASE_DB_URL"})` and the check is
+  `if k in _DOTENV_ALLOWED and k not in os.environ`. A `.env` that reaches a
+  server cannot flip `APP_ENV`, plant `SESSION_SECRET`/`FIN_PEPPER`, or override
+  a real env var. This is the right design and it is implemented correctly.
+- **Raw FIN.** Re-derived under the new storage. `sub` is hashed at
+  `app.py:212` before anything persists it; `SAFE_CLAIMS` excludes `sub`,
+  `phone`, `picture`; `display_name`/`birthdate` are the only claim-derived
+  columns and neither is `sub`. Nothing in `store.py` writes a raw FIN, no
+  logging statement exists in either file, and tracebacks do not print locals.
+  `t.py` 3b/3c still pin the response-body and cookie cases and pass.
+- **Server-stored message verification (non-negotiable #2).** `consume_nonce`
+  returns the stored `message` and `wallet_bind` passes *that* to `vf.verify`;
+  the client's copy is never read. Unchanged by this diff and still correct — the
+  cross-identity finding above is about *whose name is in* the stored message,
+  not about which message is verified.
+- **`/api/me`'s batching is semantically equivalent.** `one(status, chain)`
+  slices `history()` (ordered `requested_at DESC`) instead of querying. The
+  partial unique indexes guarantee at most one `active` and one `pending` per
+  `(identity, chain)`, so "first match" and "the row" are the same row. No
+  behaviour change, and `promote_due` still runs before the read.
+- **`upsert_identity`'s `ON CONFLICT` handles the concurrent-first-login race.**
+  Read-then-insert with `ON CONFLICT (fin_hmac) DO UPDATE … RETURNING *` means
+  the loser blocks on the winner's uncommitted row, then lands on it rather than
+  raising. Correct fix for the case the comment names.
+- **`SET search_path TO public` in `configure` is applied per connection** and
+  the pool runs it on every new connection, so `reset()`'s DROP cannot resolve
+  into Supabase's `auth` schema. (Note for the operator: this depends on a
+  *session*-mode pooler string, which `DEPLOY.md` correctly specifies.)
+
+---
+
+### Verdict
+
+**New criticals: 0, new highs: 2.** Not yet safe to build on — but the reason is
+availability and operational blast radius, not correctness.
+
+The correctness core of R1 is good, and I want to be clear about that because it
+is the part that was hardest to get right. Losing `_DB_LOCK` did not break a
+single invariant I could reach: the sybil constraint is stronger than it was
+(the generated column makes it unforgeable from application code), nonce
+single-use survives concurrent replay, and the cancel-versus-promote race
+holds under twice the pressure `t.py` applies. Tests 22 and 23 are real tests.
+
+What is not ready is everything around the data. Two High findings, both of
+which are the same mistake in different clothes: a change that made storage
+durable did not revisit the assumptions that depended on it being disposable.
+The unbounded tables were survivable when a redeploy wiped them, and the diff
+deletes that mitigation while documenting the deletion as a feature. `reset()`'s
+guard was sufficient when it dropped a local file, and now it drops a shared
+database it cannot identify. The quadratic-parser DoS is the odd one out —
+genuinely introduced here, by a hardening helper that capped every field except
+the one that gets parsed.
+
+Fix the two Highs and the `reset()` blast radius before this takes real traffic.
+The `sslmode` and nonce-identity findings can follow; both need design decisions
+(ship Supabase's CA; add `identity_id` to `auth_nonces`) rather than patches.
+
+---
+
 ## Diff review — 2026-07-24 (Render/Docker deploy: Secure cookie, SPA catch-all, DEMO_MODE, /config.js)
 
 Scope: the uncommitted deploy deltas only — `backend/app.py` (Secure cookie on
