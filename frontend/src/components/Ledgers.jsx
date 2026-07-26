@@ -56,7 +56,7 @@ export function RegistryLedger({ identities }) {
         <tbody>
           {identities.length ? (
             identities.map((i) => (
-              <tr key={i.id}>
+              <tr key={`${i.display_name}-${i.verified_at}`}>
                 <td data-label="Identity" className="font-ui">{i.display_name}</td>
                 <td data-label="Ethereum" className="max-w-[14rem] break-all">
                   {i.evm || <span className="text-muted">—</span>}

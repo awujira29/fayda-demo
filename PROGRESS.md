@@ -156,6 +156,105 @@ Ethiopian data-protection rules. Unanswered. Do not integrate before it is.
 
 ## Done
 
+### R2 - Row-Level Security + passkey return-login + non-public registry - done 2026-07-26
+
+**RLS is enforced by Postgres, not by WHERE clauses.** The catch: the app
+connects as `postgres`, which carries `rolbypassrls` — policies written against
+that role are decoration. So a role `fayda_app` (NOLOGIN, NOBYPASSRLS) is
+created and granted to the connected user, and `store.user_conn(identity_id)`
+runs `set_config('app.identity_id', …, true)` + `SET LOCAL ROLE fayda_app` for
+the transaction. Policies on identities, wallet_bindings and
+webauthn_credentials are `USING`/`WITH CHECK (<col> = nullif(current_setting(
+'app.identity_id', true), ''))`. The `nullif` is load-bearing: on a REUSED
+pooled connection `current_setting` returns the empty string rather than NULL,
+so a bare comparison becomes `id = ''` — a predicate an unbound transaction can
+satisfy and then share with every other unbound transaction. Verified: a
+`SELECT` with no WHERE clause at all returns exactly one identity's rows; an
+INSERT for another identity is refused; an unbound transaction reads and writes
+nothing; neither role nor GUC survives a pool checkout, including after an
+exception mid-transaction (t.py 27, 32a).
+
+**The interaction that mattered: RLS hides rows the sybil check needs.** The
+unique indexes are not RLS-filtered, so a same-tier collision is still caught
+even though the querying identity cannot see the conflicting row. The cross-tier
+case (an identity with a wallet claiming one held by another) has no index to
+catch it, which is exactly why `address_claimed_by_other` stays on the
+privileged connection — scoped, it would see nothing and report the address
+free. Both halves are asserted against a row RLS hides (t.py 27).
+
+**Passkey return-login, deliberately NOT Supabase Auth** though R2 named it: its
+passkey support is beta ("API may change without notice"), and adopting it would
+put a client-readable JWT in the browser and a second identity authority beside
+Fayda — S1 moved sessions server-side precisely because the claims carry
+kebele/woreda, and the SPA is same-origin with a third-party wallet connector.
+WebAuthn is implemented directly (py_webauthn) against our own Postgres, so
+Fayda stays the only source of identity and Supabase stays what it is: the
+database enforcing the policies. A passkey session carries name and birthdate
+only — it proves device control, not a fresh national-ID check, and must not
+resurrect neighbourhood-level claims from an older session.
+
+**The security property that took three rounds to get right:** a passkey
+outlives logout, so an attacker holding a live session could register one and
+convert a temporary compromise into permanent access — the precise failure the
+cooling period exists to prevent, made unrecoverable. Three rules, each closing
+a gap the previous round left:
+
+1. Registration requires `auth_method == "fayda"` (set explicitly at the
+   callback, never inferred from a missing key), so a passkey cannot
+   chain-register another.
+2. Registration also requires a RECENT verification (`auth_at` within 15
+   minutes). Gating on how the session was *created* was not enough — the
+   auditor pointed out that a stolen cookie inherits the victim's Fayda login
+   and could register at any point in the session's 12 hours. Freshness shrinks
+   that to minutes and forces the attacker through the one step a cookie cannot
+   replay.
+3. Revocation ends the sessions that passkey opened, not just its next login.
+   The attacker who registered it is already signed in; without this, revoking
+   left them working for the rest of a 12-hour TTL and the escape hatch was
+   decorative.
+
+Verified end to end (t.py 30, 30b, 30c — 30c backdates `auth_at` through the
+store so staleness is tested deterministically rather than by waiting), and in
+real Chrome with a CDP virtual authenticator: register → sign out → return with
+the passkey alone, register disabled in a passkey session, revoke present and
+effective.
+
+**The registry stopped being public.** `/api/registry` requires a session; the
+payload drops `fin_hmac` (a stable pseudonymous key that lets any reader
+correlate a person across rows) and the internal id (the RLS scoping key), and
+lists only identities that actually hold a wallet — an identity with none was
+the sensitive half of the row without the useful half. This also takes the
+registry-wide `promote_due()` off the unauthenticated surface. Honest caveat
+recorded in DEPLOY.md: under `DEMO_MODE` a persona click buys a session, so the
+gate is real but the identities behind it are public test data.
+
+**Auditor: 0 criticals. Two highs, both resolved.** (1) The unrevokable-passkey
+persistence above. (2) `requirements.txt` was unresolvable — `cryptography==46.0.6`
+against webauthn's `>=49`, which would have failed every Docker and Render
+build while tests passed on a venv upgraded out of band; verified fixed with a
+`--dry-run` install in a fresh venv, not the local one. Five mediums also fixed:
+the `nullif` fail-closed gap, `reset()` orphaning credentials and permanently
+dropping their foreign key, the registry disclosure, `require_user_verification`
+not enforced at registration (which would have stored unusable keys), and three
+unauthenticated 500s from malformed JSON bodies.
+
+Also made structural rather than documented: `DEMO_MODE` publishes a login any
+visitor can perform, so a deploy that sets it AND points at a real Fayda
+endpoint now refuses to boot instead of putting real identities behind a
+one-click login (t.py 32d). The remaining DEMO_MODE caveat — that the gate is
+real but the identities behind it are public test personas — is written down in
+DEPLOY.md.
+
+**Verification:** all 34 checks pass; tests 27-32 are new. The Docker image
+builds clean (the `cryptography` pin fix verified in the context it was
+breaking, not just via `pip --dry-run`). Full flow driven in real Chrome via a
+CDP virtual authenticator, not only the software authenticator in t.py.
+
+**Known and accepted:** a stolen session can revoke the victim's OWN passkeys
+(revoke is gated on the session alone). That is the safe direction — worst case
+the victim is pushed back through Fayda, which is where a compromised session
+should end up anyway — so it stays un-privileged deliberately.
+
 ### R1 - Supabase Postgres migration (KEYSTONE) - done 2026-07-26
 Storage is managed Postgres, not a file on the container's disk. Data survives
 deploy, restart and scale-out, the sybil indexes hold across every instance
@@ -489,11 +588,7 @@ one platform, which collapses persistence, the login layer, and RLS into one dec
 
 ### R1 - Migrate to Supabase Postgres (KEYSTONE) - DONE 2026-07-26 (see Done)
 
-### R2 - Supabase Auth + passkey return-login + RLS
-Real accounts. Fayda once to establish identity, then register a passkey (WebAuthn)
-for biometric return-login. Postgres RLS policies so every user session reads/writes
-ONLY its own rows -- enforced by the DB. User dashboard shows only the signed-in
-person's identity/wallets/history. Public registry stops being public.
+### R2 - Auth + passkey return-login + RLS - DONE 2026-07-26 (see Done)
 
 ### R3 - Operator role + immutable access logging
 Privileged role that can look up other identities. Every operator lookup written to

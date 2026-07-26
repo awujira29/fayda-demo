@@ -5,6 +5,7 @@ Internal proof of concept. The Fayda side is a real OIDC client pointed at a
 local mock provider — swapping to production is an env var change, not a rewrite.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -17,12 +18,21 @@ from contextlib import asynccontextmanager
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import base58
 import httpx
 import jwt
 import nacl.signing
+import psycopg
 import uvicorn
+import webauthn as wa
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+)
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from fastapi import FastAPI, HTTPException, Request
@@ -100,6 +110,24 @@ if not DEV_MODE:
             " must be set from a secret manager when APP_ENV != dev"
         )
 
+# DEMO_MODE publishes the mock IdP, so anyone can click a persona and hold a
+# session. That is the point of a demo, and it is why the registry being
+# "authenticated" means little there. It becomes a real problem only if the
+# same deploy ALSO points at live Fayda: real identities would then sit behind
+# a login anyone can perform. Nothing prevented that combination, so make it
+# structural rather than a line in DEPLOY.md — same shape as the secrets guard
+# above, and it fails at boot rather than after real people have registered.
+if DEMO_MODE and not DEV_MODE:
+    _live = [n for n in ("FAYDA_AUTHORIZE_URL", "FAYDA_TOKEN_URL",
+                         "FAYDA_USERINFO_URL") if os.getenv(n)]
+    if _live:
+        raise RuntimeError(
+            "refusing to start: DEMO_MODE publishes the mock identity provider, "
+            "but " + ", ".join(_live) + " points this deploy at a real one. "
+            "Real identities must not sit behind a login any visitor can perform. "
+            "Unset DEMO_MODE for a live deployment."
+        )
+
 # Dev-only fallback so the demo runs with zero setup. NEVER reached in production
 # because the guard above hard-stops a non-dev start with these unset.
 #
@@ -126,6 +154,11 @@ SESSION_TTL_HOURS = 12
 # by 24x while leaving room for a real biometric or OTP capture; ten minutes
 # risked expiring a slow but legitimate login.
 PRE_AUTH_SESSION_TTL_HOURS = 0.5
+# How recently Fayda must have verified the person before the session may
+# create a passkey — a credential that outlives the session itself. Fifteen
+# minutes is long enough to finish reading the page and click, short enough
+# that a stolen cookie is usually past it.
+FRESH_AUTH_SECONDS = 900
 
 
 def _sign_sid(sid: str) -> str:
@@ -380,6 +413,13 @@ async def callback(request: Request, code: str = "", state: str = ""):
     # browser and the DOM — so sub, phone and picture are stripped here, at the
     # boundary, before anything stores them.
     request.session["claims"] = safe_claims(claims)
+    # Explicit, not inferred from the absence of the key: this field decides
+    # whether the session may register a passkey, and a security gate should
+    # not rest on a default.
+    request.session["auth_method"] = "fayda"
+    # When that verification happened, so operations that create long-lived
+    # credentials can demand a recent one (see require_fayda_session).
+    request.session["auth_at"] = datetime.now(timezone.utc).isoformat()
     return RedirectResponse("/")
 
 
@@ -387,6 +427,268 @@ async def callback(request: Request, code: str = "", state: str = ""):
 def logout(request: Request):
     request.session.clear()
     return JSONResponse({"ok": True})
+
+
+# ------------------------------------------------------- passkeys (R2)
+#
+# Return-login, not a second identity system. A passkey can only be registered
+# by a session that Fayda already verified, and it carries that identity_id, so
+# an assertion re-establishes an identity Fayda proved — it can never mint one.
+# Fayda remains the only source of identity (CLAUDE.md), and the private key
+# never leaves the authenticator, which is what makes this phishing-resistant
+# in a way a password or an emailed link is not.
+#
+# Deliberately NOT Supabase Auth, though R2 named it: its passkey support is
+# beta ("API may change without notice"), and it would put a client-readable
+# JWT in the browser and a second identity authority beside Fayda. S1 moved
+# sessions server-side precisely because the claims carry kebele/woreda, and
+# the SPA is same-origin with a third-party wallet connector. Supabase is still
+# the base — it is the Postgres that stores these credentials and enforces the
+# RLS around them.
+
+# The relying-party id is the registrable domain, WITHOUT scheme or port; the
+# expected origin keeps both. Getting them confused is the classic WebAuthn
+# misconfiguration — a credential is bound to the RP id, so changing it orphans
+# every registered passkey. Note a bare IP is not a valid RP id (browsers
+# reject it; 'localhost' is the one special case), so a deployment that never
+# sets PUBLIC_URL or RENDER_EXTERNAL_URL falls back to 127.0.0.1 and passkeys
+# simply will not register — the same footgun already documented for the
+# session cookie, and it fails visibly rather than silently.
+RP_ID = urlparse(PUBLIC).hostname or "localhost"
+RP_NAME = "Fayda wallet registry"
+
+
+def _b64(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def require_fayda_session(request: Request) -> str:
+    """
+    For the operations that must not be reachable with a passkey alone.
+
+    A passkey is a long-lived credential that survives the victim's logout, so
+    if a stolen session could mint one, the attacker would convert a temporary
+    compromise into permanent access — and then chain-register further keys
+    without ever facing Fayda again. Registration therefore requires a session
+    established by an actual Fayda authentication, which is the one step an
+    attacker holding only a session cookie cannot replay. This is the same
+    reasoning as the cooling period: a compromise must stay recoverable.
+    """
+    iid = current(request)
+    # Absent means "not established by Fayda" — the safe reading. The callback
+    # sets this explicitly, so only a session predating that change lacks it,
+    # and such a session should re-verify rather than be trusted by default.
+    if request.session.get("auth_method") != "fayda":
+        raise HTTPException(
+            403, "verify with Fayda again to add a passkey — a passkey cannot "
+                 "register another passkey")
+    # Freshness, not just provenance. Gating on how the session was CREATED
+    # still lets a stolen cookie mint a passkey any time in the session's 12
+    # hours, because the theft inherits the victim's Fayda login. Requiring a
+    # recent authentication shrinks that window to minutes and forces the
+    # attacker through the one step a cookie cannot replay. Same idea as the
+    # re-authentication prompt other systems put in front of adding a
+    # credential.
+    at = request.session.get("auth_at")
+    fresh = False
+    if at:
+        try:
+            fresh = (datetime.now(timezone.utc)
+                     - datetime.fromisoformat(at)).total_seconds() < FRESH_AUTH_SECONDS
+        except ValueError:
+            fresh = False
+    if not fresh:
+        raise HTTPException(
+            403, "for security, verify with Fayda again before adding a passkey")
+    return iid
+
+
+@app.post("/api/passkey/register/begin")
+def passkey_register_begin(request: Request):
+    iid = require_fayda_session(request)
+    ident = store.get_identity(iid)
+    if not ident:
+        raise HTTPException(401, "not authenticated with Fayda")
+    opts = wa.generate_registration_options(
+        rp_id=RP_ID,
+        rp_name=RP_NAME,
+        # The user handle is the internal identity id, never the FIN or its
+        # HMAC: it is stored on the authenticator and can surface in account
+        # pickers, so it must carry nothing about the person.
+        user_id=iid.encode(),
+        user_name=ident["display_name"],
+        user_display_name=ident["display_name"],
+        # Exclude what is already registered so the same authenticator does not
+        # silently create a duplicate credential.
+        exclude_credentials=[
+            PublicKeyCredentialDescriptor(id=wa.base64url_to_bytes(c["credential_id"]))
+            for c in store.credentials_of(iid)
+        ],
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.REQUIRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        ),
+    )
+    # The challenge lives in the server-side session, single-use. Verifying
+    # against a challenge the client echoed back would authenticate nothing.
+    request.session["passkey_challenge"] = _b64(opts.challenge)
+    return json.loads(wa.options_to_json(opts))
+
+
+async def _json_body(request: Request) -> dict:
+    """
+    A body that is not a JSON object is a client error, not a server one. These
+    routes are reachable unauthenticated, so a malformed body must produce 400
+    rather than an unhandled exception and a 500.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "expected a JSON object")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "expected a JSON object")
+    return body
+
+
+@app.post("/api/passkey/register/complete")
+async def passkey_register_complete(request: Request):
+    iid = require_fayda_session(request)
+    challenge = request.session.pop("passkey_challenge", None)
+    if not challenge:
+        raise HTTPException(400, "no registration in progress")
+    body = await _json_body(request)
+    credential = body.get("credential")
+    if not isinstance(credential, dict):
+        raise HTTPException(400, "malformed credential")
+    label = body.get("label", "")
+    if not isinstance(label, str):
+        raise HTTPException(400, "malformed label")
+    label = _clean_token(label, "label")[:64]
+    try:
+        v = wa.verify_registration_response(
+            credential=credential,
+            expected_challenge=wa.base64url_to_bytes(challenge),
+            expected_origin=PUBLIC,
+            expected_rp_id=RP_ID,
+            # The options ask for user_verification=required; without this the
+            # library does not hold the response to it, so a credential created
+            # without a biometric/PIN check would be stored and then rejected
+            # at every login — an unusable key the user cannot tell apart from
+            # a working one.
+            require_user_verification=True,
+        )
+    except Exception:
+        raise HTTPException(400, "passkey registration failed")
+    try:
+        store.add_credential(
+            identity_id=iid,
+            credential_id=_b64(v.credential_id),
+            public_key=_b64(v.credential_public_key),
+            sign_count=v.sign_count,
+            label=label,
+        )
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, "that passkey is already registered")
+    return {"registered": True, "passkeys": store.credentials_of(iid)}
+
+
+@app.get("/api/passkey/list")
+def passkey_list(request: Request):
+    return {"passkeys": store.credentials_of(current(request))}
+
+
+@app.post("/api/passkey/revoke")
+async def passkey_revoke(request: Request):
+    """
+    The escape hatch, and the reason registration is Fayda-gated rather than
+    forbidden. Without a revoke path, a passkey registered by an attacker holding a
+    live session would outlive the victim's logout with nothing the victim
+    could do — the same failure the cooling period exists to prevent, made
+    permanent. Deleting runs RLS-scoped, so one identity cannot revoke
+    another's credential even if the id were guessed.
+    """
+    iid = current(request)
+    body = await _json_body(request)
+    cred_id = body.get("credential_id")
+    if not isinstance(cred_id, str) or not cred_id or len(cred_id) > 512:
+        raise HTTPException(400, "malformed credential id")
+    if not store.delete_credential(iid, cred_id):
+        raise HTTPException(404, "no such passkey on this identity")
+    # Kill the sessions that passkey opened, not just its ability to open more.
+    # An attacker who registered it is already signed in; leaving that session
+    # alive for the rest of its 12h TTL would make revocation a formality.
+    ended = store.delete_sessions_for_credential(cred_id)
+    return {"revoked": True, "sessions_ended": ended,
+            "passkeys": store.credentials_of(iid)}
+
+
+@app.post("/api/passkey/login/begin")
+def passkey_login_begin(request: Request):
+    # Unauthenticated by nature — this is how a returning user signs in.
+    # Discoverable credentials mean no username is sent, so this endpoint
+    # reveals nothing about who is registered.
+    opts = wa.generate_authentication_options(
+        rp_id=RP_ID,
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    request.session["passkey_challenge"] = _b64(opts.challenge)
+    return json.loads(wa.options_to_json(opts))
+
+
+@app.post("/api/passkey/login/complete")
+async def passkey_login_complete(request: Request):
+    challenge = request.session.pop("passkey_challenge", None)
+    if not challenge:
+        raise HTTPException(400, "no sign-in in progress")
+    body = await _json_body(request)
+    credential = body.get("credential")
+    if not isinstance(credential, dict):
+        raise HTTPException(400, "malformed credential")
+    cred_id = credential.get("id")
+    if not cred_id or not isinstance(cred_id, str) or len(cred_id) > 512:
+        raise HTTPException(400, "malformed credential")
+    # One message for every failure below. An unknown credential and a bad
+    # signature must be indistinguishable, or this endpoint answers "is this
+    # credential id registered here?" for anyone who asks — and a credential id
+    # is the one part of a passkey that is not secret.
+    denied = HTTPException(400, "passkey not recognised")
+
+    stored = store.credential_by_id(cred_id)
+    if not stored:
+        raise denied
+    try:
+        v = wa.verify_authentication_response(
+            credential=credential,
+            expected_challenge=wa.base64url_to_bytes(challenge),
+            expected_origin=PUBLIC,
+            expected_rp_id=RP_ID,
+            credential_public_key=wa.base64url_to_bytes(stored["public_key"]),
+            credential_current_sign_count=stored["sign_count"],
+            require_user_verification=True,
+        )
+    except Exception:
+        raise denied
+
+    store.touch_credential(cred_id, v.new_sign_count)
+    ident = store.get_identity(stored["identity_id"])
+    if not ident:
+        raise denied
+
+    request.session["identity_id"] = ident["id"]
+    # Same privilege change as the Fayda callback, so a fixated pre-auth sid
+    # cannot ride into the authenticated session.
+    request.session["__rotate__"] = True
+    # No claims: a passkey proves control of a registered device, not a fresh
+    # Fayda authentication, so it must not resurrect kebele/woreda-level claims
+    # from an older session. The dashboard falls back to the name and birthdate
+    # on the identity row; re-running Fayda is what restores the full record.
+    request.session["claims"] = {
+        "name": ident["display_name"], "birthdate": ident["birthdate"],
+    }
+    request.session["auth_method"] = "passkey"
+    # Which credential opened this session, so revoking it can also end it.
+    request.session["passkey_credential_id"] = cred_id
+    return {"authenticated": True, "identity": ident["display_name"]}
 
 
 def current(request: Request) -> str:
@@ -502,7 +804,14 @@ def wallet_bind(req: BindReq, request: Request):
 
 
 @app.get("/api/registry")
-def api_registry():
+def api_registry(request: Request):
+    # R2: the registry stops being public. It was a demo inspector panel over
+    # mock personas; over real Fayda identities it is a directory of verified
+    # Ethiopians and the wallets they control, which is not something to hand
+    # an anonymous caller. Requiring a session also takes the registry-wide
+    # promote_due() off the unauthenticated surface, where it was the cheapest
+    # way to make the server do unbounded work.
+    current(request)
     store.promote_due()
     return {"identities": store.registry(), "cooling_hours": COOLING_HOURS}
 
@@ -549,6 +858,13 @@ def api_me(request: Request):
         },
         "history": rows,
         "cooling_hours": COOLING_HOURS,
+        # Registered passkeys (public metadata only — no key material), so the
+        # dashboard can say whether return-login is set up.
+        "passkeys": store.credentials_of(iid),
+        # How THIS session was established. A passkey proves device control,
+        # not a fresh Fayda check, and the UI says so rather than implying the
+        # national-ID verification just happened.
+        "auth_method": request.session.get("auth_method", "unknown"),
     }
 
 

@@ -91,6 +91,23 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at  TEXT NOT NULL
 );
 
+-- R2 return-login. A passkey is registered only by an already Fayda-verified
+-- session and is bound to that identity, so it re-establishes an identity
+-- Fayda already proved — it never mints a new one. Only the PUBLIC key is
+-- here; the private key never leaves the authenticator, which is what makes
+-- this phishing-resistant.
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    credential_id TEXT PRIMARY KEY,        -- base64url, from the authenticator
+    identity_id   TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+    public_key    TEXT NOT NULL,           -- base64url COSE key
+    -- Authenticators that implement it increment this per assertion. A value
+    -- that fails to advance is the documented signal of a cloned credential.
+    sign_count    BIGINT NOT NULL DEFAULT 0,
+    label         TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    last_used_at  TEXT
+);
+
 -- Properties of THIS database, as opposed to the process talking to it. The
 -- disposable marker (see reset) lives here because a guard that reads the
 -- caller's own environment is not a guard: the caller sets the environment.
@@ -135,6 +152,58 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_chain_address
 -- fixes would have silently cancelled each other out.
 CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions (expires_at COLLATE "C");
 CREATE INDEX IF NOT EXISTS ix_auth_nonces_expires ON auth_nonces (expires_at COLLATE "C");
+"""
+
+# R2. The application connects as `postgres`, which carries rolbypassrls — every
+# policy would be ignored, so RLS written against that role is theatre. Instead
+# the identity-scoped queries switch to APP_ROLE for the duration of one
+# transaction (see user_conn). It is NOBYPASSRLS and owns nothing, so the
+# policies below actually bind, and the row filter is the database's, not a
+# WHERE clause someone can forget to write.
+APP_ROLE = "fayda_app"
+
+SCHEMA_RLS = f"""
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{APP_ROLE}') THEN
+        CREATE ROLE {APP_ROLE} NOLOGIN NOBYPASSRLS;
+    END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA public TO {APP_ROLE};
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON identities, wallet_bindings, webauthn_credentials TO {APP_ROLE};
+
+ALTER TABLE identities           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wallet_bindings      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webauthn_credentials ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS p_identities_own  ON identities;
+DROP POLICY IF EXISTS p_bindings_own    ON wallet_bindings;
+DROP POLICY IF EXISTS p_credentials_own ON webauthn_credentials;
+
+-- nullif(..., '') is what makes this fail closed, and it is not decoration.
+-- current_setting(x, true) returns NULL only on a connection that has never
+-- set x; once a pooled connection has carried a transaction-scoped value, it
+-- comes back as the EMPTY STRING instead. A bare comparison then reads
+-- `id = ''`, which is a perfectly ordinary predicate: an unbound transaction
+-- could insert a row with an empty id and every other unbound transaction
+-- would read and write it. Mapping '' to NULL makes an unbound transaction
+-- match nothing, on both the read and the write side.
+CREATE POLICY p_identities_own ON identities
+    FOR ALL TO {APP_ROLE}
+    USING      (id = nullif(current_setting('app.identity_id', true), ''))
+    WITH CHECK (id = nullif(current_setting('app.identity_id', true), ''));
+
+CREATE POLICY p_bindings_own ON wallet_bindings
+    FOR ALL TO {APP_ROLE}
+    USING      (identity_id = nullif(current_setting('app.identity_id', true), ''))
+    WITH CHECK (identity_id = nullif(current_setting('app.identity_id', true), ''));
+
+CREATE POLICY p_credentials_own ON webauthn_credentials
+    FOR ALL TO {APP_ROLE}
+    USING      (identity_id = nullif(current_setting('app.identity_id', true), ''))
+    WITH CHECK (identity_id = nullif(current_setting('app.identity_id', true), ''));
 """
 
 
@@ -278,6 +347,33 @@ def conn():
         yield c
 
 
+@contextmanager
+def user_conn(identity_id: str):
+    """
+    A connection that can only see ONE identity's rows, enforced by Postgres.
+
+    Everything inside runs as APP_ROLE (NOBYPASSRLS) with app.identity_id bound
+    to this identity, so the policies filter every statement — including one
+    that forgets its WHERE clause, which is the failure this exists to make
+    impossible. Both settings are transaction-scoped (SET LOCAL / set_config
+    is_local=true), so they are gone when the pooled connection is handed to
+    the next request; a leaked role or identity across requests would be worse
+    than no RLS at all.
+
+    Not for cross-identity work: the sybil check must see other identities'
+    claims, and promotion runs registry-wide. Those keep conn() deliberately.
+    """
+    if not identity_id:
+        raise ValueError("user_conn requires an identity")
+    with _pool().connection() as c:
+        # Bind the identity BEFORE dropping privilege: order matters only for
+        # clarity here, but it keeps the sequence readable as "who am I, then
+        # become restricted".
+        c.execute("SELECT set_config('app.identity_id', %s, true)", (identity_id,))
+        c.execute(f"SET LOCAL ROLE {APP_ROLE}")
+        yield c
+
+
 def normalize_address(chain: str, address: str) -> str:
     """
     The canonical form of an address, mirroring the ADDRESS_NORM generated
@@ -350,6 +446,20 @@ def _create_schema(c: psycopg.Connection) -> None:
             c.execute(f"DROP INDEX {name}")
 
     c.execute(SCHEMA_INDEXES)
+    c.execute(SCHEMA_RLS)
+
+    # SET ROLE needs membership in the target role. Issued separately, with the
+    # connected role's real name quoted as an identifier: `GRANT ... TO
+    # CURRENT_USER` is accepted by the parser but terminates the connection on
+    # Supabase's pooler, and the failure looks like a dropped TLS session
+    # rather than a rejected statement.
+    me = c.execute("SELECT current_user AS u").fetchone()["u"]
+    c.execute(
+        psycopg.sql.SQL("GRANT {role} TO {me}").format(
+            role=psycopg.sql.Identifier(APP_ROLE),
+            me=psycopg.sql.Identifier(me),
+        )
+    )
 
 
 def init():
@@ -468,9 +578,14 @@ def reset():
         # database other processes are querying. registry_meta is deliberately
         # not dropped — it holds no registry data, and dropping it would
         # discard the marker that authorized this.
+        # webauthn_credentials is in the list because CASCADE would drop its
+        # foreign key to identities and CREATE TABLE IF NOT EXISTS would never
+        # add it back — leaving orphaned passkeys, permanently unreferenced,
+        # for identities the wipe claims to have erased. Reset must not quietly
+        # weaken the schema it recreates.
         c.execute(
             "DROP TABLE IF EXISTS wallet_bindings, auth_nonces, sessions, "
-            "identities CASCADE"
+            "webauthn_credentials, identities CASCADE"
         )
         _create_schema(c)
 
@@ -516,7 +631,9 @@ def upsert_identity(fin_hmac: str, display_name: str, birthdate: str) -> dict:
 
 
 def get_identity(identity_id: str) -> dict | None:
-    with conn() as c:
+    # RLS-scoped: the policy alone would restrict this to the one row, and the
+    # WHERE clause is kept as the belt to its braces.
+    with user_conn(identity_id) as c:
         row = c.execute(
             "SELECT * FROM identities WHERE id = %s", (identity_id,)
         ).fetchone()
@@ -553,6 +670,23 @@ def delete_session(sid: str) -> None:
         c.execute("DELETE FROM sessions WHERE sid = %s", (sid,))
 
 
+def delete_sessions_for_credential(credential_id: str) -> int:
+    """
+    End every session that a given passkey established.
+
+    Revocation that only blocks the NEXT sign-in is not an escape hatch: an
+    attacker who registered a passkey on a compromised session is already
+    signed in, and would keep that session for the rest of its TTL after the
+    owner revoked. Privileged by necessity — sessions are keyed by sid, and the
+    row being deleted belongs to the attacker, not to the caller.
+    """
+    with conn() as c:
+        return c.execute(
+            "DELETE FROM sessions WHERE data->>'passkey_credential_id' = %s",
+            (credential_id,),
+        ).rowcount
+
+
 def sweep_expired() -> tuple[int, int]:
     """
     Reclaim TTL-dead rows from the two tables that grow with traffic. R1 made
@@ -579,6 +713,65 @@ def sweep_expired() -> tuple[int, int]:
             'DELETE FROM auth_nonces WHERE expires_at COLLATE "C" < %s', (cutoff,)
         ).rowcount
     return s, n
+
+
+# ------------------------------------------------------------- webauthn (R2)
+
+def add_credential(identity_id: str, credential_id: str, public_key: str,
+                   sign_count: int, label: str = "") -> None:
+    with user_conn(identity_id) as c:
+        c.execute(
+            """INSERT INTO webauthn_credentials
+                   (credential_id, identity_id, public_key, sign_count, label, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s)""",
+            (credential_id, identity_id, public_key, sign_count, label, iso(now())),
+        )
+
+
+def credentials_of(identity_id: str) -> list[dict]:
+    with user_conn(identity_id) as c:
+        rows = c.execute(
+            "SELECT credential_id, label, created_at, last_used_at "
+            "FROM webauthn_credentials ORDER BY created_at",
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_credential(identity_id: str, credential_id: str) -> bool:
+    """
+    Revoke one passkey. RLS-scoped, so the row policy — not the WHERE clause —
+    is what stops one identity deleting another's credential.
+    """
+    with user_conn(identity_id) as c:
+        return c.execute(
+            "DELETE FROM webauthn_credentials WHERE credential_id = %s",
+            (credential_id,),
+        ).rowcount == 1
+
+
+def credential_by_id(credential_id: str) -> dict | None:
+    """
+    Privileged on purpose: a return-login has no session yet, so there is no
+    identity to scope to — resolving the credential is how the identity is
+    discovered. Keyed by the authenticator's own credential id, which is
+    unguessable and proves nothing on its own; the signature check is what
+    authenticates.
+    """
+    with conn() as c:
+        row = c.execute(
+            "SELECT * FROM webauthn_credentials WHERE credential_id = %s",
+            (credential_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def touch_credential(credential_id: str, sign_count: int) -> None:
+    with conn() as c:
+        c.execute(
+            "UPDATE webauthn_credentials SET sign_count = %s, last_used_at = %s "
+            "WHERE credential_id = %s",
+            (sign_count, iso(now()), credential_id),
+        )
 
 
 # ------------------------------------------------------------------- nonces
@@ -637,7 +830,7 @@ class _NotPending(Exception):
 
 
 def active_binding(identity_id: str, chain: str) -> dict | None:
-    with conn() as c:
+    with user_conn(identity_id) as c:
         row = c.execute(
             """SELECT * FROM wallet_bindings
                WHERE identity_id = %s AND chain = %s AND status = 'active'""",
@@ -647,7 +840,7 @@ def active_binding(identity_id: str, chain: str) -> dict | None:
 
 
 def pending_binding(identity_id: str, chain: str) -> dict | None:
-    with conn() as c:
+    with user_conn(identity_id) as c:
         row = c.execute(
             """SELECT * FROM wallet_bindings
                WHERE identity_id = %s AND chain = %s AND status = 'pending'""",
@@ -682,6 +875,9 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
     """
     incumbent = active_binding(identity_id, chain)
     t = now()
+    # The INSERT below runs RLS-scoped, so WITH CHECK refuses a row whose
+    # identity_id is anyone else's — a binding cannot be written on another
+    # person's behalf even if application code passed the wrong id.
     row = {
         "id": str(uuid.uuid4()),
         "identity_id": identity_id,
@@ -700,7 +896,7 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
         "activated_at": iso(t) if incumbent is None else None,
         "archived_at": None,
     }
-    with conn() as c:
+    with user_conn(identity_id) as c:
         try:
             c.execute(
                 """INSERT INTO wallet_bindings
@@ -734,7 +930,7 @@ def create_binding(identity_id, chain, address, nonce, sig, message,
 
 def cancel_pending(identity_id: str, chain: str) -> bool:
     """The escape hatch. If an attacker initiates a swap, the real user kills it here."""
-    with conn() as c:
+    with user_conn(identity_id) as c:
         # Read and write in ONE transaction, holding the row lock: promote_due
         # runs on every read (including the unauthenticated /api/registry) and
         # takes the same lock, so cancel either happens entirely before a
@@ -861,7 +1057,7 @@ def bindings_of(identity_id: str) -> list[dict]:
 
 
 def history(identity_id: str) -> list[dict]:
-    with conn() as c:
+    with user_conn(identity_id) as c:
         rows = c.execute(
             """SELECT * FROM wallet_bindings WHERE identity_id = %s
                ORDER BY requested_at DESC""",
@@ -871,16 +1067,33 @@ def history(identity_id: str) -> list[dict]:
 
 
 def registry() -> list[dict]:
-    """Everything, for the inspector panel."""
+    """
+    The signed-in view of the registry: who is verified and which wallets they
+    hold. fin_hmac is deliberately absent — it cannot re-derive the FIN, but it
+    is a stable pseudonymous key that lets any reader correlate one person
+    across every row, and this list is now read by other users rather than by a
+    demo inspector. Operators reach the fuller view through R3's audited path.
+    """
     with conn() as c:
         rows = c.execute(
-            """SELECT i.id, i.display_name, i.fin_hmac, i.verified_at,
+            """SELECT i.display_name, i.verified_at,
                       (SELECT address FROM wallet_bindings b
                         WHERE b.identity_id=i.id AND b.chain='evm' AND b.status='active') AS evm,
                       (SELECT address FROM wallet_bindings b
                         WHERE b.identity_id=i.id AND b.chain='solana' AND b.status='active') AS solana
-               FROM identities i ORDER BY i.verified_at DESC"""
+               FROM identities i
+               -- Only people who actually hold a binding. An identity with no
+               -- wallet contributes nothing a reader can use while still
+               -- disclosing that this person completed Fayda verification here
+               -- — the sensitive half of the row without the useful half.
+               WHERE EXISTS (SELECT 1 FROM wallet_bindings b
+                             WHERE b.identity_id = i.id AND b.status = 'active')
+               ORDER BY i.verified_at DESC"""
         ).fetchall()
+        # No internal id either: it is the RLS scoping key and the join key for
+        # every per-identity table, so it does not belong in a list handed to
+        # other users. The registry answers "is this wallet claimed, and by
+        # whom", which needs neither.
         return [dict(r) for r in rows]
 
 

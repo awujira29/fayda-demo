@@ -64,6 +64,21 @@ returned 404 (`backend/t.py` test 20 pins this).
   server-side test keys), read anyone's raw FIN (never leaves the server),
   or bypass the sybil constraint (database unique indexes).
 
+## What "the registry is no longer public" means in DEMO_MODE
+
+R2 put `/api/registry` behind a session, and it no longer discloses the FIN
+HMAC, the internal identity id, or identities with no wallet bound. Be clear
+about what that buys **in the demo posture**: `DEMO_MODE=1` publishes the mock
+IdP, so any visitor can click a persona and hold a valid session a second
+later. Authentication is therefore not a meaningful barrier here — the gate is
+real, the identities behind it are public test personas, and the demo is
+designed for exactly that.
+
+It becomes a real barrier the moment `DEMO_MODE` is off and login means a live
+Fayda authentication. What the demo posture genuinely fixes either way: the
+registry-wide `promote_due()` is off the unauthenticated surface, and the HMAC
+serial is out of the response body.
+
 ## One security note carried into a real deployment
 
 The mock `/authorize` validates `redirect_uri` by **path only** (`/callback`),

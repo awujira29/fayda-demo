@@ -21,6 +21,7 @@ import { signEvm, currentNetwork, useWalletConnection, PRIVY_CONFIGURED } from '
 import { RecordHeader } from './components/RecordHeader.jsx'
 import { IdentityRecord } from './components/IdentityRecord.jsx'
 import { VerifyGate, BackendDown, OriginMismatch } from './components/VerifyGate.jsx'
+import { loginWithPasskey, registerPasskey, passkeysSupported } from './passkey.js'
 import { SetupConnector } from './components/SetupConnector.jsx'
 import { EvmRecord, SolanaRecord, CHAINS } from './components/ChainRecord.jsx'
 import { AttestationDialog } from './components/AttestationDialog.jsx'
@@ -73,6 +74,7 @@ export default function App() {
   const conn = useWalletConnection()
   const [me, setMe] = useState(null)
   const [registry, setRegistry] = useState(null)
+  const [passkeyErr, setPasskeyErr] = useState('')
   const [attest, setAttest] = useState(null)
   const [fatal, setFatal] = useState('')
   const [err, setErr] = useState('')
@@ -83,7 +85,19 @@ export default function App() {
   const attestGen = useRef(0)
 
   const load = useCallback(async () => {
-    const [m, r] = await Promise.all([api('/api/me'), api('/api/registry')])
+    // Both at once. R2 made the registry authenticated, so a signed-out
+    // visitor's request 401s — swallowed here, because this promise is what
+    // the fatal-error boundary watches and a logged-out landing page must not
+    // report a server failure. Awaiting /api/me first to decide whether to ask
+    // would be tidier, but it serialises two round trips to a managed
+    // database and the page visibly lags behind its own state.
+    const [m, r] = await Promise.all([
+      api('/api/me'),
+      api('/api/registry').catch(() => null),
+    ])
+    // Set together: `me` alone renders the signed-in page against a null
+    // registry, which the ledger states as "the registry is empty" — wrong
+    // rather than merely pending.
     setMe(m)
     setRegistry(r)
     return m
@@ -107,6 +121,37 @@ export default function App() {
       setBusy(false)
     }
   }
+
+  // Sign-in errors belong beside the sign-in button, not in the page-level
+  // error slot the signed-in flows use — a signed-out visitor has no other
+  // context to read them against. A cancelled biometric prompt is a normal
+  // outcome (NotAllowedError), not a failure worth alarming anyone about.
+  async function signInWithPasskey() {
+    setPasskeyErr('')
+    setBusy(true)
+    try {
+      await loginWithPasskey()
+      await load()
+    } catch (e) {
+      if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') {
+        setPasskeyErr(e.message || 'Your device did not complete the check.')
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const addPasskey = () =>
+    run(
+      () => registerPasskey(navigator.platform || 'this device'),
+      'Passkey registered. You can return with your device biometric.',
+    )
+
+  const revokePasskey = (credential_id) =>
+    run(
+      () => api('/api/passkey/revoke', { credential_id }),
+      'Passkey revoked. That device can no longer sign in.',
+    )
 
   const startBind = (chain, wallet) =>
     run(async () => {
@@ -203,11 +248,21 @@ export default function App() {
           {originMismatch && <div className="mb-4"><OriginMismatch publicOrigin={me.public_origin} /></div>}
 
           {!me.authenticated ? (
-            <VerifyGate simulated={me.dev || me.demo} />
+            <VerifyGate
+              simulated={me.dev || me.demo}
+              onPasskey={passkeysSupported() ? signInWithPasskey : null}
+              busy={busy}
+              passkeyError={passkeyErr}
+            />
           ) : (
             <>
               <h2 className="doc-section">Identity</h2>
-              <IdentityRecord me={me} onLogout={logout} busy={busy} />
+              <IdentityRecord
+                me={me} onLogout={logout} busy={busy}
+                onAddPasskey={passkeysSupported() ? addPasskey : null}
+                onRevokePasskey={revokePasskey}
+                passkeys={me.passkeys}
+              />
 
               {!PRIVY_CONFIGURED && (
                 <>
@@ -234,14 +289,18 @@ export default function App() {
             </>
           )}
 
-          <h2 className="doc-section">Public registry</h2>
-          <RegistryLedger identities={registry ? registry.identities : []} />
-          <div className="mt-3 flex flex-wrap gap-2">
-            <Button variant="ghost" size="sm" onClick={() => load().catch((e) => setErr(e.message))}>
-              Refresh
-            </Button>
-            {me.dev && me.authenticated && <WipeButton onConfirm={wipe} disabled={busy} />}
-          </div>
+          {me.authenticated && (
+            <>
+              <h2 className="doc-section">Registry</h2>
+              <RegistryLedger identities={registry ? registry.identities : []} />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button variant="ghost" size="sm" onClick={() => load().catch((e) => setErr(e.message))}>
+                  Refresh
+                </Button>
+                {me.dev && <WipeButton onConfirm={wipe} disabled={busy} />}
+              </div>
+            </>
+          )}
 
           {me.authenticated && !me.dev && (
             <Card className="mt-8 border-rule bg-surface">

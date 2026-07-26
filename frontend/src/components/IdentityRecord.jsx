@@ -9,7 +9,13 @@ import { CopyValue } from './CopyValue.jsx'
  * product hinges on — displayed verbatim and never branched on (value set
  * unconfirmed with NIDP).
  */
-export function IdentityRecord({ me, onLogout, busy }) {
+export function IdentityRecord({
+  me, onLogout, busy, onAddPasskey, onRevokePasskey, passkeys,
+}) {
+  // A passkey proves control of a registered device, not a fresh national-ID
+  // check, so the record says which one established this session rather than
+  // implying Fayda just verified the person again.
+  const viaPasskey = me.auth_method === 'passkey'
   const id = me.identity
   const claims = me.claims || {}
   return (
@@ -59,6 +65,78 @@ export function IdentityRecord({ me, onLogout, busy }) {
             pepper.
           </p>
         </div>
+
+        {onAddPasskey && (
+          <div className="mt-4 border-t border-rule pt-3">
+            <div className="doc-label mb-1">Return without repeating verification</div>
+            <div className="flex flex-wrap items-center gap-3">
+              {viaPasskey ? (
+                <Button variant="secondary" size="sm" disabled>
+                  Register a passkey
+                </Button>
+              ) : (
+                <Button variant="secondary" size="sm" onClick={onAddPasskey} disabled={busy}>
+                  Register a passkey
+                </Button>
+              )}
+              <span className="text-[0.8125rem] text-muted">
+                {passkeys?.length
+                  ? `${passkeys.length} registered on this identity`
+                  : 'None registered yet'}
+              </span>
+            </div>
+            <p className="mt-2 max-w-[58ch] text-[0.8125rem] leading-relaxed text-muted">
+              {viaPasskey ? (
+                <>
+                  You are signed in with a passkey, so you can review and revoke
+                  keys here but not add one. Verifying with Fayda again is what
+                  adds a device — so anyone who reaches an open session cannot
+                  quietly give themselves a permanent way back in.
+                </>
+              ) : (
+                <>
+                  Your device keeps the key and unlocks it with Face ID or a
+                  fingerprint; the registry only stores the public half. It signs
+                  you back in — it never re-proves your identity, which only
+                  Fayda can do.
+                </>
+              )}
+            </p>
+            {/* A passkey outlives sign-out, so the list is the user's only way
+                to notice one they did not add — and revoke is the only way to
+                undo it. Both stay visible rather than tucked behind a menu. */}
+            {passkeys?.length > 0 && (
+              <ul className="mt-3 space-y-1.5">
+                {passkeys.map((p) => (
+                  <li
+                    key={p.credential_id}
+                    className="flex flex-wrap items-baseline justify-between gap-2 border-t border-rule pt-1.5"
+                  >
+                    <span className="text-[0.8125rem]">
+                      {p.label || 'Unnamed device'}
+                      <span className="ml-2 font-mono text-[0.75rem] text-muted">
+                        added {String(p.created_at).slice(0, 10)}
+                        {p.last_used_at
+                          ? ` · last used ${String(p.last_used_at).slice(0, 10)}`
+                          : ' · never used'}
+                      </span>
+                    </span>
+                    {onRevokePasskey && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => onRevokePasskey(p.credential_id)}
+                      >
+                        Revoke
+                      </Button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
 
         <details className="mt-3">
           <summary className="doc-label cursor-pointer">

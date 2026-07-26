@@ -5,7 +5,9 @@ uvicorn==0.51.0
 python-multipart==0.0.32   # form posts on the mock /token endpoint
 
 PyJWT[crypto]==2.7.0       # RS256 client assertion
-cryptography==46.0.6       # RSA keypair generation
+cryptography==49.0.0       # RSA keypair generation. Floor set by webauthn 3.0.0
+                           # (>=49); the old 46.0.6 pin made this file
+                           # unresolvable and broke the Docker build.
 
 eth-account==0.13.7        # secp256k1 signer recovery (EVM)
 PyNaCl==1.6.2              # ed25519 verification (Solana)
@@ -15,3 +17,12 @@ httpx==0.28.1              # OIDC token/userinfo calls, and t.py
 
 psycopg[binary,pool]==3.3.4  # Supabase Postgres (R1) — durable storage, real
                              # concurrency, and the base for RLS (R2)
+
+webauthn==3.0.0            # R2 passkey return-login (WebAuthn/FIDO2 verification).
+                           # Hand-rolling CBOR/COSE parsing, attestation and
+                           # assertion checks would be strictly worse than a
+                           # maintained implementation of a security standard.
+cbor2==6.1.3               # webauthn's attestation decoder; pinned because t.py
+                           # imports it directly to build a test authenticator.
+pyOpenSSL==26.3.0          # pulled in by webauthn; pinned so the build is
+                           # reproducible rather than whatever resolves that day.

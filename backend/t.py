@@ -1,4 +1,4 @@
-import re, httpx, sys, base64, subprocess, os, time
+import re, httpx, sys, base64, subprocess, os, time, json
 B="http://127.0.0.1:8000"
 # 30s, not 10: every store call is a network round trip to managed Postgres,
 # so a bind is seconds, not milliseconds. This is a transport timeout, never
@@ -445,24 +445,41 @@ step("24. junk-priced junk: oversized or malformed bind inputs rejected before a
 # and decode in linear time — only non-zero digits exercise the quadratic
 # big-integer path (measured: 'z'*60000 = 5.6s, '1'*100000 = 0.00s).
 big = "z" * 60_000
-t0 = time.time()
+small = "z" * 40                       # plausible length, still not a real key
+
+
+def probe(payload):
+    t0 = time.time()
+    r = c.post(f"{B}/api/wallet/bind", json=payload)
+    return r, time.time() - t0
+
+
+# Every probe must be refused, whatever its size or chain.
+for chain, addr in (("solana", big), ("not-a-chain", big), ("solana", small)):
+    r, _ = probe({"chain": chain, "address": addr, "nonce": "n", "signature": "s"})
+    assert r.status_code == 400, (chain, len(addr), r.status_code, r.text[:120])
 r = c.post(f"{B}/api/wallet/nonce", json={"chain": "solana", "address": big})
 assert r.status_code == 400, (r.status_code, r.text[:120])
-r = c.post(f"{B}/api/wallet/bind",
-           json={"chain": "solana", "address": big, "nonce": "n", "signature": "s"})
-assert r.status_code == 400, (r.status_code, r.text[:120])
-r = c.post(f"{B}/api/wallet/bind",
-           json={"chain": "not-a-chain", "address": big, "nonce": "n", "signature": "s"})
-assert r.status_code == 400, (r.status_code, r.text[:120])
-elapsed = time.time() - t0
-# Pre-fix, each probe cost ~3.5 s of quadratic decode (>10 s for the trio);
-# post-fix all three are shape-check rejections plus a session round trip to
-# the managed database. 6 s cleanly separates those worlds while tolerating
-# remote-Postgres latency.
-assert elapsed < 6.0, f"oversized inputs took {elapsed:.1f}s — something is decoding them"
+
+# The real assertion is a COMPARISON, not a wall-clock budget: an oversized
+# address must cost no more than a small one. Both requests do identical
+# session work, so the round trips to the managed database cancel out and what
+# remains is decode cost — which is what regressed here. An absolute bound
+# measured DB latency instead, and drifted when RLS added statements per
+# request. Pre-fix the 60 KB payload was ~3.5 s against a few ms; a 4x ratio
+# separates that from noise without being sensitive to how slow the DB is.
+oversized = min(probe({"chain": "solana", "address": big,
+                       "nonce": "n", "signature": "s"})[1] for _ in range(3))
+baseline = min(probe({"chain": "solana", "address": small,
+                      "nonce": "n", "signature": "s"})[1] for _ in range(3))
+ratio = oversized / max(baseline, 1e-6)
+assert ratio < 4.0, (f"a 60 KB address cost {ratio:.1f}x a 40-char one "
+                     f"({oversized:.2f}s vs {baseline:.2f}s) — it is being decoded")
+elapsed = oversized
 r = c.post(f"{B}/api/wallet/nonce", json={"chain": "evm", "address": "0x" + "a" * 39 + "\x00"})
 assert r.status_code == 400, ("NUL address must 400 at the boundary", r.status_code)
-print(f"  oversized/foreign-chain/NUL inputs all 400 in {elapsed:.2f}s: ok")
+print(f"  oversized/foreign-chain/NUL inputs all 400; 60KB costs "
+      f"{ratio:.2f}x a 40-char address (not decoded): ok")
 
 step("25. R1 durability hygiene: expired sessions and nonces are reclaimed, live ones kept")
 # Storage no longer resets on redeploy, so TTL-dead rows must be deleted by
@@ -569,5 +586,409 @@ with st.conn() as sc:
                "value=excluded.value, set_at=excluded.set_at", (original_marker, st.iso(st.now())))
 assert st.disposable()[0], "failed to restore the disposable marker"
 print("  marker restored; both gates verified independent: ok")
+
+step("27. R2 RLS: the DATABASE refuses cross-identity reads and writes")
+# The requirement is row policies, not app-side WHERE clauses — "one missed
+# WHERE clause = full leak" is the threat. So every assertion here uses a query
+# with NO identity predicate at all: whatever filtering happens is Postgres's.
+rls_a = st.upsert_identity(secrets.token_hex(16), "RLS Alice", "")
+rls_b = st.upsert_identity(secrets.token_hex(16), "RLS Bob", "")
+addr_a, addr_b = rnd_addr(), rnd_addr()
+st.create_binding(rls_a["id"], "evm", addr_a, secrets.token_hex(8), "s", "m", 72)
+st.create_binding(rls_b["id"], "evm", addr_b, secrets.token_hex(8), "s", "m", 72)
+
+with st.user_conn(rls_a["id"]) as uc:
+    ids = uc.execute("SELECT id FROM identities").fetchall()          # no WHERE
+    bind = uc.execute("SELECT identity_id FROM wallet_bindings").fetchall()
+assert [r["id"] for r in ids] == [rls_a["id"]], \
+    ("an unfiltered SELECT saw other identities", len(ids))
+assert bind and all(r["identity_id"] == rls_a["id"] for r in bind), \
+    "an unfiltered SELECT saw other identities' bindings"
+print("  unfiltered SELECT returns only the bound identity's rows: ok")
+
+# WITH CHECK: writing a row belonging to someone else must be refused.
+try:
+    with st.user_conn(rls_a["id"]) as uc:
+        uc.execute("""INSERT INTO wallet_bindings (id,identity_id,chain,address,status,
+                      proof_nonce,proof_sig,proof_message,requested_at)
+                      VALUES (%s,%s,'evm',%s,'active','n','s','m',%s)""",
+                   (secrets.token_hex(8), rls_b["id"], rnd_addr(), st.iso(st.now())))
+    raise AssertionError("wrote a binding on another identity's behalf")
+except psycopg.errors.InsufficientPrivilege:
+    print("  INSERT for another identity refused by the row policy: ok")
+
+# Fails CLOSED: no identity bound means no rows, never all rows.
+with st.conn() as sc:
+    sc.execute(f"SET LOCAL ROLE {st.APP_ROLE}")
+    n = sc.execute("SELECT count(*) AS n FROM identities").fetchone()["n"]
+assert n == 0, ("RLS fails OPEN when app.identity_id is unset", n)
+print("  unset identity sees zero rows, not every row: ok")
+
+# The role and the identity are transaction-scoped: a pooled connection handed
+# to the next request must come back as the privileged role, or one user's
+# scope would silently become another's.
+with st.conn() as sc:
+    who = sc.execute("SELECT current_user AS u").fetchone()["u"]
+    guc = sc.execute("SELECT current_setting('app.identity_id', true) AS g").fetchone()["g"]
+assert who != st.APP_ROLE and not guc, ("RLS context leaked across pooled connections", who, guc)
+print("  role and identity do not leak across pooled connections: ok")
+
+# SYBIL vs RLS. This is the interaction that matters: RLS hides other
+# identities' rows, so anything that depended on SEEING them to stay correct
+# would now silently fail open. Both halves of the sybil defence are checked
+# against a row the querying identity cannot read.
+with st.user_conn(rls_b["id"]) as uc:
+    vis = uc.execute("SELECT count(*) AS n FROM wallet_bindings WHERE address=%s",
+                     (addr_a,)).fetchone()["n"]
+assert vis == 0, "RLS should hide A's binding from B"
+
+# (a) The unique index. Indexes are not RLS-filtered, so a same-tier collision
+# is still detected. rls_c has no incumbent, so its bind is ACTIVE — the same
+# tier as A's — which is what ux_active_chain_address arbitrates.
+rls_c = st.upsert_identity(secrets.token_hex(16), "RLS Carol", "")
+try:
+    st.create_binding(rls_c["id"], "evm", addr_a, secrets.token_hex(8), "s", "m", 72)
+    raise AssertionError("RLS hid A's row and the sybil index was lost with it")
+except st.BindingConflict as e:
+    assert isinstance(e.__cause__, psycopg.errors.UniqueViolation), e.__cause__
+print("  unique index still rejects a claim on a row RLS hides: ok")
+
+# (b) The cross-tier case the index cannot cover (B already holds a wallet, so
+# its second bind would be PENDING against A's ACTIVE — different partial
+# indexes, no collision). That gap is why address_claimed_by_other exists, and
+# why it must keep running privileged: an RLS-scoped version would see nothing
+# and cheerfully report the address free. Assert the check AND the endpoint.
+assert st.address_claimed_by_other("evm", addr_a, rls_b["id"]), \
+    "the cross-identity sybil check must still see other identities"
+r = c2.post(f"{B}/api/wallet/nonce", json={"chain": "evm", "address": addr_a})
+assert r.status_code == 409, ("HTTP path let a second identity claim a taken wallet",
+                              r.status_code, r.text[:120])
+print("  cross-tier claim refused by the privileged check and by HTTP: ok")
+
+step("28. R2: the registry is no longer public")
+anon2 = httpx.Client(follow_redirects=False, timeout=30)
+r = anon2.get(f"{B}/api/registry")
+assert r.status_code == 401, ("registry still served to an anonymous caller", r.status_code)
+r = c.get(f"{B}/api/registry")
+assert r.status_code == 200, (r.status_code, r.text[:120])
+body = r.text
+# fin_hmac is a stable pseudonymous identifier: it cannot re-derive the FIN,
+# but it does let anyone correlate one person across every row. It has no place
+# in a directory read by other users; operators get it through R3's audited path.
+assert "fin_hmac" not in body, "registry still exposes the per-identity HMAC"
+print("  registry requires authentication and drops fin_hmac: ok")
+
+step("29. R2 passkey return-login: register with Fayda, return without it")
+# A software authenticator: real ES256 keys, real client-data and
+# authenticator-data byte layouts, real signatures. The server code under test
+# is the same code a hardware key drives — only the key custody differs, so a
+# passing run means the WebAuthn verification path actually works rather than
+# that a mock agreed with itself.
+import cbor2, hashlib as _hl, struct
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes as _hh
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    encode_dss_signature, decode_dss_signature)
+
+RP_ID = "127.0.0.1"
+ORIGIN = B
+
+
+def b64u(b): return base64.urlsafe_b64encode(b).decode().rstrip("=")
+def b64ud(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+class SoftAuthenticator:
+    """Minimal CTAP2-shaped authenticator: ES256, resident key, UV set."""
+
+    def __init__(self):
+        self.key = ec.generate_private_key(ec.SECP256R1())
+        self.cred_id = secrets.token_bytes(32)
+        self.sign_count = 0
+
+    def _cose(self):
+        n = self.key.public_key().public_numbers()
+        return cbor2.dumps({1: 2, 3: -7, -1: 1,
+                            -2: n.x.to_bytes(32, "big"), -3: n.y.to_bytes(32, "big")})
+
+    def _auth_data(self, attested: bool):
+        # flags: UP | UV | (AT when attesting)
+        flags = 0x01 | 0x04 | (0x40 if attested else 0)
+        d = _hl.sha256(RP_ID.encode()).digest() + bytes([flags]) + \
+            struct.pack(">I", self.sign_count)
+        if attested:
+            d += b"\x00" * 16 + struct.pack(">H", len(self.cred_id)) + \
+                 self.cred_id + self._cose()
+        return d
+
+    def register(self, challenge_b64):
+        cd = json.dumps({"type": "webauthn.create", "challenge": challenge_b64,
+                         "origin": ORIGIN, "crossOrigin": False},
+                        separators=(",", ":")).encode()
+        ad = self._auth_data(True)
+        att = cbor2.dumps({"fmt": "none", "attStmt": {}, "authData": ad})
+        return {"id": b64u(self.cred_id), "rawId": b64u(self.cred_id),
+                "type": "public-key",
+                "response": {"clientDataJSON": b64u(cd), "attestationObject": b64u(att)}}
+
+    def assert_(self, challenge_b64, *, bump=True, origin=None):
+        if bump:
+            self.sign_count += 1
+        cd = json.dumps({"type": "webauthn.get", "challenge": challenge_b64,
+                         "origin": origin or ORIGIN, "crossOrigin": False},
+                        separators=(",", ":")).encode()
+        ad = self._auth_data(False)
+        sig = self.key.sign(ad + _hl.sha256(cd).digest(), ec.ECDSA(_hh.SHA256()))
+        return {"id": b64u(self.cred_id), "rawId": b64u(self.cred_id),
+                "type": "public-key",
+                "response": {"clientDataJSON": b64u(cd), "authenticatorData": b64u(ad),
+                             "signature": b64u(sig), "userHandle": None}}
+
+
+auth = SoftAuthenticator()
+
+# Registration requires a Fayda-verified session. Anonymous must be refused —
+# otherwise a passkey could mint an identity Fayda never proved.
+assert anon.post(f"{B}/api/passkey/register/begin").status_code == 401, \
+    "anonymous caller could begin passkey registration"
+print("  registration refused without a Fayda session: ok")
+
+me_before = c.get(f"{B}/api/me").json()
+opts = c.post(f"{B}/api/passkey/register/begin").json()
+r = c.post(f"{B}/api/passkey/register/complete",
+           json={"credential": auth.register(opts["challenge"]), "label": "test key"})
+assert r.status_code == 200, (r.status_code, r.text[:200])
+assert len(r.json()["passkeys"]) >= 1, r.json()
+print("  passkey registered against the Fayda-verified identity: ok")
+
+# The return-login: a brand-new client with no cookie from the Fayda flow.
+ret = httpx.Client(follow_redirects=False, timeout=30)
+assert not ret.get(f"{B}/api/me").json()["authenticated"], "new client started authenticated"
+opts = ret.post(f"{B}/api/passkey/login/begin").json()
+r = ret.post(f"{B}/api/passkey/login/complete",
+             json={"credential": auth.assert_(opts["challenge"])})
+assert r.status_code == 200, (r.status_code, r.text[:200])
+back = ret.get(f"{B}/api/me").json()
+assert back["authenticated"], "passkey sign-in did not establish a session"
+assert back["identity"]["id"] == me_before["identity"]["id"], \
+    ("passkey signed in as the wrong identity", back["identity"]["id"])
+print(f"  returned as {back['identity']['display_name']} without re-running Fayda: ok")
+
+# A passkey proves device control, not a fresh Fayda authentication: it must
+# not resurrect neighbourhood-level claims from the earlier session.
+assert "address" not in back["claims"] and "residenceStatus" not in back["claims"], \
+    ("passkey session exposed kebele/woreda claims", list(back["claims"]))
+assert back["claims"].get("name"), "passkey session lost the display name"
+print("  passkey session carries name/birthdate only, no kebele/woreda: ok")
+
+# Challenge is single-use: replaying the same assertion must fail.
+replayed = auth.assert_(opts["challenge"], bump=False)
+r2 = httpx.Client(follow_redirects=False, timeout=30)
+r2.post(f"{B}/api/passkey/login/begin")
+r = r2.post(f"{B}/api/passkey/login/complete", json={"credential": replayed})
+assert r.status_code == 400, ("a replayed assertion was accepted", r.status_code)
+print("  replayed assertion rejected (challenge is single-use): ok")
+
+# Wrong origin must fail even with a valid signature — this is the property
+# that makes a passkey phishing-resistant, so it has to be pinned.
+r3 = httpx.Client(follow_redirects=False, timeout=30)
+opts = r3.post(f"{B}/api/passkey/login/begin").json()
+r = r3.post(f"{B}/api/passkey/login/complete",
+            json={"credential": auth.assert_(opts["challenge"],
+                                             origin="https://evil.example.com")})
+assert r.status_code == 400, ("an assertion from a foreign origin was accepted",
+                              r.status_code)
+print("  assertion from a foreign origin rejected: ok")
+
+# An unknown credential must be INDISTINGUISHABLE from a bad signature — a
+# credential id is not secret, so a differing message turns this endpoint into
+# "is this passkey registered here?" for any caller. Compare both answers.
+r4 = httpx.Client(follow_redirects=False, timeout=30)
+opts = r4.post(f"{B}/api/passkey/login/begin").json()
+ghost = SoftAuthenticator()
+unknown = r4.post(f"{B}/api/passkey/login/complete",
+                  json={"credential": ghost.assert_(opts["challenge"])})
+assert unknown.status_code == 400, unknown.status_code
+
+r5 = httpx.Client(follow_redirects=False, timeout=30)
+opts = r5.post(f"{B}/api/passkey/login/begin").json()
+forged = auth.assert_(opts["challenge"], bump=False)       # real, registered id...
+forged["response"]["signature"] = b64u(secrets.token_bytes(70))   # ...bad signature
+badsig = r5.post(f"{B}/api/passkey/login/complete", json={"credential": forged})
+assert badsig.status_code == 400, badsig.status_code
+assert unknown.text == badsig.text, \
+    ("unknown credential is distinguishable from a bad signature — enumeration oracle",
+     unknown.text[:90], badsig.text[:90])
+print("  unknown credential and bad signature answer identically: ok")
+
+# RLS covers the credential table too: one identity must not see another's.
+with st.user_conn(rls_a["id"]) as uc:
+    n = uc.execute("SELECT count(*) AS n FROM webauthn_credentials").fetchone()["n"]
+assert n == 0, ("another identity's passkeys were visible under RLS", n)
+print("  webauthn_credentials is RLS-scoped per identity: ok")
+
+step("30. a stolen session must not buy PERMANENT access via a passkey")
+# The cooling period exists because a live session can be compromised, and the
+# real user must be able to recover. A passkey outlives logout, so if a stolen
+# session could mint one — or if one passkey could mint another — a temporary
+# compromise would become permanent and unrecoverable. Two rules make it
+# recoverable: only a Fayda-established session may register, and the owner can
+# always revoke.
+pk_session = ret          # the client that signed in with a passkey in test 29
+assert pk_session.get(f"{B}/api/me").json()["auth_method"] == "passkey"
+# The Fayda-established session must say so explicitly rather than relying on
+# the key's absence — this field is what gates passkey registration.
+assert c.get(f"{B}/api/me").json()["auth_method"] == "fayda", \
+    "a Fayda session must record auth_method explicitly"
+r = pk_session.post(f"{B}/api/passkey/register/begin")
+assert r.status_code == 403, \
+    ("a passkey was able to register another passkey — compromise becomes permanent",
+     r.status_code)
+print("  a passkey session cannot chain-register another passkey: ok")
+
+# The owner (Fayda-verified) can revoke. Register a second key, then remove it.
+extra = SoftAuthenticator()
+opts = c.post(f"{B}/api/passkey/register/begin").json()
+r = c.post(f"{B}/api/passkey/register/complete",
+           json={"credential": extra.register(opts["challenge"]), "label": "attacker key"})
+assert r.status_code == 200, (r.status_code, r.text[:160])
+before = {p["credential_id"] for p in c.get(f"{B}/api/me").json()["passkeys"]}
+assert b64u(extra.cred_id) in before, "the second passkey was not registered"
+
+r = c.post(f"{B}/api/passkey/revoke", json={"credential_id": b64u(extra.cred_id)})
+assert r.status_code == 200, (r.status_code, r.text[:160])
+after = {p["credential_id"] for p in c.get(f"{B}/api/me").json()["passkeys"]}
+assert b64u(extra.cred_id) not in after, "revoke did not remove the passkey"
+print("  the owner can revoke a passkey: ok")
+
+# A revoked passkey must stop working, not merely disappear from the list.
+gone = httpx.Client(follow_redirects=False, timeout=30)
+opts = gone.post(f"{B}/api/passkey/login/begin").json()
+r = gone.post(f"{B}/api/passkey/login/complete",
+              json={"credential": extra.assert_(opts["challenge"])})
+assert r.status_code == 400, ("a revoked passkey still signs in", r.status_code)
+assert not gone.get(f"{B}/api/me").json()["authenticated"]
+print("  a revoked passkey no longer signs in: ok")
+
+# One identity must not revoke another's credential, even knowing its id.
+still_mine = {p["credential_id"] for p in c.get(f"{B}/api/me").json()["passkeys"]}
+victim_cred = next(iter(still_mine))
+r = c2.post(f"{B}/api/passkey/revoke", json={"credential_id": victim_cred})
+assert r.status_code == 404, ("one identity revoked another's passkey", r.status_code)
+assert victim_cred in {p["credential_id"] for p in c.get(f"{B}/api/me").json()["passkeys"]}
+print("  another identity cannot revoke it: ok")
+
+step("30b. revocation ends the session the passkey opened, not just the next one")
+# An attacker who registered a passkey on a compromised session is ALREADY
+# signed in. If revoking only blocked the next sign-in, the attacker keeps
+# working for the rest of a 12-hour TTL and the escape hatch is decorative.
+tmp = SoftAuthenticator()
+opts = c.post(f"{B}/api/passkey/register/begin").json()
+assert c.post(f"{B}/api/passkey/register/complete",
+              json={"credential": tmp.register(opts["challenge"]),
+                    "label": "session-kill"}).status_code == 200
+live = httpx.Client(follow_redirects=False, timeout=30)
+opts = live.post(f"{B}/api/passkey/login/begin").json()
+assert live.post(f"{B}/api/passkey/login/complete",
+                 json={"credential": tmp.assert_(opts["challenge"])}).status_code == 200
+assert live.get(f"{B}/api/me").json()["authenticated"], "the passkey session did not open"
+r = c.post(f"{B}/api/passkey/revoke", json={"credential_id": b64u(tmp.cred_id)})
+assert r.status_code == 200 and r.json()["sessions_ended"] >= 1, r.text[:160]
+assert not live.get(f"{B}/api/me").json()["authenticated"], \
+    "revoking the passkey left its session alive"
+r = live.post(f"{B}/api/wallet/nonce", json={"chain": "evm", "address": rnd_addr()})
+assert r.status_code == 401, ("the revoked session can still act", r.status_code)
+print("  revoking a passkey signs out the session it created: ok")
+
+step("30c. a stale session cannot mint a passkey, even one Fayda established")
+# Gating on how the session was CREATED still lets a stolen cookie register at
+# any point in the session's 12 hours — the theft inherits the victim's Fayda
+# login. Registration therefore also requires a RECENT verification. Backdate
+# this session's auth_at through the store to test it deterministically rather
+# than by waiting.
+sid_now = c.cookies.get("session").rsplit(".", 1)[0]
+with st.conn() as sc:
+    row = sc.execute("SELECT data FROM sessions WHERE sid=%s", (sid_now,)).fetchone()
+    stale = dict(row["data"])
+    fresh_at = stale["auth_at"]
+    stale["auth_at"] = st.iso(st.now() - st.timedelta(hours=3))
+    sc.execute("UPDATE sessions SET data=%s WHERE sid=%s", (Json(stale), sid_now))
+r = c.post(f"{B}/api/passkey/register/begin")
+assert r.status_code == 403, ("a 3-hour-old session could still add a passkey",
+                              r.status_code)
+# Restore, and confirm a fresh session is still allowed — otherwise this test
+# would pass just as well against a route that always refuses.
+with st.conn() as sc:
+    stale["auth_at"] = fresh_at
+    sc.execute("UPDATE sessions SET data=%s WHERE sid=%s", (Json(stale), sid_now))
+assert c.post(f"{B}/api/passkey/register/begin").status_code == 200, \
+    "a freshly verified session must still be able to register"
+print("  registration requires a recent Fayda verification, not just any: ok")
+
+step("31. malformed passkey bodies are client errors, never 500s")
+# These routes are reachable unauthenticated, so an unhandled shape is a free
+# server error for anybody who asks.
+for body in ('not json at all', '[]', '"hello"', '{"credential": "nope"}',
+             '{"credential": {"id": 12345}}'):
+    r = httpx.post(f"{B}/api/passkey/login/complete", content=body,
+                   headers={"Content-Type": "application/json"}, timeout=30)
+    assert r.status_code < 500, (f"malformed body produced {r.status_code}", body[:40])
+r = c.post(f"{B}/api/passkey/register/complete",
+           json={"credential": {"id": "x"}, "label": "bad\x00label"})
+assert r.status_code < 500, ("a NUL in the label reached storage", r.status_code)
+print("  malformed and NUL-bearing bodies all answered without a 500: ok")
+
+step("32. R2 hygiene: fail-closed policy, reset keeps the FK, registry minimised")
+# (a) An unbound transaction must match NOTHING, including on INSERT. On a
+# REUSED pooled connection current_setting returns '' rather than NULL, so a
+# bare comparison becomes `id = ''` — an ordinary predicate an unbound
+# transaction can satisfy, and then share with every other unbound transaction.
+with st.conn() as sc:
+    sc.execute("SELECT set_config('app.identity_id', 'someone', true)")
+with st.conn() as sc:
+    sc.execute(f"SET LOCAL ROLE {st.APP_ROLE}")
+    try:
+        sc.execute("""INSERT INTO identities (id, fin_hmac, display_name,
+                      verified_at, last_seen_at) VALUES ('','ghost','Ghost',%s,%s)""",
+                   (st.iso(st.now()), st.iso(st.now())))
+        raise AssertionError("an unbound RLS transaction inserted a row (fails OPEN)")
+    except psycopg.errors.InsufficientPrivilege:
+        pass
+print("  an unbound transaction can neither read nor write: ok")
+
+# (b) reset() must not leave orphaned passkeys or silently drop the FK.
+st.reset()
+with st.conn() as sc:
+    fk = sc.execute(
+        """SELECT 1 FROM pg_constraint
+           WHERE conrelid='webauthn_credentials'::regclass AND contype='f'""").fetchone()
+    orphans = sc.execute("SELECT count(*) AS n FROM webauthn_credentials").fetchone()["n"]
+assert fk, "reset() dropped the credentials foreign key and never restored it"
+assert orphans == 0, ("reset() left passkeys for identities it erased", orphans)
+print("  reset recreates the FK and leaves no orphaned passkeys: ok")
+
+# (c) The registry hands other users the least that still answers the question.
+ident_r = st.upsert_identity(secrets.token_hex(16), "Registry Visible", "")
+st.upsert_identity(secrets.token_hex(16), "No Wallet Yet", "")
+st.create_binding(ident_r["id"], "evm", rnd_addr(), secrets.token_hex(8), "s", "m", 72)
+listed = st.registry()
+names = {e["display_name"] for e in listed}
+assert "Registry Visible" in names, "an identity with an active wallet is missing"
+assert "No Wallet Yet" not in names, \
+    "an identity with no wallet is disclosed — sensitive half without the useful half"
+assert all("id" not in e and "fin_hmac" not in e for e in listed), \
+    ("registry leaks the internal id or the FIN HMAC", listed[0].keys())
+print("  registry lists only wallet-holders, without internal id or HMAC: ok")
+
+# (d) DEMO_MODE publishes a login anyone can perform, so it must never sit in
+# front of real Fayda identities. Documentation does not enforce that; a
+# startup refusal does.
+p = server(8112, {"APP_ENV": "production", "DEMO_MODE": "1",
+                  "SESSION_SECRET": "x" * 32, "FIN_PEPPER": "y" * 32,
+                  "FAYDA_TOKEN_URL": "https://partner.fayda.et/v1/token"})
+out = p.communicate(timeout=60)[0]
+assert p.returncode != 0, "DEMO_MODE started against a real Fayda endpoint"
+assert "refusing to start" in out, out[-400:]
+print("  DEMO_MODE + a real Fayda endpoint refuses to boot: ok")
 
 print("\n\nALL CHECKS PASSED")

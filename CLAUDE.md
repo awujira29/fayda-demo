@@ -32,6 +32,17 @@ Correctness properties, not preferences. Breaking any is a bug regardless of wha
    in production.
 6. **Fayda is an identity provider, not a database.** No lookup endpoint exists.
    Never design anything assuming we can query a person's record.
+7. **Identity comes from Fayda alone.** A passkey is a return-login for an identity
+   Fayda already verified — it re-establishes a session, it never mints an identity.
+   Registering one requires a Fayda-established session (auth_method == "fayda"), so
+   a stolen session cannot convert itself into permanent access, and the owner can
+   always revoke. Same reasoning as the cooling period: compromise stays recoverable.
+8. **Per-identity data is read and written through store.user_conn().** It switches to
+   a NOBYPASSRLS role and binds app.identity_id for the transaction, so Postgres row
+   policies — not a WHERE clause someone can forget — decide what is visible. The
+   privileged store.conn() is for genuinely cross-identity work (the sybil check,
+   promotion, sessions, credential lookup at login); adding a per-user query there is
+   how a leak gets written.
 
 ## Things we know that the code does not say
 
@@ -58,7 +69,8 @@ existing wallet must keep working. Do not simplify this into an instant swap.
 | File | Role |
 |---|---|
 | backend/app.py | OIDC client, session middleware, binding endpoints, registry API |
-| backend/store.py | Schema and queries (psycopg / Supabase Postgres). Unique indexes live here. |
+| backend/store.py | Schema and queries (psycopg / Supabase Postgres). Unique indexes, RLS policies, and the conn()/user_conn() split live here. |
+| frontend/src/passkey.js | WebAuthn base64url↔ArrayBuffer seam. The only module that touches navigator.credentials. |
 | backend/verify.py | secp256k1 recovery (EVM), ed25519 verification (Solana) |
 | backend/mock_esignet.py | Throwaway. Deleted in production. |
 | backend/t.py | End-to-end tests |

@@ -8,7 +8,7 @@ import { Alert } from './ui/alert.jsx'
  * In dev the biometric capture is simulated — that disclosure is load-bearing
  * and stays visible.
  */
-export function VerifyGate({ simulated }) {
+export function VerifyGate({ simulated, onPasskey, busy, passkeyError }) {
   return (
     <section aria-labelledby="verify-title">
       <h2 className="doc-section" id="verify-title">Establish your identity</h2>
@@ -37,11 +37,30 @@ export function VerifyGate({ simulated }) {
               </li>
             ))}
           </ol>
-          <div className="mt-5">
+          <div className="mt-5 flex flex-wrap items-center gap-3">
             <Button variant="primary" onClick={() => { window.location.href = '/login' }}>
               Begin verification with Fayda
             </Button>
+            {onPasskey && (
+              <Button variant="ghost" onClick={onPasskey} disabled={busy}>
+                {busy ? 'Waiting for your device…' : 'Returning? Use your passkey'}
+              </Button>
+            )}
           </div>
+          {onPasskey && (
+            <p className="mt-3 max-w-[58ch] text-[0.8125rem] text-muted">
+              Once verified, you can register a passkey and return with Face ID
+              or a fingerprint — no second trip through Fayda. Verification
+              itself always comes from Fayda.
+            </p>
+          )}
+          {passkeyError && (
+            <div className="mt-4">
+              <Alert tone="danger" title="That passkey did not sign you in.">
+                {passkeyError}
+              </Alert>
+            </div>
+          )}
         </div>
         {simulated && (
           <div className="border-t border-rule bg-surface px-5 py-3">

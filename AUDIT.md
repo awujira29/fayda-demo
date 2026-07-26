@@ -5,6 +5,835 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Fix review — R2, 2026-07-26 (Fayda-gated registration, passkey revoke, `nullif` policies, reset FK, registry minimised, UV at registration, `_json_body`)
+
+**Scope:** only the deltas applied on top of the R2 audit immediately below —
+`require_fayda_session` and the explicit `auth_method` write in `/callback`,
+`POST /api/passkey/revoke` + `store.delete_credential`, the `nullif(...,'')`
+policy predicates, `webauthn_credentials` in `reset()`'s DROP list, the
+`registry()` projection and `WHERE EXISTS` filter,
+`require_user_verification=True`, `_json_body` + the `credential`/`label` type
+checks, `cryptography==49.0.0`, and the frontend passkey list/revoke UI.
+
+**Method:** re-ran every probe that produced an original finding, plus new ones
+aimed at the fixes themselves. Two cautions about this run, because they changed
+answers mid-flight: the file was edited under me (my first pass caught an
+earlier cut of `require_fayda_session` that used a `"fayda"` default and did not
+write `auth_method` in `/callback`), and the long-running dev server on :8000 is
+started without `--reload`, so it can serve stale code. Everything reported
+below was therefore re-verified against a **fresh uvicorn booted from the
+current tree** on :8222 with `BASE_URL`/`PUBLIC_URL` pinned to it. RLS was
+re-checked against the live catalog and with raw `psycopg` connections in both
+the virgin (GUC never set) and reused (GUC `''`) states. Dependency resolution
+was re-run with `--ignore-installed`. No code was modified.
+
+**Counts (new this review): 0 critical / 0 high / 1 medium / 2 low.**
+**Prior findings: 6 RESOLVED, 1 PARTIAL, nothing OPEN at High or above.**
+
+---
+
+### Status of the R2 findings
+
+| # | Finding | Status |
+|---|---|---|
+| High 1 | Unrevokable passkey persistence | **PARTIAL** |
+| High 2 | `requirements.txt` unresolvable | **RESOLVED** |
+| Medium 1 | RLS not fail-closed on `WITH CHECK` | **RESOLVED** |
+| Medium 2 | `reset()` orphans credentials, drops FK | **RESOLVED** |
+| Medium 3 | Registry disclosure | **RESOLVED** (residual by design) |
+| Medium 4 | UV not enforced at registration | **RESOLVED** |
+| Medium 5 | Unauthenticated 500s | **RESOLVED** |
+
+---
+
+#### High 1 — PARTIAL
+
+*Resolved half.* Everything the fix set out to do, it does:
+
+```
+passkey session -> /api/passkey/register/begin      403
+passkey session -> /api/passkey/register/complete   403
+legacy session (auth_method key deleted from the row) -> 403, /api/me reports "unknown"
+legacy session -> /api/passkey/revoke               404 (reachable, correctly ungated)
+Fayda re-login in place -> auth_method "fayda", register/begin 200
+owner revokes own key -> 200, revoked key then fails login (400)
+another identity revokes it -> 404, key still present
+```
+
+`auth_method` is not client-forgeable: the session lives in the `sessions`
+table and the cookie is `sid.HMAC` only; a forged cookie reads as
+unauthenticated, and a header or body field named `auth_method` changes nothing
+(403 either way). The default direction is right, and better than the cut I
+first tested — `app.py:396` now writes `auth_method = "fayda"` explicitly in
+`/callback` and `app.py:447` uses a bare `get("auth_method") != "fayda"`, so a
+session predating the change is *denied* rather than trusted. Fail-closed, and I
+confirmed it by deleting the key from a live session row. The comment's claim
+that a security gate should not rest on a default is correct and is now
+honoured. I also confirmed the remedy the 403 message prescribes works **in
+place**, no logout required, by tracing the session row through
+`/login → /authorize → confirm → /callback` and watching `auth_method` flip from
+`passkey` to `fayda` at the callback.
+
+*Residual.* The gate is on how the session was **created**, not on who is
+holding it now — and a stolen cookie is, by construction, a session Fayda
+created. The original attack's first three steps are untouched. Re-verified
+against the current tree:
+
+```
+victim auth_method: fayda
+attacker (victim's cookie) register/begin      -> 200
+attacker register/complete, label "iPhone"     -> 200
+victim POST /logout
+attacker /api/passkey/login/complete           -> 200, back in as Meseret Alemu
+what the victim then sees: [('iPhone', '2026-07-26T21:46:03')]
+```
+
+What changed is the *ending*, and that matters: the credential is now listed in
+the UI with label, created and last-used, and one click removes it. That was one
+of the two remedies I named, and it converts "permanent and unrevokable" into
+"visible and reversible". It is why this is PARTIAL rather than OPEN.
+
+Two things keep it from RESOLVED. First, nothing signals that a passkey was
+added — no notification, no `/api/me` flag, no audit line; the victim has to go
+looking. Second, `label` is entirely attacker-supplied (I registered one called
+"iPhone"), so the only field distinguishing an attacker's key from the victim's
+own is `created_at`. Someone with three devices will not reliably spot a fourth.
+Closing this properly means either a step-up — re-run Fayda *at the moment of
+registration*, not merely "this session once came from Fayda" — or an
+out-of-band signal when a credential is added.
+
+*Other persistence paths, checked and clear.* A nonce issued by the attacker
+does not survive logout in any useful form: `/api/wallet/bind` still requires a
+session and returns 401 without one. `/logout` deletes the session row, so a
+shared cookie dies with it. A pending binding does survive, but that is the
+cooling period working as designed — it is exactly the window the victim cancels
+in. A passkey session retains full wallet powers (`/api/wallet/nonce` 200),
+which is a deliberate choice covered by that same cooling period.
+
+#### High 2 — RESOLVED
+
+`cryptography==49.0.0` (`requirements.txt:8`) with a comment naming the floor.
+Re-resolved from scratch, not against the local venv:
+
+```
+python -m pip install --dry-run --ignore-installed -r backend/requirements.txt
+Would install ... cryptography-49.0.0 ... webauthn-3.0.0 ...   (no ResolutionImpossible)
+```
+
+Crypto re-verified under 49.0.0 through the app's own code paths, not by version
+inspection: EVM sign → `vf.verify` True, wrong address rejected, tampered
+message rejected; Solana ed25519 verify True, tampered rejected; the RS256
+client assertion round-trips through `mock_esignet.generate_client_keypair` and
+a wrong key raises `InvalidSignatureError`. As expected — `eth-account` reaches
+secp256k1 through `eth-keys` and `PyNaCl` goes through libsodium; neither
+touches `cryptography`.
+
+#### Medium 1 — RESOLVED
+
+The catalog now reads
+`(id = NULLIF(current_setting('app.identity_id'::text, true), ''::text))` on all
+three policies, `USING` and `WITH CHECK`. Verified in both connection states,
+read and write:
+
+```
+virgin connection (current_setting -> None):  READ 0 rows;  INSERT id=''  -> InsufficientPrivilege
+reused connection (current_setting -> ''):    READ 0 rows on identities / wallet_bindings /
+                                              webauthn_credentials;  INSERT identity=''
+                                              -> InsufficientPrivilege on all three
+GUC explicitly set to '':                     READ 0 rows;  INSERT -> InsufficientPrivilege
+properly bound:                               A sees only A;  cross-identity INSERT
+                                              -> InsufficientPrivilege
+```
+
+The exact write that succeeded in the original finding now fails. Fail-closed on
+both sides, on a fresh connection and a recycled one.
+
+#### Medium 2 — RESOLVED
+
+`webauthn_credentials` is in the DROP list (`store.py:580-582`) with a comment
+naming the CASCADE / `IF NOT EXISTS` interaction that caused it. Live catalog
+after the change: `webauthn_credentials_identity_id_fkey` present, orphan count
+0. The 8 orphans my original run produced are gone.
+
+#### Medium 3 — RESOLVED, with a residual I agree can stay documented
+
+`registry()` returns `['display_name', 'evm', 'solana', 'verified_at']` — no
+`id`, no `fin_hmac` — and the `WHERE EXISTS` filter behaves correctly across the
+tiers. Built four identities and checked each:
+
+```
+HAS-ACTIVE      listed  (expected)
+PENDING-ONLY    absent  (expected — nothing to disclose yet)
+ARCHIVED-ONLY   absent  (expected)
+NO-WALLET       absent  (expected)
+```
+
+Both halves of my objection are gone: the RLS scoping key is no longer handed to
+readers, and people who completed Fayda but bound nothing are no longer
+disclosed at all.
+
+*On the DEMO_MODE question asked directly: I agree, documentation is enough.* A
+public demo IdP whose whole purpose is "click a persona, be signed in" cannot
+also be an authentication gate, and the rows behind it are fictional. What is
+worth writing down is the invariant that makes it safe — **DEMO_MODE and real
+Fayda credentials must never be set on the same deploy** — because nothing in the
+code enforces it, and the day someone points `FAYDA_AUTHORIZE_URL` at production
+while `DEMO_MODE=1` is still in `render.yaml`, the registry is one click from
+public again. A startup refusal (`DEMO_MODE=1` together with any `FAYDA_*_URL`
+override → refuse to boot) would make it structural rather than remembered, and
+it is the same shape as the existing secrets guard.
+
+The standing design note from the original finding remains true and remains a
+judgement call, not a defect: the endpoint is a *list*, so any signed-in user can
+enumerate every bound person's name against their wallet addresses in one
+request. A *lookup* — "is this address claimed, and by whom" — answers the
+product question without enabling bulk correlation. Worth revisiting when the
+registry holds real identities rather than four personas.
+
+#### Medium 4 — RESOLVED
+
+`require_user_verification=True` at `app.py:474`. A registration whose
+authenticator data clears the UV flag is now rejected —
+`400 {"detail":"passkey registration failed"}` — where it previously returned 200
+and stored a credential that could never be used.
+
+#### Medium 5 — RESOLVED
+
+`_json_body` plus the `credential` / `label` type checks close every path I
+found, and `label` now goes through the file's own `_clean_token`. Sixteen
+malformed bodies across all three endpoints, zero 5xx:
+
+```
+login/complete:    not-json | [1,2] | "hello" | 5           -> 400 expected a JSON object
+                   {"credential": "nope" | {"id":12345} | null}
+                                                            -> 400 malformed credential
+register/complete: not-json | [1,2]                         -> 400 expected a JSON object
+                   label with NUL | 900 chars | a dict      -> 400 malformed label
+revoke:            not-json | [1,2] | id as int | missing   -> 400
+```
+
+The NUL label that produced a 500 in the original finding is now a clean 400.
+This also closes original **Low 3** (an unhandled 500 leaving the challenge
+unconsumed) as a side effect: with no unhandled path left, every failure runs
+through the response wrapper and burns the challenge.
+
+---
+
+### New this review
+
+#### Medium (new) — revoking a passkey does not terminate the sessions it established
+
+**Location:** `backend/app.py:466-483` (`passkey_revoke`) and
+`store.delete_credential`; nothing touches the `sessions` table.
+**Confidence:** certain — reproduced against the current tree.
+**Invariant strained:** the endpoint's own docstring — *"The escape hatch... a
+passkey registered by an attacker holding a live session would outlive the
+victim's logout with nothing the victim could do"* — and, behind it, CLAUDE.md's
+requirement that a compromise stay recoverable.
+
+```
+attacker signs in with the key                -> 200
+victim revokes that credential                -> 200
+attacker's existing session /api/me           -> authenticated: True, auth_method: passkey
+attacker still acts: /api/wallet/nonce        -> 200
+attacker cannot sign in again                 -> 400
+```
+
+Revocation removes the *future* login and leaves the *present* one running for
+the remainder of `SESSION_TTL_HOURS` (12). The victim performs the documented
+remedy, the UI says "That device can no longer sign in", and the attacker keeps
+working for up to half a day — long enough to start a wallet swap, which then
+costs the victim another 72-hour cancel race. Same class of gap as the original
+High 1, one layer in: the escape hatch is not quite an escape.
+
+The fix is small and local. There is no link from a session row to the
+credential that created it today, so it needs either a `credential_id` recorded
+in the session at `passkey_login_complete` (then delete matching rows on
+revoke), or the blunter and arguably better "revoke signs this identity out
+everywhere" — which is what users expect from a revoke button and what most
+passkey implementations do. Either way it should be what the UI copy promises.
+
+#### Low (new) — a stolen session can revoke the victim's own passkeys
+
+`/api/passkey/revoke` is gated on `current()` alone, deliberately and correctly:
+a passkey session must be able to revoke. The consequence is that an attacker
+holding a live session can, in one visit, delete the victim's keys and register
+their own, leaving a list that looks untouched in count. Impact is bounded —
+Fayda is the root authority and always restores access, so this is denial of a
+convenience, not of the account. Worth knowing that `revoke` is not a privileged
+operation the way `register` now is.
+
+#### Low (new) — `cbor2` and `pyOpenSSL` remain unpinned
+
+Both are hard requirements of `webauthn`, and `backend/t.py` now imports `cbor2`
+directly (test 29's software authenticator) without it appearing in
+`requirements.txt`. A fresh environment gets whatever pip resolves. Small, but
+this is a file whose first line is "Versions as tested."
+
+---
+
+### Carried forward from the original review, unchanged
+
+- **Low 1** (`RESET ROLE` escapes the role from inside a `user_conn` block) — OPEN.
+  Still no injection surface; still a caveat on the "the filter is the
+  database's" claim.
+- **Low 2** (one `passkey_challenge` session key for both ceremonies) — OPEN.
+  Re-verified: a challenge minted by `/login/begin` still completes a
+  registration (200). No escalation — `clientData.type` still binds the ceremony
+  — but the two flows still clobber each other.
+- **Low 4** (no cap on credentials per identity) — PARTIAL. Still uncapped, but a
+  user can now remove them, which was most of the concern.
+- **Low 5** (`/api/passkey/login/begin` mints unauthenticated session rows; no
+  rate limit anywhere) — OPEN.
+- **Low 6** (`RP_ID` from `urlparse(PUBLIC).hostname`, no startup guard against an
+  IP literal or a `PUBLIC` carrying a path) — OPEN. Both still fail closed.
+- **Low 7** (`touch_credential` privileged though `identity_id` is in hand) — OPEN.
+- **Low 8** (registry disclosed the internal identity UUID) — RESOLVED by
+  Medium 3's fix.
+- **Low 9** (`credential_id` and the `navigator.platform` label in `/api/me`) —
+  now justified rather than open: the revoke UI needs both.
+
+---
+
+### Verdict
+
+**Yes — safe to build on. New criticals: 0, new highs: 0.**
+
+Both blockers are genuinely gone: the tree builds from a clean environment, and
+the passkey is no longer a one-way door. The RLS fix is the strongest of the
+set — fail-closed on the write side as well as the read side, verified in both
+the virgin and recycled connection states, with the exact write that succeeded
+before now refused. What is left is one Medium of the same shape as the original
+High, one layer in (revocation cuts off the next login but not the current
+session), plus the residual that a stolen Fayda session can still mint a passkey
+the victim must notice in order to remove. Neither blocks further work; both
+should close before this carries real Fayda identities rather than four
+personas.
+
+---
+
+## Audit — 2026-07-26 (R2: Postgres RLS, WebAuthn passkey return-login, de-publicised registry)
+
+**Scope:** the uncommitted working tree on top of `d858953` only — `git diff` of
+`backend/app.py`, `backend/store.py`, `backend/requirements.txt`, `backend/t.py`,
+`frontend/src/App.jsx`, `frontend/src/components/{IdentityRecord,VerifyGate}.jsx`,
+plus the new untracked `frontend/src/passkey.js`. R1 (Supabase Postgres) is HEAD
+and was re-attacked only where R2 changed its behaviour (the `FOR UPDATE` paths
+that now run as a different role, and `reset()`).
+
+**Method:** read every hunk first, then attacked. Against the live dev Supabase
+project I probed the catalog directly (`pg_roles`, `pg_class.relrowsecurity`,
+`pg_policies`, `information_schema.role_table_grants`, `pg_constraint`) rather
+than trusting the DDL string; drove `store.user_conn` by hand with unfiltered
+`SELECT`s, a deliberate mid-transaction exception, and role/GUC re-reads across
+three subsequent pool checkouts; and tried to escape the role from inside a
+scoped transaction. Against the dev server on 127.0.0.1:8000 I built an ES256
+software authenticator (real CBOR/COSE, real client-data and authenticator-data
+byte layouts, real signatures, controllable UV flag and sign counter) and ran
+registration and assertion ceremonies with the flags, challenges, sessions,
+origins and body shapes deliberately wrong. I booted a second instance on :8111
+in the *shipped* posture (`APP_ENV=production DEMO_MODE=1`, secrets supplied) to
+test the registry gate and the dev surface as they will actually exist on
+Render. Dependency resolvability was checked with a real `pip install --dry-run
+--ignore-installed`. No code was modified. No credential was printed.
+
+*Database side effects of this run, on the throwaway dev project only:* probing
+`/api/dev/reset` through a passkey session wiped the dev registry (it is marked
+disposable and `t.py` wipes it on every run anyway) — that wipe is itself
+evidence for Medium #2 below. Probe identities and 8 passkey rows remain. One
+`identities` row with `id = ''` was created to demonstrate Medium #1 and was
+deleted immediately afterwards; the table was re-counted to confirm.
+
+**Counts (this review): 0 critical / 2 high / 5 medium / 9 low.**
+
+> **Superseded.** All seven of these were addressed; see the fix review
+> above for per-finding RESOLVED/PARTIAL status and re-verification evidence.
+> High 1 is PARTIAL; everything else at Medium and above is RESOLVED.
+
+The RLS is **not** theatre. `SET LOCAL ROLE` really does take effect (psycopg is
+not in autocommit, so the `set_config` starts a real transaction), the role is
+`NOBYPASSRLS`, an unfiltered `SELECT` sees exactly one identity, and neither the
+role nor the GUC survives a pool checkout — including after an exception thrown
+mid-transaction. What it does *not* do is what its own comment claims about the
+unset case, and the deliberate privileged/unscoped list is defensible except for
+one entry. Details below.
+
+---
+
+### High #1 — a passkey turns a temporary session compromise into permanent, unrevokable control of a Fayda identity
+
+**Location:** `backend/app.py:427-456` (`/api/passkey/register/begin`),
+`:459-485` (`/register/complete`), `:506-555` (`/login/complete`); no delete
+route exists anywhere in the file (`grep -n "@app\." backend/app.py` lists 21
+routes; none removes a credential).
+**Confidence:** certain — every step reproduced end to end against the running
+server.
+**Invariant broken:** CLAUDE.md, *"Cooling period exists for session compromise,
+not user convenience. If an attacker with a live session swaps the wallet, the
+real user needs a window to cancel."*
+
+The threat model this codebase already writes down is *attacker holds a live
+session*. R2 hands that attacker a way to make the cancel window permanently
+irrelevant, and gives the victim no way to undo it.
+
+Reproduced:
+
+1. With a stolen session cookie, `POST /api/passkey/register/begin` →
+   `POST /api/passkey/register/complete` with an authenticator the attacker
+   controls. Nothing gates this on a *fresh* Fayda authentication — only on
+   `current(request)`, which the stolen cookie satisfies.
+2. The victim logs out. Every session row dies. The attacker's credential row
+   does not.
+3. `POST /api/passkey/login/begin` → `/complete` at any later time returns a
+   fresh 12-hour session (`SESSION_TTL_HOURS`, the same TTL a real Fayda login
+   earns). Confirmed: `auth_method: passkey`, `/api/registry` 200,
+   `/api/wallet/nonce` 200 — full binding powers.
+4. From *that* passkey session, `register/begin` returns 200 again. I chained
+   seven credentials onto one identity without touching Fayda after the first
+   login. So the attacker can also rotate their own persistence.
+5. There is no revocation. `/api/me` and `/api/passkey/list` *display* the
+   credentials — the UI even prints "N registered on this identity" — but no
+   endpoint deletes one. The victim can see the attacker's key and cannot remove
+   it without direct database access.
+
+Net effect on the cooling period: the attacker re-initiates the wallet swap
+whenever they like. The victim must notice and win the cancel race every 72
+hours, forever. The window that was supposed to be the user's advantage becomes
+a treadmill.
+
+Two things would each break the chain and neither is present: requiring a fresh
+Fayda authentication (not merely a session) to register a credential, and a
+`DELETE /api/passkey/{id}` scoped through `user_conn`.
+
+---
+
+### High #2 — `pip install -r backend/requirements.txt` cannot resolve; every clean build of R2 fails
+
+**Location:** `backend/requirements.txt:8` (`cryptography==46.0.6`) against
+`:19` (`webauthn==3.0.0`, which declares `cryptography>=49.0.0`);
+consumed by `Dockerfile:21` (`RUN pip install --no-cache-dir -r
+backend/requirements.txt`), which is the Render build (`render.yaml`,
+`runtime: docker`).
+**Confidence:** certain — reproduced.
+**Invariant broken:** DEPLOY/CLAUDE.md's "deterministic build"; and the R2 diff
+adds a dependency without updating the pin it invalidates.
+
+```
+ERROR: Cannot install -r backend/requirements.txt (line 19) and cryptography==46.0.6
+       because these package versions have conflicting dependencies.
+  The user requested cryptography==46.0.6
+  webauthn 3.0.0 depends on cryptography>=49.0.0
+ERROR: ResolutionImpossible
+```
+
+The local venv already carries `cryptography 49.0.0` (installed out of band —
+`pip show` confirms 49.0.0 while the file still pins 46.0.6), which is why
+29/29 passes locally and why nothing in the suite notices. The file as committed
+describes an environment that cannot be built. The first `docker build` after
+this lands dies at layer 21.
+
+Secondary, same file: `cbor2` and `pyOpenSSL` (both hard requirements of
+`webauthn`, and `cbor2` is imported directly by `t.py:` test 29) are untracked,
+so their versions float — against a file whose first line is "Versions as
+tested."
+
+*On the dependency question asked directly:* the `cryptography 46 → 49` bump is
+safe for the rest of the stack. `eth-account` does not depend on `cryptography`
+at all (it signs through `eth-keys`/`coincurve`), `PyNaCl` depends only on
+`cffi`, and `PyJWT[crypto]` needs `>=3.4.0`. I ran a full OIDC login through the
+RS256 client assertion under 49.0.0 — it works. The problem is the pin, not the
+library.
+
+---
+
+### Medium #1 — RLS does **not** fail closed on `WITH CHECK`; `current_setting(..., true)` returns `''`, not NULL, on every reused pooled connection
+
+**Location:** `backend/store.py:185-201` — the comment and all three policies.
+**Confidence:** certain — demonstrated, including the write.
+**Invariant strained:** the comment's own claim, verbatim: *"current_setting(...,
+true) yields NULL when the GUC is unset, and `id = NULL` matches nothing: a
+transaction that forgets to name an identity sees an empty registry rather than
+all of it. Fails closed."*
+
+That is true exactly once per physical connection. After `set_config('app.
+identity_id', …, true)` has run and the transaction has ended, the GUC is
+*defined* and resets to the empty string, not to undefined. Measured on a
+virgin connection versus a used one:
+
+```
+virgin connection            current_setting -> None
+after one local set + commit current_setting -> ''
+```
+
+Since the pool recycles connections, every connection in steady state is in the
+second state. The policy predicate is therefore `id = ''`, not `id IS NULL`.
+On the read side that still returns zero rows — which is why test 27's "unset
+identity sees zero rows" passes, and it passes for a reason the test does not
+state. On the **write** side it fails open:
+
+```
+SET LOCAL ROLE fayda_app;                        -- no set_config
+SELECT current_setting('app.identity_id', true);  -- ''
+INSERT INTO identities (id, …) VALUES ('', …);    -- SUCCEEDS: '' = '' passes WITH CHECK
+```
+
+and the row that lands is then visible **and writable** to every other unbound
+`fayda_app` transaction:
+
+```
+unbound fayda_app SELECT sees: [{'id': '', 'display_name': 'y'}]
+and can UPDATE it: 1 row
+```
+
+I deleted the row afterwards. This is not reachable from application code today:
+`user_conn` raises `ValueError` on a falsy identity, and `current()` 401s on an
+empty `identity_id`. So the severity is Medium, not High. But the property the
+comment asserts — and that the next person writing a `user_conn`-shaped helper
+will rely on — is not the property the database has. The only thing preventing a
+shared cross-tenant row is the unenforced convention that no identity id is ever
+`''`; there is no `CHECK (id <> '')` and the policies do not say
+`current_setting(...) IS NOT NULL AND …`.
+
+---
+
+### Medium #2 — `reset()` leaves `webauthn_credentials` behind and permanently drops its foreign key; the Wipe button does not wipe passkeys
+
+**Location:** `backend/store.py:576-579` (the `DROP TABLE … identities CASCADE`)
+against `:99-109` (the `CREATE TABLE IF NOT EXISTS webauthn_credentials … REFERENCES
+identities(id) ON DELETE CASCADE`).
+**Confidence:** certain — observed in the live catalog, then reproduced by
+triggering `/api/dev/reset`.
+**Invariant broken:** CLAUDE.md, *"Prefer database constraints over application
+checks"*, and the schema comment that promises `ON DELETE CASCADE`.
+
+`reset()` drops `wallet_bindings, auth_nonces, sessions, identities CASCADE`.
+The CASCADE takes the FK constraint on `webauthn_credentials` with it, because
+that constraint depends on `identities`. The table itself is not in the DROP
+list, so `_create_schema`'s `CREATE TABLE IF NOT EXISTS` is a no-op and the FK
+is **never re-added**. The live dev database right now:
+
+```
+FK constraints on webauthn_credentials: ['webauthn_credentials_pkey']   -- pkey only
+```
+
+After I triggered `/api/dev/reset`:
+
+```
+identities: 0   wallet_bindings: 0   webauthn_credentials: 8   orphans: 8
+labels retained: 'sc', 'reused-after-500', 'noUV', ''  (created_at/last_used_at intact)
+```
+
+Three consequences:
+
+- The dev/demo "Wipe registry" button deletes identities and bindings but leaves
+  every passkey — public key, credential id, device label (the frontend sets it
+  from `navigator.platform`), creation and last-use timestamps — for people the
+  registry claims to have forgotten. That is a data-deletion promise the code
+  does not keep.
+- `webauthn_credentials` grows monotonically across every reset, unbounded.
+- `ON DELETE CASCADE` is gone for the life of the database, so any future
+  identity deletion silently orphans credentials rather than removing them.
+
+No authentication consequence: `passkey_login_complete` calls
+`store.get_identity(stored["identity_id"])` and raises the uniform `denied` when
+it returns `None`. I confirmed against the 8 live orphans that they cannot log
+in. And identity ids are uuid4, so an orphan cannot be re-adopted by a new
+identity. That is why this is Medium and not High.
+
+---
+
+### Medium #3 — the registry is not de-publicised in the configuration that actually ships
+
+**Location:** `backend/app.py:670-680` (`current(request)` is the whole gate),
+`backend/store.py:1030-1047`, against `render.yaml` (`APP_ENV: production`,
+`DEMO_MODE: "1"`) and `backend/app.py:265-266` (`if DEV_MODE or DEMO_MODE:
+app.include_router(mock_esignet.router)`).
+**Confidence:** certain — reproduced against a production-posture DEMO_MODE
+instance on :8111.
+**Invariant strained:** the change's own stated goal — *"over real Fayda
+identities it is a directory of verified Ethiopians and the wallets they
+control, which is not something to hand an anonymous caller."*
+
+The gate is "holds any session". In the posture `render.yaml` ships, a session
+costs one click on a persona card:
+
+```
+boot /api/me            -> authenticated: False, demo: True, dev: False
+anon  /api/registry     -> 401                      (correct)
+GET /login -> pick persona -> /callback -> /api/registry -> 200, every identity
+/api/dev/reset|fast-forward|test-wallet -> 404       (correct — DEMO_MODE never arms these)
+```
+
+So the anonymous-caller property holds for exactly as long as it takes to press
+a button. On the demo deploy the rows are fictional personas, which caps the
+harm — but the property being claimed is not the property being enforced, and
+the moment real Fayda credentials are configured beside `DEMO_MODE=1` (nothing
+in the code forbids that combination) the directory is public again.
+
+**On the deliberate decision you asked me to challenge — I think it is wrong as
+built, for a reason narrower than "it's a directory".** `store.registry()`
+selects `FROM identities`, unconditionally. It lists *everyone who has ever
+authenticated with Fayda here*, including people with `evm: null, solana: null`
+who have bound no wallet at all. I confirmed this: my "Probe B" identity, which
+never bound anything, appears in full to every other signed-in user with
+`display_name`, `verified_at`, and its internal UUID.
+
+The product justification for a registry is "which wallet does this verified
+person control". A row with no wallet answers nothing and only discloses "this
+named person holds a Fayda ID and used this service on this date". For an
+Ethiopian national-ID-linked service that is the sensitive half without the
+useful half. Two changes would keep the feature and drop most of the exposure:
+`WHERE EXISTS (an active binding)`, and dropping `i.id` from the projection —
+which is the RLS key handed to every reader, and the one value in the row that
+has no display purpose whatsoever. Removing `fin_hmac` was right; `id` is the
+same argument one step weaker, and it went untouched.
+
+---
+
+### Medium #4 — registration does not enforce user verification, so the RP accepts a credential that violates its own stated policy
+
+**Location:** `backend/app.py:467-472` — `wa.verify_registration_response(...)`
+omits `require_user_verification`, which defaults to `False` in py_webauthn
+3.0.0 (`inspect.signature` confirms), while `:448-451` asks the client for
+`UserVerificationRequirement.REQUIRED`.
+**Confidence:** certain — reproduced.
+**Invariant strained:** `authenticator_selection` is a *request* to the client,
+not a check; the verification step is where the RP enforces it, and here it does
+not. `/login/complete` gets this right (`require_user_verification=True`).
+
+```
+options authenticatorSelection: {'residentKey':'required','userVerification':'required'}
+register a credential with the UV flag CLEARED -> 200 accepted
+login with that credential, UV cleared        -> 400 rejected
+login with that credential, UV asserted       -> 200 accepted
+```
+
+Two effects. First, a credential that genuinely cannot do user verification is
+happily stored and then can never be used — a silent, unrecoverable lockout made
+worse by there being no way to delete it (High #1). Second, the RP's UV policy
+is enforced only at assertion time, which means the RP never actually learns
+whether the authenticator can do UV; it only learns what the authenticator
+claims each time. Asserting the requirement at registration is the point where
+that is checkable.
+
+---
+
+### Medium #5 — three unauthenticated 500s on `/api/passkey/login/complete`, plus an authenticated one on `/register/complete`
+
+**Location:** `backend/app.py:511-515` — `body = await request.json()`,
+`body.get("credential")` and `credential.get("id")` all sit *outside* the
+try/except; `:465` and `:481` for the register side.
+**Confidence:** certain — reproduced.
+**Invariant strained:** the file's own boundary discipline. `_clean_token`
+(`:579-588`) and `_strip_nul` (`:292-305`) exist precisely because "a NUL byte is
+unrepresentable in Postgres text (it would become a 500 instead of the 400 this
+is)". The new R2 fields skipped both.
+
+Unauthenticated, no prior `/login/begin` state needed beyond one call:
+
+| body | result |
+|---|---|
+| `not-json` | **500** |
+| `[1,2,3]` | **500** (`body.get` on a list) |
+| `{"credential":"abc"}` | **500** (`.get` on a str) |
+| `{"credential":null}` | 400 (correct) |
+
+Authenticated: `{"label": "dev\x00ice"}` on `/register/complete` → **500**, from
+psycopg rejecting the NUL inside `store.add_credential`; app.py catches only
+`UniqueViolation` there. (`{"label": {"a": 1}}` is accepted and stored as the
+Python repr `"{'a': 1}"` — harmless, but it shows the field is unvalidated.)
+
+Each 500 also tears the keep-alive connection: the next request on the same
+socket got `ECONNRESET` in my client. The server itself stays healthy (three
+subsequent `/api/me` calls returned 200), and no traceback reaches the client,
+so this is noise and log spam rather than a breach. It is on the unauthenticated
+surface, which is why it is Medium rather than Low.
+
+---
+
+### Low
+
+1. **RLS is escapable from inside a `user_conn` block.** `RESET ROLE` inside the
+   scoped transaction restores `postgres` and full bypass — measured: `RESET ROLE
+   -> postgres | identities visible: 3`. So does `SET LOCAL ROLE postgres`, and
+   so does a second `set_config('app.identity_id', <other id>, true)`, which
+   re-points the scope to another identity (measured: it then returned Probe B's
+   row while bound to Probe A). None of this is reachable today — every query in
+   `store.py` is parameterized and there is no injection surface — but the
+   comment at `store.py:350-356` says the filter "is the database's, not a WHERE
+   clause someone can forget to write", and that guarantee is conditional on the
+   scoped block never issuing DDL-ish session commands. Worth stating so the next
+   reader does not over-trust it. `backend/store.py:345-369`.
+
+2. **One session key for two ceremonies.** `passkey_challenge`
+   (`app.py:455, 462, 502, 508`) is shared by registration and login. A challenge
+   minted by `/login/begin` completes a registration and vice versa — both
+   confirmed 200. No escalation: py_webauthn pins `clientData.type` per ceremony,
+   so a `webauthn.get` assertion can never satisfy a registration. But a login
+   attempt silently destroys an in-flight registration challenge and the reverse,
+   and the ceremony separation the spec asks for is absent.
+
+3. **An unhandled 500 does not burn the challenge.** Because the exception
+   escapes past `ServerSideSessionMiddleware.send_wrapper`, the session is never
+   re-saved and the popped challenge survives in the database. Reproduced: I
+   crashed `/register/complete` with a non-JSON body, then successfully completed
+   the *same* challenge afterwards (200). Combined with Medium #5 this means the
+   single-use property holds on every handled path and not on the crash paths.
+
+4. **No cap on credentials per identity, no revocation.** Registered seven onto
+   one identity in a loop; `excludeCredentials` in every subsequent
+   `/register/begin` grew to seven entries and `/api/me` returns the whole list
+   on every dashboard load. Self-inflicted, but it is an authenticated,
+   unbounded, durable table with no ceiling and no delete.
+   `app.py:444-447, 725-727`.
+
+5. **A second unauthenticated session-minting endpoint.** `/api/passkey/login/begin`
+   (`app.py:493-503`) writes a pre-auth session row per call, like `/login`.
+   Bounded by `PRE_AUTH_SESSION_TTL_HOURS` and the sweeper, so it is the R1
+   posture rather than a regression — but there is still no rate limit anywhere
+   in the process, and R2 widened that surface.
+
+6. **RP_ID derivation has no guard.** `RP_ID = urlparse(PUBLIC).hostname or
+   "localhost"` (`app.py:419`). With `PUBLIC_URL` and `RENDER_EXTERNAL_URL` both
+   unset outside dev, `PUBLIC` falls back to `BASE` and `RP_ID` becomes the IP
+   literal `127.0.0.1`, which browsers reject as an RP ID (`SecurityError`); if
+   `PUBLIC_URL` carries a path (`https://gov.et/fayda`), `expected_origin` can
+   never equal the browser's origin. Both fail closed — passkeys simply stop
+   working — and both are silent at startup. The app already refuses to boot on
+   missing secrets; this deserves the same treatment.
+
+7. **`touch_credential` runs privileged unnecessarily.** `store.py:729-735` uses
+   `conn()`, but `stored["identity_id"]` is in hand at the call site
+   (`app.py:538`), so it could go through `user_conn` and be covered by the
+   policy. The other two entries on the privileged list I checked and agree with:
+   `credential_by_id` genuinely has no identity to scope to yet, and `sessions` /
+   `promote_due` / `address_claimed_by_other` are correctly cross-identity
+   (test 27(b) makes the case for the last one well).
+
+8. **`/api/registry` discloses the RLS key.** Every signed-in user receives
+   `i.id`, the exact value the policies compare against. No endpoint currently
+   accepts an identity id from the client, so nothing is exploitable — but it is
+   a strange value to publish given the change's own reasoning about `fin_hmac`.
+   See Medium #3.
+
+9. **Device fingerprint stored at rest.** `frontend/src/passkey.js` is called as
+   `registerPasskey(navigator.platform || 'this device')` (`App.jsx`), so the
+   label column holds e.g. `MacIntel` and is echoed to the browser in `/api/me`.
+   Minor, and arguably useful to the user, but it is PII the schema comment does
+   not mention.
+
+---
+
+### Verified safe
+
+Actively attacked and could not break. Do not re-plough these.
+
+**RLS mechanics.** `user_conn` genuinely binds: inside the block `current_user`
+is `fayda_app` (catalog confirms `rolbypassrls = false`, `rolcanlogin = false`),
+psycopg is **not** in autocommit (`autocommit: False`, `transaction_status`
+INTRANS at the `yield`), so `SET LOCAL ROLE` is inside a real transaction rather
+than a discarded warning. An unfiltered `SELECT count(*) FROM identities`
+returned 1 of 3. `sessions` and `auth_nonces` are refused outright
+(`InsufficientPrivilege`) because the grants list only the three scoped tables.
+`WITH CHECK` does refuse a cross-identity INSERT when the GUC is bound.
+
+**No leak across pooled connections.** After a clean `user_conn` exit *and*
+after a `DivisionByZero` thrown mid-transaction, three consecutive `conn()`
+checkouts each reported `{'u': 'postgres', 'g': ''}`. The `SET LOCAL` /
+`is_local=true` pair genuinely dies with the transaction, and psycopg's pool
+rollback covers the exception path. (The `''` rather than `NULL` is Medium #1;
+the *isolation* is sound.)
+
+**`search_path` survives the role switch** — `SHOW search_path` inside
+`user_conn` returns `public`. This now matters more than R1's comment says:
+Supabase's `auth` schema owns tables named `identities`, `sessions` **and**
+`webauthn_credentials` (all three confirmed in `pg_class`, owner
+`supabase_auth_admin`). R2 added a third name collision and the existing pin
+covers it.
+
+**Sybil holds under RLS.** The unique index still rejects a claim on a row RLS
+hides (confirmed: `BindingConflict` with a `UniqueViolation` cause, and
+`e.diag.constraint_name` is still populated for a non-owner role, so the
+`_chain_address` vs `_identity_chain` discrimination survives).
+`address_claimed_by_other` correctly stayed on `conn()`; scoping it would have
+made it report every taken address as free, and the cross-tier case
+(pending-against-active, which no single partial index arbitrates) is exactly
+where that would have bitten. The HTTP path 409s.
+
+**R1 concurrency work still intact under the new role.** `consume_nonce`'s
+`FOR UPDATE`, `promote_due`'s `ORDER BY id … FOR UPDATE SKIP LOCKED` and its
+per-promotion savepoints all still run privileged; `cancel_pending` moved to
+`fayda_app` but row locks are role-independent, and `promote_due`'s `SKIP LOCKED`
+still yields to a cancel holding the lock. `create_binding`'s two `user_conn`
+checkouts are sequential, not nested, so `max_size=12` is not at risk of
+self-deadlock.
+
+**A passkey cannot mint an identity Fayda did not verify.** Both registration
+endpoints require `current(request)`; anonymous `register/begin` → 401.
+`login/complete` derives the identity *only* from the credential row and denies
+uniformly when `get_identity` returns `None` — proved against the 8 orphan
+credentials Medium #2 left behind, none of which can log in.
+
+**A passkey cannot be registered for another identity.** Completing A's
+registration challenge from B's session → 400; completing a registration with a
+third party's `login/begin` challenge → 400. The challenge is session-scoped and
+the `identity_id` written is `current(request)`'s, re-checked by the policy's
+`WITH CHECK`.
+
+**Credential-id substitution does not work.** py_webauthn 3.0.0 enforces
+`bytes_to_base64url(raw_id) == id` in both ceremonies, so presenting the
+victim's `id` (which selects the stored public key) beside an attacker's `rawId`
+is rejected before any crypto runs.
+
+**Origin and RP-ID pinning work.** An otherwise-valid assertion carrying
+`origin: https://evil.example.com` → 400. `expected_rp_id` is hashed and compared
+against `authData.rp_id_hash` in both ceremonies.
+
+**Sign-count / cloned-authenticator handling is correct.** A replayed counter is
+rejected (400); the library skips the check only when both stored and presented
+counts are 0, which is what keeps Apple/iCloud passkeys (always 0) working.
+`touch_credential` persists the advance.
+
+**No enumeration oracle on login.** Unknown credential and valid-credential-bad-
+signature return byte-identical bodies. There is a residual timing difference
+(unknown = one DB lookup; known = lookup plus an ECDSA verify) but it is well
+inside network noise against a remote Postgres.
+
+**The reduced-claims passkey session creates no authorization difference.**
+`kebele`/`woreda`/`residenceStatus` are genuinely absent from a passkey session
+(`claims: {'name': …, 'birthdate': …}` only), and nothing anywhere in `app.py`
+branches on `claims` for authorization — it is read once, in `/api/me`, and
+echoed. `auth_method` is reported honestly.
+
+**FIN handling is untouched by R2.** Nothing in the passkey path reads `sub`.
+`user_id` is the internal uuid4, never the FIN or its HMAC — correct, since the
+user handle is stored on the authenticator and surfaces in account pickers.
+`fin_hmac` is genuinely gone from `/api/registry` (checked the raw response body,
+not just the SELECT list); it remains in `/api/me`, which is the caller's own row
+only. No new logging of session, claims or FIN anywhere in the diff.
+
+**The dev surface is absent in the shipped demo posture.** On the
+`APP_ENV=production DEMO_MODE=1` instance, `/api/dev/reset`,
+`/api/dev/fast-forward` and `/api/dev/test-wallet` all 404 while the mock IdP
+mounts. The `DEV_MODE` / `DEMO_MODE` split holds exactly as documented.
+
+**The dependency bump is safe for the existing crypto.** See High #2 — the
+`cryptography 49.0.0` runtime is fine for `eth-account` (no dependency),
+`PyNaCl` (cffi only) and `PyJWT[crypto]` (`>=3.4.0`); the RS256 client assertion
+was exercised end to end. Only the *pin* is broken.
+
+---
+
+**Verdict: no — not safe to build on as it stands. New criticals: 0, new highs: 2.**
+The RLS is real and the WebAuthn verification is done properly, but the tree
+cannot be built (High #2 kills every clean `docker build`), and the passkey adds
+unrevokable persistence that directly undercuts the cooling period's stated
+reason for existing (High #1). Both are additive fixes — a pin bump and a
+`DELETE /api/passkey/{id}` plus a fresh-Fayda gate on registration — with no
+redesign implied; the RLS and passkey verification work underneath them stands.
+
+---
+
 ## Fix review 2 — 2026-07-26 (target-gated reset, COLLATE "C", lifespan sweeper, pre-auth TTL)
 
 Scope: the second fix round only — `store.py` (`registry_meta` table,
