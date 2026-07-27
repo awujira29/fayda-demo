@@ -1,4 +1,4 @@
-import re, httpx, sys, base64, subprocess, os, time, json
+import re, httpx, sys, base64, subprocess, os, time, json, uuid
 B="http://127.0.0.1:8000"
 # 30s, not 10: every store call is a network round trip to managed Postgres,
 # so a bind is seconds, not milliseconds. This is a transport timeout, never
@@ -179,7 +179,20 @@ try:
     r=httpx.get(f"{pb}/authorize", params={"client_id":"x"}, timeout=5,
                 follow_redirects=False)
     assert r.status_code==404, ("/authorize", r.status_code)
-    print("  dev routes + mock IdP all 404 in production: ok")
+    # The interactive docs enumerate every route and request shape, the
+    # operator endpoints included. FastAPI serves them openly by default;
+    # production must not publish a map of the compliance API. Assert on the
+    # CONTENT, not the status: unmatched GETs fall through to the SPA
+    # catch-all, so these paths legitimately answer 200 with index.html — the
+    # requirement is that no route table comes back, not that nothing does.
+    for route in ("/docs", "/redoc", "/openapi.json"):
+        r=httpx.get(f"{pb}{route}", timeout=5, follow_redirects=False)
+        body=r.text.lower()
+        assert "swagger" not in body and "redoc" not in body, \
+            ("interactive API docs served in production", route)
+        assert "/api/operator/" not in r.text, \
+            ("the route table is published in production", route)
+    print("  dev routes, mock IdP, and API docs all absent in production: ok")
 finally:
     srv.terminate()
     try: srv.wait(timeout=10)
@@ -214,9 +227,13 @@ st.create_binding(Bi["id"], "evm", X, secrets.token_hex(8), "sig", "msg", 72)  #
 st.force_due(Bi["id"], "evm")
 # Before the fix the first read after cooling elapsed raised IntegrityError
 # inside promote_due and every subsequent read 500'd. Reads must stay healthy.
+# Drive the REGISTRY-WIDE promotion directly: it used to be reachable via
+# GET /api/registry, but R3 moved that behind the operator role, and the
+# invariant under test is promote_due()'s, not the endpoint's.
 for _ in range(3):
-    r=c.get(f"{B}/api/registry"); assert r.status_code==200, ("registry wedged", r.status_code)
+    st.promote_due()
 r=c.get(f"{B}/api/me"); assert r.status_code==200, ("api/me wedged", r.status_code)
+r=c.get(f"{B}/api/me"); assert r.status_code==200, ("api/me wedged on repeat", r.status_code)
 assert st.active_binding(A["id"], "evm")["address"]==X, "winner's active binding lost"
 inc=st.active_binding(Bi["id"], "evm")
 assert inc and inc["address"]==W, "loser's incumbent was archived by the failed promotion"
@@ -399,7 +416,7 @@ for _ in range(4):
 print("  4 case-variant races, exactly one live claim every time: ok")
 
 step("23. cooling: a committed cancel is never reverted by a concurrent promotion")
-# promote_due runs on every read (including the unauthenticated /api/registry),
+# promote_due runs on every read of /api/me, and registry-wide for operators,
 # so it races the user's cancel. Without a row lock and a status guard, a
 # promotion holding a stale snapshot re-activated the row the user had just
 # cancelled — the attacker's swap goes live even though the victim cancelled
@@ -665,18 +682,20 @@ assert r.status_code == 409, ("HTTP path let a second identity claim a taken wal
                               r.status_code, r.text[:120])
 print("  cross-tier claim refused by the privileged check and by HTTP: ok")
 
-step("28. R2: the registry is no longer public")
+step("28. R2/R3: the registry is neither public nor reachable without an audit entry")
+# The registry IS the sensitive cross-user join — every verified person mapped
+# to the wallets they control. R2 put it behind a session; R3 makes it
+# operator-only and logged, because "some session" let an operator read the
+# whole mapping by the one route that left no trace.
 anon2 = httpx.Client(follow_redirects=False, timeout=30)
-r = anon2.get(f"{B}/api/registry")
-assert r.status_code == 401, ("registry still served to an anonymous caller", r.status_code)
-r = c.get(f"{B}/api/registry")
-assert r.status_code == 200, (r.status_code, r.text[:120])
-body = r.text
-# fin_hmac is a stable pseudonymous identifier: it cannot re-derive the FIN,
-# but it does let anyone correlate one person across every row. It has no place
-# in a directory read by other users; operators get it through R3's audited path.
-assert "fin_hmac" not in body, "registry still exposes the per-identity HMAC"
-print("  registry requires authentication and drops fin_hmac: ok")
+r = anon2.post(f"{B}/api/registry", json={"reason": "just having a look"})
+assert r.status_code == 401, ("registry served an anonymous caller", r.status_code)
+r = c.post(f"{B}/api/registry", json={"reason": "just having a look"})
+assert r.status_code == 403, ("registry served a non-operator", r.status_code)
+# And the old unaudited GET must be gone, not merely unused by the frontend.
+assert c.get(f"{B}/api/registry").status_code in (404, 405), \
+    "the unaudited GET /api/registry still exists"
+print("  registry refuses anonymous, non-operator, and the old unaudited GET: ok")
 
 step("29. R2 passkey return-login: register with Fayda, return without it")
 # A software authenticator: real ES256 keys, real client-data and
@@ -990,5 +1009,330 @@ out = p.communicate(timeout=60)[0]
 assert p.returncode != 0, "DEMO_MODE started against a real Fayda endpoint"
 assert "refusing to start" in out, out[-400:]
 print("  DEMO_MODE + a real Fayda endpoint refuses to boot: ok")
+
+step("33. R3 operator role: no cross-user visibility without an operator")
+# Test 32 reset the schema, which drops sessions — everyone is signed out.
+# Sign back in through the real Fayda flow rather than reaching into the DB,
+# so the operator below holds a session the app actually issued.
+def fayda_login(cl, fin):
+    loc = cl.get(f"{B}/login").headers["location"]
+    page = cl.get(loc).text
+    stt = re.search(r'name="state" value="([^"]*)"', page).group(1)
+    rr = cl.post(f"{B}/authorize/confirm",
+                 data={"fin": fin, "redirect_uri": f"{B}/callback",
+                       "state": stt, "nonce": "n"})
+    cd = re.search(r"code=([^&]+)", rr.headers["location"]).group(1)
+    cl.get(f"{B}/callback", params={"code": cd, "state": stt})
+    return cl.get(f"{B}/api/me").json()
+
+assert fayda_login(c, fins[0])["authenticated"], "could not re-establish a session"
+
+# c is a signed-in ordinary user. Every operator route must refuse it — the
+# whole point of R3 is that "authenticated" is not "allowed to read other
+# people".
+subject = st.upsert_identity(secrets.token_hex(16), "Audited Subject", "1990-01-01")
+for path, payload in (("/api/operator/search", {"query": "Audited", "reason": "checking things"}),
+                      ("/api/operator/identity", {"identity_id": subject["id"],
+                                                  "reason": "checking things"}),
+                      ("/api/operator/access-log", {})):
+    r = c.post(f"{B}{path}", json=payload)
+    assert r.status_code == 403, (f"{path} served a non-operator", r.status_code)
+r = anon.post(f"{B}/api/operator/search", json={"query": "x", "reason": "checking things"})
+assert r.status_code == 401, ("operator route served an anonymous caller", r.status_code)
+print("  ordinary users and anonymous callers are refused: ok")
+
+# Grant through the store, as the CLI does — never over HTTP.
+me_id = c.get(f"{B}/api/me").json()["identity"]["id"]
+st.grant_operator(me_id, granted_by="t.py", note="test operator")
+assert st.is_operator(me_id)
+# There must be no HTTP route that grants this. Check the actual route table,
+# not the source text — an earlier version of this assertion stripped
+# "store.grant_operator" before searching, so a route that called exactly that
+# would have passed it. Vacuous.
+import app as _app
+for _r in _app.app.routes:
+    _fn = getattr(_r, "endpoint", None)
+    if _fn is None:
+        continue
+    _src = ""
+    try:
+        import inspect as _inspect
+        _src = _inspect.getsource(_fn)
+    except Exception:
+        pass
+    assert "grant_operator" not in _src, \
+        (f"route {getattr(_r, 'path', '?')} can grant the operator role", _fn.__name__)
+print("  operator granted out of band; no route in the app can grant it: ok")
+
+step("34. R3: every operator lookup is logged BEFORE the data is returned")
+before = st.access_log_all(limit=1)["total"]
+# A reason is mandatory and must be substantive.
+for bad in ("", "   ", "why"):
+    r = c.post(f"{B}/api/operator/identity",
+               json={"identity_id": subject["id"], "reason": bad})
+    assert r.status_code == 400, ("a lookup without a real reason was allowed", bad)
+assert st.access_log_all(limit=1)["total"] == before, \
+    "a refused lookup still wrote a log entry"
+print("  a lookup without a substantive reason is refused: ok")
+
+r = c.post(f"{B}/api/operator/identity",
+           json={"identity_id": subject["id"], "reason": "AML review case 4471"})
+assert r.status_code == 200, (r.status_code, r.text[:160])
+assert r.json()["identity"]["display_name"] == "Audited Subject"
+page = st.access_log_all(limit=1000)
+entries = page["entries"]
+assert page["total"] == before + 1, ("the lookup was not logged", page["total"], before)
+e = entries[0]
+assert e["actor_id"] == me_id and e["subject_id"] == subject["id"], e
+assert e["action"] == "view_identity" and e["reason"] == "AML review case 4471", e
+assert e["at"], "log entry has no timestamp"
+print(f"  logged who/whom/when/why: {e['action']} by operator on subject: ok")
+
+# A lookup for a nonexistent identity is still logged — probing for which
+# identities exist is itself something a reviewer should see.
+ghost_id = str(uuid.uuid4())
+n = st.access_log_all(limit=1)["total"]
+r = c.post(f"{B}/api/operator/identity",
+           json={"identity_id": ghost_id, "reason": "AML review case 4472"})
+assert r.status_code == 404, r.status_code
+assert st.access_log_all(limit=1)["total"] == n + 1, "a probe for a missing identity went unlogged"
+print("  probing for a nonexistent identity is logged too: ok")
+
+# Reading the log is itself logged.
+n = st.access_log_all(limit=1)["total"]
+r = c.post(f"{B}/api/operator/access-log")
+assert r.status_code == 200, r.text[:160]
+assert st.access_log_all(limit=1)["total"] == n + 1, "reading the access log went unlogged"
+print("  reading the access log is itself logged: ok")
+
+step("35. R3: the access log is append-only, enforced by the database")
+# Not "the app never updates it" — the app connects as the table owner, so a
+# GRANT alone would prove nothing. A trigger must refuse every caller.
+target = st.access_log_all(limit=1)["entries"][0]["id"]
+for sql, args in (
+    ("UPDATE access_log SET reason='covered up' WHERE id=%s", (target,)),
+    ("DELETE FROM access_log WHERE id=%s", (target,)),
+):
+    try:
+        with st.conn() as sc:
+            sc.execute(sql, args)
+        raise AssertionError(f"access_log accepted: {sql.split()[0]}")
+    except psycopg.errors.RaiseException as exc:
+        assert "append-only" in str(exc), exc
+still = [e for e in st.access_log_all(limit=1000)["entries"] if e["id"] == target]
+assert len(still) == 1 and still[0]["reason"] != "covered up", "the log entry was altered"
+print("  UPDATE and DELETE both refused by the database, row intact: ok")
+
+step("36. R3: a person can see who looked at their record, and only that")
+# The surveillance R4 builds on is one-directional by nature. This is the
+# smallest thing that makes it observable by the person being surveilled.
+subject_client_id = subject["id"]
+mine = st.access_log_about(subject_client_id)["entries"]
+assert mine and all(m["action"] == "view_identity" for m in mine), mine
+assert any(m["reason"] == "AML review case 4471" for m in mine), mine
+# ... and RLS must stop it becoming a window onto everyone else's entries.
+other = st.upsert_identity(secrets.token_hex(16), "Unwatched Person", "")
+assert st.access_log_about(other["id"])["entries"] == [], \
+    "a person with no accesses saw someone else's log entries"
+r = c.get(f"{B}/api/me/access-log")
+assert r.status_code == 200 and isinstance(r.json()["entries"], list), r.text[:120]
+print("  the subject sees accesses about them, and nobody else's: ok")
+
+step("37. R3: the audit trail cannot be evicted, truncated, or made anonymous")
+# (a) Eviction by volume. An unpaginated LIMIT meant an actor could bury an
+# entry simply by generating more: the row survived in the table but fell off
+# the only view anyone reads. Page past the noise and the old entry must still
+# be reachable, and the total must reveal the truncation.
+marker = "AML review case 4471"
+noise_reason = "routine bulk review pass"
+for _ in range(30):
+    c.post(f"{B}/api/operator/identity",
+           json={"identity_id": subject["id"], "reason": noise_reason})
+first = st.access_log_all(limit=5)
+assert first["total"] > 5, "total must report everything, not just the page"
+assert first["next_before"], "a truncated page must offer a cursor"
+seen, cursor, pages = [], first["next_before"], 0
+seen += [e["reason"] for e in first["entries"]]
+while cursor and pages < 40:
+    pg = st.access_log_all(limit=5, before=cursor)
+    seen += [e["reason"] for e in pg["entries"]]
+    cursor, pages = pg["next_before"], pages + 1
+assert marker in seen, "an older entry became unreachable behind newer noise"
+print(f"  paged {pages+1} pages through {first['total']} entries, old entry still reachable: ok")
+
+# The subject's own view must page too — it is their only window.
+sub_page = st.access_log_about(subject["id"], limit=5)
+assert sub_page["total"] > 5 and sub_page["next_before"], sub_page["total"]
+sub_seen, cur, n = [], sub_page["next_before"], 0
+sub_seen += [e["reason"] for e in sub_page["entries"]]
+while cur and n < 40:
+    pg = st.access_log_about(subject["id"], limit=5, before=cur)
+    sub_seen += [e["reason"] for e in pg["entries"]]
+    cur, n = pg["next_before"], n + 1
+assert marker in sub_seen, "the subject could not page back to an older access"
+print("  the subject can page back to an older access too: ok")
+
+# (a2) Timestamps are not unique — a search writes one entry per result in a
+# tight loop. A cursor on `at` alone skips every row sharing the last row's
+# timestamp, which is the same eviction with a smaller window. Plant an exact
+# collision and page through it one row at a time.
+collide_at = st.iso(st.now())
+collide_subject = st.upsert_identity(secrets.token_hex(16), "Collision Subject", "")
+planted = set()
+with st.conn() as sc:
+    for k in range(5):
+        eid = f"collide-{secrets.token_hex(6)}"
+        planted.add(eid)
+        sc.execute(
+            """INSERT INTO access_log (id, at, actor_id, subject_id, action, reason)
+               VALUES (%s,%s,%s,%s,'view_identity',%s)""",
+            (eid, collide_at, me_id, collide_subject["id"], f"same-microsecond {k}"))
+walked, cursor, guard = set(), None, 0
+while guard < 60:
+    pg = st.access_log_all(limit=1, before=cursor)
+    if not pg["entries"]:
+        break
+    walked.update(e["id"] for e in pg["entries"])
+    cursor, guard = pg["next_before"], guard + 1
+    if planted <= walked:
+        break
+assert planted <= walked, \
+    ("paging skipped entries sharing a timestamp", len(planted - walked))
+print(f"  {len(planted)} entries at an identical timestamp all reachable: ok")
+
+# (b) TRUNCATE does not fire row triggers — the single most effective way to
+# erase the whole log. A statement trigger must catch it.
+try:
+    with st.conn() as sc:
+        sc.execute("TRUNCATE access_log")
+    raise AssertionError("TRUNCATE erased the access log")
+except psycopg.errors.RaiseException as exc:
+    assert "append-only" in str(exc), exc
+print("  TRUNCATE refused: ok")
+
+# (c) A plain trigger is skipped when session_replication_role='replica',
+# which turns both guards off in one statement. ENABLE ALWAYS must defeat it.
+try:
+    with st.conn() as sc:
+        sc.execute("SET session_replication_role = replica")
+        sc.execute("DELETE FROM access_log WHERE id=%s", (target,))
+    raise AssertionError("replica mode bypassed the append-only trigger")
+except psycopg.errors.RaiseException as exc:
+    assert "append-only" in str(exc), exc
+assert any(e["id"] == target for e in st.access_log_all(limit=1000)["entries"]), \
+    "the entry disappeared despite the refusal"
+print("  session_replication_role=replica does not bypass it: ok")
+
+# (d) Search made the discovery phase invisible: one entry naming the query,
+# none naming who was returned, so no subject ever learned they surfaced.
+found = st.upsert_identity(secrets.token_hex(16), "Searchable Person", "")
+n_before = len(st.access_log_about(found["id"], limit=1000)["entries"])
+r = c.post(f"{B}/api/operator/search",
+           json={"query": "Searchable", "reason": "sanctions screening sweep"})
+assert r.status_code == 200 and r.json()["results"], r.text[:160]
+mine_now = st.access_log_about(found["id"], limit=1000)["entries"]
+assert len(mine_now) == n_before + 1, \
+    ("a search surfaced this person without telling them", len(mine_now), n_before)
+assert mine_now[0]["action"] == "search_result", mine_now[0]
+# ... and search must not hand out more than it needs to pick a record.
+assert all("birthdate" not in x and "fin_hmac" not in x for x in r.json()["results"]), \
+    "search results carry more than is needed to choose a record"
+print("  each identity a search surfaces is logged to that person: ok")
+
+# (e) The operator's full view must not re-expose the correlation key.
+r = c.post(f"{B}/api/operator/identity",
+           json={"identity_id": subject["id"], "reason": "AML review case 4473"})
+assert r.status_code == 200 and "fin_hmac" not in r.text, \
+    "the operator record re-exposes the FIN HMAC"
+print("  the operator record withholds fin_hmac like the registry does: ok")
+
+step("38. R3: operator powers need a Fayda session, and authority is itself logged")
+# A passkey session was too weak to add another passkey yet strong enough to
+# read every identity in the registry. Operator powers are the more sensitive
+# of the two.
+pk_op = httpx.Client(follow_redirects=False, timeout=30)
+op_key = SoftAuthenticator()
+opts = c.post(f"{B}/api/passkey/register/begin").json()
+assert c.post(f"{B}/api/passkey/register/complete",
+              json={"credential": op_key.register(opts["challenge"]),
+                    "label": "operator device"}).status_code == 200
+opts = pk_op.post(f"{B}/api/passkey/login/begin").json()
+assert pk_op.post(f"{B}/api/passkey/login/complete",
+                  json={"credential": op_key.assert_(opts["challenge"])}).status_code == 200
+assert pk_op.get(f"{B}/api/me").json()["identity"]["id"] == me_id, "signed in as someone else"
+r = pk_op.post(f"{B}/api/operator/identity",
+               json={"identity_id": subject["id"], "reason": "AML review case 4474"})
+assert r.status_code == 403, ("a passkey session exercised operator powers", r.status_code)
+print("  the same operator on a passkey session is refused: ok")
+
+# Granting and revoking the power is itself part of the trail.
+newbie = st.upsert_identity(secrets.token_hex(16), "Future Operator", "")
+n = st.access_log_all(limit=1)["total"]
+st.grant_operator(newbie["id"], granted_by="t.py", note="temporary access")
+st.revoke_operator(newbie["id"], revoked_by="t.py")
+after = st.access_log_all(limit=10)["entries"]
+actions = [e["action"] for e in after[:2]]
+assert "grant_operator" in actions and "revoke_operator" in actions, actions
+assert st.access_log_all(limit=1)["total"] == n + 2, "grant/revoke were not both logged"
+assert not st.is_operator(newbie["id"]), "revoke did not take effect"
+# Revocation is a tombstone: the record of who once held the power survives.
+with st.conn() as sc:
+    row = sc.execute("SELECT revoked_at FROM operators WHERE identity_id=%s",
+                     (newbie["id"],)).fetchone()
+assert row and row["revoked_at"], "revoking deleted the record of the grant"
+print("  grant and revoke are logged; revocation leaves a tombstone: ok")
+
+step("39. R3 hygiene: in-place migration, bulk disclosure logged, cursor errors")
+# (a) CREATE TABLE IF NOT EXISTS adds nothing to a table that already exists,
+# so revoked_at would never appear on a database created before revocation
+# existed — and every operator route would then 500 on UndefinedColumn.
+# Fail-closed, but silent until somebody needs compliance access.
+with st.conn() as sc:
+    sc.execute("ALTER TABLE operators DROP COLUMN IF EXISTS revoked_at")
+    gone = sc.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name='operators' "
+        "AND column_name='revoked_at'").fetchone()
+assert not gone, "failed to simulate the old table shape"
+st.init()
+with st.conn() as sc:
+    back = sc.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name='operators' "
+        "AND column_name='revoked_at'").fetchone()
+assert back, "init() did not migrate an existing operators table in place"
+assert st.is_operator(me_id), "the operator lost their role across the migration"
+print("  an older operators table gains revoked_at on boot: ok")
+
+# (b) The registry discloses every bound identity's name AND both wallet
+# addresses in one call — more than search does — so it must log per subject
+# too, or the bulk route stays quieter than the narrow one.
+listed = st.registry_ids()
+assert listed, "need at least one wallet-holder for this to mean anything"
+watched = listed[0]
+n_before = st.access_log_about(watched, limit=1)["total"]
+r = c.post(f"{B}/api/registry", json={"reason": "quarterly registry review"})
+assert r.status_code == 200, (r.status_code, r.text[:160])
+n_after = st.access_log_about(watched, limit=1)["total"]
+assert n_after == n_before + 1, \
+    ("a registry listing disclosed this person without telling them", n_before, n_after)
+recent = st.access_log_about(watched, limit=5)["entries"][0]
+assert recent["action"] == "listed_in_registry", recent
+print("  a bulk registry listing is logged to every person it discloses: ok")
+
+# (c) A malformed cursor must not silently rewind to page one — a reader would
+# loop on the head of the log believing they were paging back through it.
+for bad in ("garbage", "no-separator", "|", "abc|"):
+    r = c.get(f"{B}/api/me/access-log", params={"before": bad})
+    assert r.status_code == 400, ("a malformed cursor was accepted", bad, r.status_code)
+print("  a malformed paging cursor is rejected, not silently reset: ok")
+
+# (d) A CLI grant must name the human who ran it.
+assert st.cli_actor().startswith("cli:") and "@" in st.cli_actor(), st.cli_actor()
+who = st.upsert_identity(secrets.token_hex(16), "CLI Granted", "")
+st.grant_operator(who["id"], granted_by=st.cli_actor(), note="from the CLI")
+entry = [e for e in st.access_log_all(limit=20)["entries"]
+         if e["action"] == "grant_operator" and e["subject_id"] == who["id"]][0]
+assert entry["actor_id"].startswith("cli:") and len(entry["actor_id"]) > 5, entry
+st.revoke_operator(who["id"], revoked_by=st.cli_actor())
+print(f"  a CLI grant records who ran it ({entry['actor_id'][:28]}…): ok")
 
 print("\n\nALL CHECKS PASSED")

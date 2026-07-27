@@ -5,6 +5,915 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Fix review — R3, 2026-07-26 (operator-gated registry, keyset paging, per-result search logging, ALWAYS triggers, Fayda-gated operators, operator tombstones)
+
+**Scope:** only the deltas applied on top of the R3 audit immediately below —
+`POST /api/registry` behind `require_operator`, the `auth_method == "fayda"`
+check in `require_operator`, the per-result `search_result` entries in
+`/api/operator/search`, `find_identities` losing `birthdate`, `identity_full`
+moving to explicit columns, the `(at, id)` keyset cursor plus `total` in
+`access_log_all` / `access_log_about` and the `?before=` parameters,
+`trg_access_log_no_truncate`, the two `ENABLE ALWAYS` statements,
+`ix_access_log_at (at COLLATE "C" DESC, id DESC)`, the `operators.revoked_at`
+tombstone with logged grant/revoke, and t.py tests 28 and 33-38.
+
+**Method:** re-ran every probe that produced an original finding, plus new ones
+aimed at the fixes themselves. Two cautions, because both changed answers
+mid-flight. First, **the tree was edited under me**: my first pass read a
+`git diff` in which the cursor was `at` alone, and the live code had already
+moved to a composite `at|id`. Everything below was therefore re-verified against
+a snapshot (`store.py` sha256 `d5797219…`, `app.py` `97f87962…`) and a **fresh
+uvicorn booted from it** on `127.0.0.1:8323`. Second, **a t.py run overlapped my
+first trigger battery** and its `reset()` produced transient `UndefinedTable`
+results plus row-count drift; the entire battery was re-run with one dedicated
+`psycopg` connection per probe, explicit rollback, and the trigger catalog
+(`pg_trigger.tgenabled`) and row count re-read from a separate connection after
+each probe. Routes were enumerated programmatically from `app.app.routes` with
+`inspect.getsource` rather than by grep. No code was modified; the probe grants
+I created were revoked.
+
+**Counts (new this review): 0 critical / 0 high / 2 medium / 4 low.**
+**Prior findings: 6 RESOLVED, 2 PARTIAL, nothing OPEN at High or above.**
+
+---
+
+### Status of the R3 findings
+
+| # | Finding | Status |
+|---|---|---|
+| High #1 | `/api/registry` unaudited cross-user visibility | **RESOLVED** (residual: new Medium #2) |
+| High #2 | `LIMIT 200` eviction from every review surface | **RESOLVED** |
+| High #3 | Search logged the query, not who it returned | **RESOLVED** |
+| Medium #1 | No Fayda provenance, no freshness for operators | **PARTIAL** |
+| Medium #2 | Grant/revoke outside the log; revoke erased the record | **RESOLVED** |
+| Medium #3 | `TRUNCATE` and `session_replication_role` bypassed the trigger | **RESOLVED** |
+| Medium #4 | Unbounded log, no index on `at`, unrate-limited reader | **PARTIAL** |
+| Medium #5 | `fin_hmac` and proof material handed to operators | **RESOLVED** |
+| L1 | Reason gate is length-only | **OPEN** |
+| L2 | Vacuous "no route grants operator" test | **RESOLVED** |
+| L3 | `operators` has no RLS | **OPEN** |
+| L4 | `subject_id` is unvalidated free text | **OPEN** |
+| L5 | No UI for `/api/me/access-log`; actor is an opaque UUID | **PARTIAL** |
+| L6 | `DEMO_MODE` makes the operator role publicly claimable | **OPEN** |
+| L7 | `t.py` grants an operator and never revokes it | **OPEN** |
+| L8 | `at` sorted without `COLLATE "C"` | **RESOLVED** |
+
+---
+
+#### High #1 — RESOLVED
+
+The endpoint is now `POST`, operator-only, and logged. Verified against the
+fresh server:
+
+```
+anonymous POST /api/registry            -> 401
+non-operator POST /api/registry         -> 403
+GET /api/registry (the old unaudited route) -> 405
+operator POST /api/registry             -> 200, 1 log row, action=list_registry
+```
+
+Route enumeration was redone exhaustively — walking `app.app.routes` and reading
+each endpoint's source rather than grepping — and it is now clean. Every route
+that can return another identity's data carries `require_operator`:
+
+```
+POST /api/operator/search      OPERATOR+LOGGED
+POST /api/operator/identity    OPERATOR+LOGGED
+POST /api/operator/access-log  OPERATOR+LOGGED
+POST /api/registry             OPERATOR+LOGGED
+```
+
+Everything else is own-identity or unauthenticated-by-design: `/api/me`,
+`/api/me/access-log`, `/api/wallet/{nonce,bind,cancel}`, `/api/passkey/{list,
+revoke}` scope to `current(request)`; `/api/passkey/login/{begin,complete}`,
+`/login`, `/callback`, `/logout`, `/config.js` are the login surface and return
+only the caller's own display name; `/api/dev/*` is dev-gated and own-identity
+except `reset`, which is additionally disposable-marker-gated. **The R3
+acceptance criterion is met.** The residual is attribution, not authorization —
+new Medium #2.
+
+#### High #2 — RESOLVED
+
+The cursor is composite and the ordering, the predicate and the index all agree:
+
+```
+_ORDER  = ORDER BY at COLLATE "C" DESC, id DESC
+_KEYSET = (at COLLATE "C" < %s OR (at COLLATE "C" = %s AND id < %s))
+index   = ix_access_log_at (at COLLATE "C" DESC, id DESC)
+```
+
+This is the part I most expected to break and could not. I planted five rows at
+one byte-identical timestamp and walked the pager at every page size where the
+boundary can fall inside the tie group:
+
+```
+planted 5 rows all at at = 2026-07-27T00:05:18.551396+00:00
+limit=1: reached 5/5    limit=2: 5/5    limit=3: 5/5    limit=4: 5/5
+subject's own view (RLS-scoped), limit=1: total 5, 5 reachable
+```
+
+I confirmed the old form really would have lost them — `count(*) WHERE at
+COLLATE "C" < <cursor>` returns 0 for the tie group, so an `at`-only cursor
+skips all four survivors. `total` is reported and is RLS-correct in the subject
+view (counts only that subject's rows). The index is genuinely used: page 1
+plans as `Index Scan using ix_access_log_at` with **no Sort node**, which is the
+`COLLATE "C"` mismatch the R1 review caught on the sweep indexes, avoided here.
+
+#### High #3 — RESOLVED
+
+```
+search "Zzsearchable" -> 1 result,  2 log rows (search + search_result)
+search "%"            -> 5 results, 6 log rows
+subject's own /api/me/access-log gained exactly 1 entry, action=search_result
+result fields: ['id','display_name','verified_at']   birthdate: absent   fin_hmac: absent
+zero-result query    -> 1 log row (the query itself is still recorded)
+```
+
+Suppression attempts failed. The per-result loop runs before the response is
+returned, so a failure mid-loop 500s the request with some subjects already
+logged — over-logging, the safe direction. A query matching nothing still writes
+the `search` entry, so probing for absence stays visible. `%` no longer buys
+un-attributed disclosure: every surfaced person now gets a row naming them.
+
+#### Medium #1 — PARTIAL
+
+Provenance is enforced; freshness is not. Both halves reproduced on one session:
+
+```
+auth_method=passkey -> POST /api/operator/identity   403
+auth_method=passkey -> POST /api/registry            403
+auth_method=fayda, auth_at=2020-01-01 -> POST /api/operator/identity  200
+same session        -> POST /api/passkey/register/begin  403 "verify with Fayda again"
+```
+
+So the asymmetry is narrowed but inverted rather than closed: a six-year-stale
+Fayda session is still too weak to add a passkey and strong enough to read a
+stranger's record. A stolen operator cookie retains full compliance powers for
+the session's 12 hours. I am not asking for `FRESH_AUTH_SECONDS` on every
+lookup — that would make a day of compliance work unusable — but the gap between
+the two gates is now a deliberate choice that should be written down, and a
+step-up on the bulk routes (`/api/registry`, `%` searches) would cost little.
+
+#### Medium #2 — RESOLVED
+
+```
+after revoke_operator -> POST /api/operator/identity   403   (per-request, no caching)
+tombstone row: {granted_by: 'audit-r3', revoked: True}       (the row survives)
+after re-grant        -> 200,  revoked_at back to NULL
+grant + revoke        -> 2 access_log rows (grant_operator, revoke_operator)
+```
+
+Authority is now part of the same trail as the lookups. Two residual nits, both
+Low and both below: the grant is committed before it is logged, and `actor_id`
+carries free text for these two actions.
+
+#### Medium #3 — RESOLVED
+
+Re-run with one isolated connection per probe and the catalog re-read after each.
+Both triggers are `tgenabled='A'`. Every non-DDL vector is refused:
+
+```
+UPDATE                                        refused (append-only)
+DELETE                                        refused (append-only)
+TRUNCATE                                      refused (append-only)
+TRUNCATE CASCADE                              refused (append-only)
+session_replication_role=replica + DELETE     refused (append-only)   <- was the bypass
+session_replication_role=replica + UPDATE     refused (append-only)
+session_replication_role=replica + TRUNCATE   refused (append-only)
+INSERT ... ON CONFLICT DO UPDATE              refused (append-only)
+MERGE ... WHEN MATCHED THEN DELETE            refused (append-only)
+DELETE / TRUNCATE as fayda_app                refused (InsufficientPrivilege)
+fayda_app SET session_replication_role        refused (InsufficientPrivilege)
+TRUNCATE identities CASCADE                   succeeded, access_log untouched (no FK path)
+```
+
+`MERGE` and `TRUNCATE identities CASCADE` are mine, not in the test suite, and
+both hold. Only DDL still gets through — `ALTER TABLE ... DISABLE TRIGGER`
+(named, `ALL`, and `USER`), `DROP TRIGGER`, `DROP FUNCTION ... CASCADE`,
+`CREATE RULE ... DO INSTEAD NOTHING`, `DROP TABLE` — which is exactly the line
+the code comment draws. Worth one sentence in that comment: the `CREATE RULE`
+variant is the only bypass that is **silent**, since the `DELETE` reports success
+and the rows are gone with no exception raised, whereas every other route leaves
+either an error or a visibly altered catalog.
+
+#### Medium #4 — PARTIAL
+
+The index half is fixed and is genuinely effective (see High #2 — `Index Scan`,
+no `Sort`). The growth half moved sideways rather than forward:
+
+```
+EXPLAIN SELECT count(*) FROM access_log
+  Aggregate -> Seq Scan on access_log
+```
+
+Both readers now run that unindexed `count(*)` on **every** call, including
+`GET /api/me/access-log`, which any authenticated session can hit in a loop with
+no rate limit. Previously the cost was one seq-scan-plus-sort of a page; now the
+page itself is an index scan but every call additionally counts the whole table,
+and under `access_log_about` that count evaluates the RLS policy per row. On a
+never-swept table the cost still grows without bound, and it now grows on the
+cheapest, least-privileged endpoint.
+
+On the explicit question of deferring retention to R6: **deferring retention is
+right and I would not change it** — a log that prunes itself is not an audit log,
+and the R3 rationale ("a compromised app cannot quietly erase its own tracks")
+argues against a sweeper. But retention and this are different decisions.
+Rate-limiting `/api/me/access-log`, or replacing the exact `count(*)` with an
+approximate or cached total, needs no retention policy and is what actually
+bounds the cost. Note also that reading the log writes to the log
+(`read_access_log`), so paging a large log is self-amplifying — bounded and by
+design, but it means the table's growth rate is not purely a function of
+lookups.
+
+#### Medium #5 — RESOLVED
+
+`identity_full` selects explicit columns and `find_identities` dropped
+`birthdate`. Verified over HTTP: the operator record carries
+`id, display_name, birthdate, verified_at, last_seen_at, bindings` with no
+`fin_hmac`, and bindings carry no `proof_sig` / `proof_message` / `proof_nonce`.
+Search results carry `id, display_name, verified_at` only. A future column added
+to `identities` can no longer leak in via `*`.
+
+#### L2 — RESOLVED
+
+The replacement walks `app.app.routes` and `inspect.getsource`, so a route
+calling `store.grant_operator(...)` now fails it — I re-confirmed the old form
+passed that exact case. One limitation worth knowing: it inspects only the
+endpoint function's own source, so a route calling a module-level helper that
+grants would still slip through. One level deep, not transitive.
+
+#### L5 — PARTIAL
+
+`frontend/src/App.jsx` now fetches `/api/me/access-log` and renders entries and
+total, so the control is reachable from the product. The second half stands: the
+subject sees `actor_id`, a bare identity UUID, so they learn *that* someone
+looked and never *who*.
+
+#### L1, L3, L4, L6, L7 — OPEN, unchanged
+
+`MIN_REASON_CHARS` is still 8 and length-only (`"aaaaaaaa"` passes).
+`operators` still has no `ENABLE ROW LEVEL SECURITY` and is still
+`GRANT SELECT`-ed to `fayda_app`. `subject_id` is still unvalidated free text.
+Nothing refuses an operator grant on a `DEMO_MODE` deploy where any visitor can
+claim a persona. `t.py:1046` still grants `me_id` with no teardown (test 38 does
+revoke its own `newbie`, but not this one).
+
+---
+
+### New this review
+
+#### Medium #1 (new) — `revoked_at` is never added to an existing `operators` table, so any database that ran the earlier R3 cut breaks on every operator route
+
+**Location:** `backend/store.py:115-125` (the `CREATE TABLE IF NOT EXISTS`),
+`backend/store.py:811` (`is_operator`), against
+`backend/store.py:490` (the `address_norm` precedent).
+**Confidence:** certain — reproduced.
+**Invariant strained:** the schema's own in-place-migration rule.
+
+`CREATE TABLE IF NOT EXISTS operators (... revoked_at TEXT)` adds nothing to a
+table that already exists, and no `ALTER TABLE operators ADD COLUMN IF NOT
+EXISTS revoked_at` was added beside it. Reproduced by simulating the previous
+shape inside a rolled-back transaction:
+
+```
+simulated old-shape operators: ['identity_id','granted_at','granted_by','note']
+after _create_schema():        ['identity_id','granted_at','granted_by','note']
+revoked_at restored?  False
+is_operator's query:  UndefinedColumn: column "revoked_at" does not exist
+```
+
+Every operator route then 500s, and `grant_operator`'s `ON CONFLICT DO UPDATE
+SET revoked_at = NULL` fails too — so the fix for Medium #2 is what breaks. It
+fails closed (no data is served), which is why this is Medium and not High, but
+it is an outage on any database carrying the intermediate schema, and it is
+silent until someone tries to use compliance access.
+
+The codebase already solved exactly this, one screen away: `address_norm` is
+added by a separate `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` whose comment
+says "Adding it separately (rather than in the CREATE TABLE) is what lets a
+database created before this change migrate in place." The same two lines are
+what `revoked_at` needs. Today's dev database only has the column because
+`t.py`'s `reset()` drops and recreates the table.
+
+#### Medium #2 (new) — `/api/registry` discloses every name↔wallet pair under a single `subject_id = NULL` entry; High #3's fix was not applied to its sibling
+
+**Location:** `backend/app.py` (`api_registry` calls `require_operator(...,
+"list_registry")` with no `subject_id`), `backend/store.py:1238` (`registry()`
+does not select `i.id`).
+**Confidence:** certain — reproduced.
+**Invariant strained:** R3 claim 4 ("a subject sees who looked at them").
+
+High #3 was raised because search returned N people under one subject-less log
+line. That is now fixed for search and left in place on the route that discloses
+strictly more — `registry()` returns every bound identity's `display_name`,
+`verified_at` and both active wallet addresses, which is the name↔wallet join
+itself.
+
+```
+operator POST /api/registry -> 200, identities disclosed with ['display_name','verified_at','evm','solana']
+log rows written: 1     entry: action=list_registry  subject_id=None
+that person's own /api/me/access-log, entries mentioning it: []
+```
+
+So an operator wanting the full mapping without notifying anyone now has exactly
+one route left, and it is the one that returns the most. The reviewer can still
+see "operator X listed the registry at time T for reason R", which is why this is
+Medium and not a re-raise of High #1 — but the subject-visibility control is
+defeated for the most sensitive field set in the system, and R4 attaches money to
+that field set. The fix is the same shape as the search fix: add `i.id` to
+`registry()`'s projection and write one `list_registry_result` row per identity
+returned.
+
+#### Low (new) — a malformed cursor silently rewinds to page 1 instead of erroring
+
+`backend/store.py:884-888`. `_cursor_parts` returns `None` whenever either half
+is empty, and both readers then fall through to the unfiltered branch. Verified:
+
+```
+before='garbage'  -> 200, newest page   before='abc|'  -> 200, newest page
+before='|'        -> 200, newest page   before='|abc'  -> 200, newest page
+before="'; DROP TABLE access_log;--" -> 200, newest page   (no injection; parameterised)
+before='9999-99-99|zzz' -> 200, correct (parses, matches everything)
+NUL in cursor     -> 400
+```
+
+A reviewer or client paging with `while cursor:` and a truncated cursor loops on
+the head of the log forever and never reaches the older entries — which is the
+same "cannot reach the old entry" outcome High #2 existed to prevent, arrived at
+by a different route. A 400 on an unparseable cursor is the right failure.
+
+#### Low (new) — `grant_operator` commits the grant before it logs it
+
+`backend/store.py:817-833`. The `with conn()` block closes (and commits) and
+*then* `log_access` is called. Every other path in R3 deliberately logs first and
+lets the write fail the operation; this one inverts it, so a `log_access` failure
+leaves a granted operator with no record of the grant. `revoke_operator` has the
+same shape. Low because the CLI is the only caller and a failure is visible on
+the console, but it is the one place the diff's own stated rule is not followed.
+
+#### Low (new) — `actor_id` now carries free text, and the CLI actor is still unidentified
+
+`backend/store.py:830,841`. `log_access(actor_id=granted_by, ...)` writes the
+literal `"cli"` (or `"t.py"` under test) into a column that holds identity UUIDs
+everywhere else. Confirmed in the live log: `actor=t.py`. A reviewer filtering or
+joining on `actor_id` gets a mixed-domain column, and "who ran the CLI" — the
+original half of Medium #2 — is still unanswerable.
+
+#### Low (new) — the route-source test is one level deep
+
+`backend/t.py:1055-1064`. See L2 above: it reads each endpoint's own source only.
+A granting route that delegates to a helper passes.
+
+---
+
+### Verified safe (re-attacked this round, held)
+
+- **Exhaustive route enumeration** by walking `app.app.routes` with
+  `inspect.getsource`: four cross-user routes, all `require_operator`-gated and
+  logged; everything else own-identity or login surface. No gap.
+- **Keyset paging under exact timestamp ties** at limits 1-4, in both the
+  operator view and the RLS-scoped subject view; `total` is honest and
+  RLS-correct.
+- **The append-only guarantee against every non-DDL vector**, including
+  `session_replication_role=replica` for all three verbs, `MERGE ... WHEN
+  MATCHED THEN DELETE`, `INSERT ... ON CONFLICT DO UPDATE`, `TRUNCATE CASCADE`,
+  and `TRUNCATE identities CASCADE` (no FK path to `access_log`, confirmed).
+  `fayda_app` cannot even set `session_replication_role`.
+- **Per-request operator revocation** — a revoked operator's live session is
+  refused on the next call; re-granting restores it; the tombstone survives both.
+- **Search cannot be made to disclose without attribution** — zero-result
+  queries still log, `%` logs every surfaced subject, and a mid-loop failure
+  over-logs rather than under-logs.
+- **Passkey sessions are refused operator powers** on both `/api/operator/*` and
+  `/api/registry`.
+- **No injection through the cursor** — `before` is parameterised; a SQL payload
+  is treated as an unparseable cursor, and a NUL is a 400.
+- **R1/R2 untouched**: the three original RLS policies are unchanged, the new
+  `FOR SELECT` policy still confines a subject to their own rows, and `reset()`
+  still drops both new tables inside the one `CASCADE` statement.
+
+---
+
+### Verdict
+
+All three Highs are genuinely fixed, and two of them — the composite-cursor
+paging and the `ENABLE ALWAYS` triggers — are fixed properly rather than
+narrowly: I attacked them with cases the test suite does not cover (`MERGE`,
+`TRUNCATE ... CASCADE`, four page sizes against a planted timestamp collision,
+cascade from a parent table) and they held. The route surface is now exhaustively
+accounted for, which was the R3 acceptance criterion.
+
+What is left is smaller and of a different kind. One is an outage waiting on any
+database that carried the intermediate schema (`revoked_at` never migrates in
+place) — fail-closed, but silent until someone needs compliance access. The other
+is that the fix for High #3 was applied to search and not to `/api/registry`,
+which discloses more; the reviewer still sees the access, but the subject does
+not. Neither blocks R4, and both are small changes.
+
+**Verdict: yes — safe to build R4 on, once the `revoked_at` migration is added.
+New criticals: 0, new highs: 0.**
+
+---
+## Audit — 2026-07-26 (R3: operator/compliance role + append-only access log)
+
+**Scope:** the uncommitted working tree on top of `5809c04` only — `git diff` of
+`backend/app.py` (`require_operator`, `/api/operator/search`,
+`/api/operator/identity`, `/api/operator/access-log`, `/api/me/access-log`),
+`backend/store.py` (the `operators` and `access_log` tables, the
+`access_log_append_only()` trigger, the `p_access_log_subject` policy, the new
+GRANT/REVOKE lines, `is_operator` / `grant_operator` / `revoke_operator` /
+`log_access` / `access_log_all` / `access_log_about` / `find_identities` /
+`get_identity_privileged` / `identity_full`, the extended `reset()` DROP list,
+the `grant-operator` and `revoke-operator` CLI), and `backend/t.py` tests 33-36.
+R1 and R2 are committed; I re-attacked them only where R3 touches them.
+
+**Method:** read every hunk, then attacked a **fresh uvicorn booted from the
+current tree** on `127.0.0.1:8322` (`APP_ENV=dev`, real Supabase dev project) —
+the long-running :8000 server has no `--reload` and can serve stale code. Three
+personas were signed in through the real Fayda mock flow; one was granted
+operator via `store.grant_operator` exactly as the CLI does. Database-layer
+claims (the trigger, the policy, the GRANTs) were attacked with raw `psycopg` as
+both the connected owner role (`current_user=postgres`, `rolbypassrls=true`) and
+as `fayda_app`, with savepoints so destructive probes rolled back. Log
+completeness was tested by comparing what each probe *returned* against what
+landed in `access_log` and what the subject could then see. Plans were taken
+with `EXPLAIN ANALYZE` on the live database. No code was modified; the dev
+database carries probe residue (~230 log rows, one `reason` rewritten to prove
+Medium #3, and the operator grant `t.py` itself leaves behind). Every grant I
+created was revoked.
+
+**Counts (this review): 0 critical / 3 high / 5 medium / 8 low.**
+
+The authorization half of R3 holds, and I want that on the record before the
+findings: I could not become an operator through the app, could not read another
+identity's record without the role, could not forge, alter or delete a log row,
+and could not make a refused request write one. What does not hold is the
+**completeness of the trail** — which is the half R4 inherits.
+
+---
+
+### High #1 — `GET /api/registry` returns the identity↔wallet mapping to every authenticated session with no log entry, so an operator just uses it instead of the audited path
+
+**Location:** `backend/app.py:897-907`, `backend/store.py:1238-1266`.
+**Confidence:** certain — reproduced.
+**Invariant broken:** R3 claim 3 ("nothing cross-user without a log entry") and
+the diff's own header comment at `app.py:806-814` ("the only place in the app
+where one person can see another's record").
+
+`/api/registry` predates R3 and contradicts both sentences. It requires only
+`current(request)` — any session, operator or not — and returns, for every
+identity holding an active binding, `display_name`, `verified_at`, and the
+active EVM and Solana addresses. It writes nothing to `access_log`. Reproduced
+against the fresh server:
+
+```
+operator GET /api/registry -> 200
+rows returned: 2
+[{"display_name": "Tesfaye Bekele", "verified_at": "2026-07-26T23:31:17…",
+  "evm": "0x78E814758240D3c4B613289d29E3Ae815A610ae5", "solana": null}, …]
+access_log delta: 0             <-- unlogged cross-user read
+ordinary (non-operator) user -> 200, same 2 rows
+anonymous                    -> 401
+```
+
+The attack is one HTTP GET. An operator who wants to know which wallet a named
+person controls never touches `/api/operator/*`: `/api/registry` gives the
+*name → wallet* join directly, and that join is strictly more sensitive than what
+the audited `/api/operator/search` returns — search has no addresses in it at
+all. The person is never told, because no row bearing their `subject_id` exists.
+
+This is the residual disclosure the R2 fix review accepted as "by design", and in
+R2 it was defensible: every reader was a peer. R3 changes the frame. It creates a
+privileged class whose reads are supposed to be accountable and then leaves the
+most sensitive cross-user join reachable outside the mechanism — so the audited
+path is the *slower* way to do the same thing, which is the one property an audit
+trail cannot survive. R4 attaches financial history to exactly this mapping.
+
+Compounding case: under `DEMO_MODE` any visitor clicks a persona and holds a
+session, so on the demo deploy this directory is effectively public.
+
+---
+
+### High #2 — an operator cannot delete a log entry, but 210 requests push it out of *every* review surface the product has
+
+**Location:** `backend/store.py:823-842` (`access_log_all(limit=200)`,
+`access_log_about(limit=200)`), consumed at `backend/app.py:884` and
+`backend/app.py:894`.
+**Confidence:** certain — reproduced end to end.
+**Invariant broken:** R3 claims 3 and 4. The rows survive; the accountability
+does not.
+
+Neither route takes an offset, a cursor, a date range, or returns a total. The
+only way to read the log through the application is "the newest 200 rows". Only
+operators can write rows, and every write is one cheap POST.
+
+Reproduced: the operator performed one sensitive lookup, confirmed it was visible
+in both views, then issued 210 innocuous lookups of the same subject:
+
+```
+sensitive lookup -> 200, log row 13deb40f-1cd8-47d7-b71b-7a6e5568b97c
+before flooding: operator view (found=True, 16 entries)   subject view (found=True, 6 entries)
+flooded 210 innocuous lookups in 294.7s
+after  flooding: operator view (found=False, 200 entries) subject view (found=False, 200 entries)
+row still in the DB? True          total rows in access_log now: 230
+```
+
+The trigger did its job — the row is still there, byte-identical — and that is
+what makes this worth reporting rather than dismissing: the storage guarantee is
+fully intact while the thing the guarantee exists to provide is gone. Both R3
+claims land on it. Claim 3: the entry exists but no product surface can reach it.
+Claim 4: the subject's own `/api/me/access-log` is capped identically, and the
+flood that buries the entry is aimed at *that same subject*, so it evicts their
+view in the same motion.
+
+Five minutes of a shell loop defeats it, from the one role the entire feature
+exists to hold accountable. Recovering the buried entry needs direct SQL against
+Supabase — precisely the privilege level R3 was built so a reviewer would not
+need.
+
+---
+
+### High #3 — `/api/operator/search` discloses up to 25 complete identity rows per call under a single `subject_id = NULL` log line, and `%` matches everyone
+
+**Location:** `backend/app.py:847-854`, `backend/store.py:845-858`.
+**Confidence:** certain — reproduced.
+**Invariant broken:** R3 claims 3 and 4. The discovery step is structurally
+invisible to the people being discovered.
+
+`find_identities` runs `display_name ILIKE '%' || query || '%'` and returns `id`,
+`display_name`, `birthdate`, `verified_at`, `last_seen_at` for up to 25 people.
+`require_operator` is called with `subject_id=None` and `detail=f"query={q}"`, so
+the log records the *search term* and never the *people returned*.
+
+```
+query='%'   -> 200  results=8  ['Hiwot Girma','Tesfaye Bekele','Meseret Alemu','Unwatched Person', …]
+query='_'   -> 200  results=8  (same)
+query='a%b' -> 200  results=2
+log line: action=search | detail=query=a%b | subject_id=None
+does u1 see the search in their own /api/me/access-log?  []
+```
+
+Two distinct problems:
+
+1. `_clean_token` (`app.py:715`) rejects only NUL and length, so LIKE
+   metacharacters pass straight into the pattern. This is **not** injection — the
+   statement is parameterised — but `query="%"` is a whole-table dump bounded
+   only by `limit=25`, and substring paging covers the remainder. Names and
+   **birthdates** for the entire registry are reachable in a handful of calls,
+   each leaving one uninformative log line.
+2. Search is the *discovery* step: the `id` it returns is exactly the input
+   `/api/operator/identity` requires. So the phase in which an operator decides
+   whom to look at leaves no per-subject trace, and `/api/me/access-log` can
+   never show it — rows with `subject_id IS NULL` fall outside its RLS predicate
+   by construction, not by oversight.
+
+The gap is real, not theoretical: an operator profiling a list of names learns
+name + birthdate + internal id for each, and every one of those people sees
+nothing. Logging the returned ids — one row per result, or the id list in
+`detail`, which is already 500 chars wide — is what closes it.
+
+---
+
+### Medium #1 — operator access requires no Fayda provenance and no freshness, so a stolen cookie or a passkey-only session carries full compliance powers for 12 hours
+
+**Location:** `backend/app.py:819-821` — `require_operator` calls `current()`,
+not `require_fayda_session()`.
+**Confidence:** certain — reproduced.
+**Invariant strained:** non-negotiable #7 and the cooling-period reasoning
+("compromise stays recoverable").
+
+R2 set this project's own rule for a high-consequence action: `app.py:465` gates
+passkey registration on `auth_method == "fayda"` **and** an authentication newer
+than `FRESH_AUTH_SECONDS` (900s). Reading a stranger's national-identity record
+and dumping the entire access log are higher-consequence than adding a
+credential, and they inherit neither gate.
+
+Reproduced on one session, downgraded in place to exactly what a passkey
+return-login produces (`auth_method="passkey"`, no `auth_at`; cookie untouched):
+
+```
+/api/me auth_method now = passkey
+POST /api/passkey/register/begin              -> 403 "verify with Fayda again to add a passkey"
+POST /api/operator/identity (another person)  -> 200  name: Tesfaye Bekele
+POST /api/operator/access-log                 -> 200  (entire log)
+```
+
+The same session is judged too weak to add a passkey to its own account and
+strong enough to read a stranger's record. An attacker holding a stolen session
+cookie — or who has compromised the operator's device passkey — gets the full
+surveillance capability for the session's 12 hours without ever facing Fayda, and
+the victims cannot be warned because of High #3 (search is subject-less) and High
+#2 (volume evicts).
+
+---
+
+### Medium #2 — granting and revoking the operator role happen outside the append-only log, and `revoke_operator` deletes the only evidence the role ever existed
+
+**Location:** `backend/store.py:789-804`; `operators` table at
+`backend/store.py:115-120`.
+**Confidence:** certain — reproduced.
+**Invariant strained:** R3 claim 2 — the log is append-only about the *use* of
+the privilege and entirely mutable about the *grant* of it.
+
+`access_log` records who looked at whom. Nothing records **who was permitted to
+look**. `grant_operator` writes to `operators` (mutable, no RLS, no trigger) and
+`revoke_operator` hard-`DELETE`s the row. Neither writes to `access_log`:
+
+```
+access_log rows written by grant + revoke: 0
+operators table after grant -> revoke:     []
+```
+
+A full grant → look → revoke cycle therefore leaves `access_log` rows pointing at
+an `actor_id` with no recorded authority, and no way for a reviewer to establish
+that the actor was an operator at the time or when they ceased to be one.
+`granted_at` and `granted_by` vanish with the row, and `granted_by` is in any case
+the hardcoded literal `"cli"` (`store.py:1288`), which identifies nobody.
+`ON CONFLICT DO NOTHING` in `grant_operator` also means a re-grant silently keeps
+the original `granted_at`/`note`.
+
+`operators` is likewise the natural target for anyone who reaches the database:
+adding yourself is a single INSERT that leaves no trace anywhere.
+
+---
+
+### Medium #3 — the append-only trigger is row-level only: `TRUNCATE` and `session_replication_role = replica` both get through, as the very role the trigger was written to constrain
+
+**Location:** `backend/store.py:238-258`.
+**Confidence:** certain — every line below was executed against the live
+database (destructive probes inside savepoints, rolled back).
+**Invariant strained:** R3 claim 2 and the comment's own words — "This raises for
+every caller, owner included."
+
+The first clause of that comment is true, the second is not. As the connected
+role (`postgres`, `rolbypassrls=true`, and the table's owner):
+
+```
+UPDATE as owner                            [refused ] RaiseException: access_log is append-only; UPDATE is not permitted
+DELETE as owner                            [refused ] RaiseException: access_log is append-only; DELETE is not permitted
+INSERT … ON CONFLICT (id) DO UPDATE        [refused ] RaiseException: … UPDATE is not permitted
+UPDATE/DELETE/TRUNCATE as fayda_app        [refused ] InsufficientPrivilege
+ALTER TABLE … DISABLE TRIGGER (owner)      [SUCCEEDED] -> UPDATE then set reason='covered up'
+SET LOCAL session_replication_role=replica [SUCCEEDED] -> UPDATE then set reason='replica-rewrite'
+TRUNCATE access_log (owner)                [SUCCEEDED] 230 rows -> 0 in-txn
+DROP TABLE access_log CASCADE (owner)      [SUCCEEDED]
+```
+
+`ALTER TABLE … DISABLE TRIGGER` is acknowledged in the comment and is a fair
+stated limit. The other two are not acknowledged and are materially cheaper:
+
+- **`TRUNCATE` does not fire `FOR EACH ROW` triggers.** One statement, no DDL, no
+  catalog change, and the entire audit trail is gone. A
+  `BEFORE TRUNCATE … FOR EACH STATEMENT` trigger closes it in three lines.
+- **`SET session_replication_role = replica`** suppresses non-`ALWAYS` triggers
+  for the session. It is a plain `SET`, needs no DDL, and reverts at commit — the
+  tidiest possible erasure. `ALTER TABLE … ENABLE ALWAYS TRIGGER` closes it.
+
+Also worth stating: `reset()` (`store.py:648-651`) legitimately `DROP`s
+`access_log`. That path is correctly gated on `APP_ENV=dev` *and* the disposable
+marker, but it means the schema's own recreation path is a supported way to erase
+the log — one more reason the storage guarantee should not be treated as
+absolute. Not reachable through any HTTP route today (nothing runs
+attacker-controlled SQL), which is why this is Medium and not High. It is a gap
+in exactly the defence-in-depth the diff claims to have built.
+
+---
+
+### Medium #4 — `access_log` grows without bound and is never swept, and both read paths seq-scan and sort it; `/api/me/access-log` hands that cost to every authenticated user with no rate limit
+
+**Location:** `backend/store.py:823-842`, `backend/app.py:887-894`; index
+definitions at `backend/store.py:138-139`.
+**Confidence:** certain — `EXPLAIN ANALYZE` on the live database.
+**Invariant strained:** the DoS posture, and the project's own lesson at
+`store.py:175-177` ("the defence gets more expensive the more it is needed").
+
+`sweep_expired` (`store.py:752`) covers `sessions` and `auth_nonces`.
+`access_log` is deliberately never pruned — correct for an audit log — but it was
+given indexes on `subject_id` and `actor_id` and **none on `at`**, which is the
+column both queries order by:
+
+```
+indexes: access_log_pkey(id), ix_access_log_subject(subject_id), ix_access_log_actor(actor_id)
+
+SELECT * FROM access_log ORDER BY at DESC LIMIT 200
+  Limit -> Sort (Sort Key: at DESC) -> Seq Scan on access_log
+
+SELECT at, actor_id, action, reason FROM access_log ORDER BY at DESC LIMIT 200    [as fayda_app]
+  Limit -> Sort (Sort Key: at DESC) -> Seq Scan on access_log
+             Filter: (subject_id = NULLIF(current_setting('app.identity_id', true), ''))
+             Rows Removed by Filter: 12
+```
+
+Both plans read and sort the whole table; the subject query does not even use
+`ix_access_log_subject`. `/api/me/access-log` is a `GET` reachable by **any**
+authenticated session (in `DEMO_MODE`, by any visitor who clicks a persona), it
+is unrate-limited, and its cost grows monotonically with the size of the audit
+trail forever. Same shape as the R1 finding that produced `ix_sessions_expires` /
+`ix_auth_nonces_expires`, now applied to the one table that by design can never
+be trimmed. An index on `at` (in the collation the query actually uses — see L8)
+fixes the sort; `(subject_id, at)` would serve the subject path.
+
+---
+
+### Medium #5 — the operator view hands over another person's `fin_hmac`, the exact field `registry()` withholds by name, plus the full proof material
+
+**Location:** `backend/store.py:872-885` (`identity_full` uses `SELECT *` on both
+tables), returned verbatim at `backend/app.py:875`.
+**Confidence:** certain — reproduced.
+**Invariant strained:** not #1 — the raw FIN is still nowhere, and a user already
+receives their *own* `fin_hmac` via `/api/me`. R3 is the first place one person
+receives *another* person's.
+
+```
+identity keys: ['id','fin_hmac','display_name','birthdate','verified_at','last_seen_at','bindings']
+fin_hmac present: True = 3f51d4a1416f30a318a48288…
+binding keys:  [… 'proof_nonce','proof_sig','proof_message','proof_method','address_norm']
+```
+
+`registry()`'s docstring (`store.py:1240-1245`) states the rule this breaks:
+"fin_hmac is deliberately absent — it cannot re-derive the FIN, but it is a
+stable pseudonymous key that lets any reader correlate one person across every
+row". That is the join key that survives name changes and lets an operator
+correlate this registry against any other dataset derived from the same pepper —
+including R4's transaction history. A compliance operator has no use for it.
+
+`SELECT *` is also why this happened and why it will keep happening: any column a
+future migration adds to `identities` or `wallet_bindings` is disclosed to
+operators automatically, with no diff to review. `registry()` enumerates its
+columns for exactly that reason; the operator path should too.
+
+---
+
+### Low
+
+**L1 — the reason gate is a length check, so `"aaaaaaaa"` is a valid audit
+justification.** `app.py:816-834`. Reproduced: `reason="aaaaaaaa"` → 200,
+`reason="........"` → 200, a multi-line reason is stored verbatim. The comment
+calls this "the difference between an audit trail and a hit counter", and test 34
+(`t.py:1044-1048`) probes only `""`, `"   "` and `"why"` — all of which fail on
+length alone, so the test cannot distinguish a real justification from eight dots.
+Not a security boundary; the finding is that the trail's usefulness rests
+entirely on operator goodwill and neither the code nor the test says so. A
+structured `case_ref` would be the honest version.
+
+**L2 — test 33's "no HTTP route grants operator" assertion cannot fail for the
+case it names.** `t.py:1034`:
+`assert "grant_operator" not in routes.replace("store.grant_operator", "")`. It
+strips the exact substring a real granting route would contain. Verified by
+appending a hypothetical `@app.post("/api/admin/grant")` handler calling
+`store.grant_operator(...)` to the source in memory: the assertion still passes.
+It can only catch a bare `grant_operator(` with no `store.` prefix. Against
+"a test that cannot fail is not a test" (CLAUDE.md conventions). The property
+itself does hold — I enumerated every `store.*` call site in `app.py` by hand —
+which is what the test should do instead.
+
+**L3 — `operators` is the only table in the schema with no RLS, and `fayda_app`
+can read it.** `store.py:259` grants `SELECT ON operators`, and no
+`ALTER TABLE operators ENABLE ROW LEVEL SECURITY` is ever issued (confirmed:
+`relrowsecurity=false` in `pg_class`). Reproduced: under `user_conn(u1)` the
+unprivileged role read the entire operator roster. No current query does this, so
+it is latent — but every other table gained RLS precisely so a forgotten `WHERE`
+could not leak, and the roster of who may surveil is not an obvious exception.
+Writes are correctly refused (`InsufficientPrivilege` on INSERT and DELETE).
+
+**L4 — `subject_id` is unvalidated free text, so an operator can seed the
+permanent log with fabricated subjects.** `app.py:864-871` checks length ≤ 64 and
+NUL only. Reproduced: `identity_id="../../etc/passwd"` → 404 to the caller and a
+permanent `access_log` row with `subject_id='../../etc/passwd'`. Logging
+non-existent subjects is deliberate and right (probing should be visible); the
+gap is that the column is never reconciled against `identities`, so the log can
+be filled with noise nobody can remove — the flip side of append-only.
+
+**L5 — `/api/me/access-log` has no UI, and shows an opaque UUID where a name
+belongs.** Nothing under `frontend/src/` references `operator` or `access-log`.
+The countervailing control that justifies the whole feature ships as an endpoint
+unreachable from the product, and when reached it returns `actor_id` — a bare
+identity UUID — so a subject learns *that* someone looked, never *who*. It is
+also the first place an ordinary user is handed another identity's internal id,
+which `registry()` refuses to do by name (`store.py:1263-1266`: "it is the RLS
+scoping key … it does not belong in a list handed to other users"). Not
+exploitable — RLS binds from the session, never from client input, and I
+confirmed a supplied id grants nothing — but it is the same principle decided
+both ways inside one diff.
+
+**L6 — on a `DEMO_MODE` deploy the operator role is publicly claimable.**
+Identity there is whichever persona button the visitor clicks
+(`mock_esignet.py:248-258` matches the posted `fin` against `PERSONAS`), so
+granting operator to a persona identity — the obvious way to demo R3 — hands
+compliance powers to every visitor. `grant_operator` has no equivalent of
+`mark_disposable`'s target check and no `DEMO_MODE` refusal. Worth a guard
+before R3 is ever demoed.
+
+**L7 — `t.py` grants an operator and never revokes it.** `t.py:1027` grants to the
+first persona's identity with no teardown; the dev database still carried
+`granted_by='t.py'` when I finished. Self-limiting only because test 32's
+`reset()` drops the table on the next run. A suite that leaves a live privilege
+behind on the database it ran against is not the pattern R4 should copy.
+
+**L8 — `at` is TEXT sorted without `COLLATE "C"`, against this codebase's own
+hard-won precedent.** `store.py:827,840`. `promote_due` and `sweep_expired` both
+carry comments explaining that the default collation does not order ISO-8601
+chronologically below one second. The new queries omit it. Checked on live data
+(`datcollate=en_US.UTF-8`): default and `COLLATE "C"` produced identical order
+over 230 rows, and every timestamp carried microseconds, so there is no live
+defect. The latent one: `datetime.isoformat()` drops the microsecond field when
+it is exactly zero (~1 in 10^6 writes), and `'+'` (0x2B) sorts before `'.'`
+(0x2E), so such a row sorts fractionally out of position — invisible except at
+the `LIMIT 200` boundary, which High #2 already makes load-bearing.
+
+---
+
+### Verified safe (actively attacked, held)
+
+These are what I tried hardest to break and could not. Next run should spend its
+budget elsewhere.
+
+- **Nobody becomes an operator through the app.** Enumerated every `store.*` call
+  site in `app.py`: `is_operator`, `log_access`, `find_identities`,
+  `identity_full`, `access_log_all`, `access_log_about` — no grant path, no write
+  to `operators`, no route accepting an identity id for privilege, nothing
+  reachable over HTTP that mutates membership. The property holds; only the test
+  of it is vacuous (L2).
+- **Non-operators and anonymous callers get nothing, and cost nothing.** All
+  three operator routes returned 403 to an ordinary authenticated session and 401
+  to an anonymous one; four sub-threshold reasons returned 400. Across all eight
+  refusals `access_log` grew by **0 rows** — outsiders cannot flood the audit
+  table, and a refused lookup leaves no trace claiming it happened.
+- **Revocation takes effect immediately on a live session.** `is_operator` is
+  queried per request: after `revoke_operator` the same cookie got 403 on the
+  next call, and 200 again after re-granting. No caching, no role carried in the
+  session.
+- **`fayda_app` cannot touch the log or the roster.** `UPDATE`, `DELETE` and
+  `TRUNCATE` on `access_log`, and `INSERT`/`DELETE` on `operators`, all returned
+  `InsufficientPrivilege`. The `REVOKE` is real, not decorative.
+- **The trigger blocks every row-level rewrite as the owner**, including the
+  `INSERT … ON CONFLICT (id) DO UPDATE` smuggling route, and the target row was
+  byte-identical afterwards. (Its limits are Medium #3.)
+- **RLS on `access_log` is real and fails closed.** Under `user_conn(u1)` with no
+  `WHERE` clause at all, the user saw 5 of 10 rows — only rows whose `subject_id`
+  was their own. A user's attempt to INSERT a forged entry naming a different
+  `actor_id` was refused: *"new row violates row-level security policy for table
+  access_log"*. One user cannot read another's entries and cannot fabricate their
+  own. The `FOR SELECT` policy plus RLS default-deny is doing the work.
+- **Log-before-read ordering is correct, and its failure direction is safe.**
+  `log_access` runs in its own transaction and commits before `require_operator`
+  returns; the handler reads afterwards on a separate connection. There is no
+  interleaving in which data is returned and the row is rolled back. The only
+  reachable failure is the opposite — an entry for an access that then 500s —
+  which over-logs rather than under-logs. No attacker-controlled input can make
+  `log_access` fail: `reason` is length- and NUL-checked before the write and
+  `detail` is app-constructed.
+- **Concurrency does not lose entries.** 20 simultaneous `/api/operator/identity`
+  calls returned 20 records and wrote exactly 20 log rows in 64.8s, no 500s and
+  no pool exhaustion, despite three sequential pool checkouts per request
+  (`is_operator`, `log_access`, `identity_full`) against `max_size=12`.
+- **R1/R2 were not regressed.** The new `FOR SELECT` policy lives on a new table
+  and does not interact with the existing `FOR ALL` policies; `p_identities_own`,
+  `p_bindings_own` and `p_credentials_own` are unchanged and still
+  `nullif`-guarded. `reset()`'s DROP list now covers `access_log` and `operators`
+  in the same single `CASCADE` statement, so no foreign key is silently lost (the
+  R2 Medium #2 failure mode), and the disposable-marker gate is untouched.
+- **No cross-origin read of operator responses.** No CORS middleware is
+  registered anywhere in `app.py`; the cookie is `SameSite=Lax` and all three
+  operator routes are `POST`.
+- **The SPA catch-all neither shadows nor exposes the new routes** — not
+  registered in dev at all, and outside dev it 404s everything under `api/`
+  before touching the filesystem.
+- **`at` ordering is correct on live data** — default (`en_US.UTF-8`) and
+  `COLLATE "C"` produced identical orderings over 230 rows (latent caveat: L8).
+- **Every other route was checked for cross-user reach and is genuinely
+  per-identity.** `/api/me`, `/api/wallet/{nonce,bind,cancel}`, `/api/passkey/*`,
+  `/api/dev/fast-forward` and `/api/dev/test-wallet` all scope to
+  `current(request)`. `/api/dev/reset` destroys everyone's data but is dev-gated
+  *and* disposable-marker-gated. `store.credential_by_id` on the passkey login
+  path is cross-identity by necessity (R2, unchanged). `/api/registry` is the
+  sole exception, and it is High #1.
+
+---
+
+### Verdict
+
+The boundary R3 set out to build is sound. Membership is genuinely out of band,
+the check is enforced on every operator route and re-read per request, the
+database refuses to let anyone rewrite or forge a row, and one user cannot see
+another's entries. If the question were only "can someone read a record they
+should not", the answer is no, and the RLS work carried over from R2 is why.
+
+But R3's stated purpose is that *nothing cross-user happens without a trace*, and
+three things break that, all reproduced. An unlogged route returns the same
+identity↔wallet mapping to anyone holding a session. Search discloses up to 25
+people per call while recording none of them. And 210 cheap requests evict any
+entry from both the operator's and the subject's only view of the log. Each is
+individually trivial to execute, and together they mean an operator who wants to
+look at someone unobserved has more than one way to do it — while the honest
+operator's lookups are the ones that show up. R4 hangs financial history off this
+exact boundary, so the trail has to be complete before it is built on, not after.
+
+**Verdict: no — not safe to build R4 on as it stands. New criticals: 0, new
+highs: 3.**
+
+---
+
 ## Fix review — R2, 2026-07-26 (Fayda-gated registration, passkey revoke, `nullif` policies, reset FK, registry minimised, UV at registration, `_json_body`)
 
 **Scope:** only the deltas applied on top of the R2 audit immediately below —

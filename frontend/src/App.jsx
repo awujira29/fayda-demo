@@ -25,7 +25,7 @@ import { loginWithPasskey, registerPasskey, passkeysSupported } from './passkey.
 import { SetupConnector } from './components/SetupConnector.jsx'
 import { EvmRecord, SolanaRecord, CHAINS } from './components/ChainRecord.jsx'
 import { AttestationDialog } from './components/AttestationDialog.jsx'
-import { HistoryLedger, RegistryLedger } from './components/Ledgers.jsx'
+import { HistoryLedger, AccessLedger } from './components/Ledgers.jsx'
 import { Alert } from './components/ui/alert.jsx'
 import { Button } from './components/ui/button.jsx'
 import { Card } from './components/ui/card.jsx'
@@ -73,7 +73,7 @@ function WipeButton({ onConfirm, disabled }) {
 export default function App() {
   const conn = useWalletConnection()
   const [me, setMe] = useState(null)
-  const [registry, setRegistry] = useState(null)
+  const [accessLog, setAccessLog] = useState(null)
   const [passkeyErr, setPasskeyErr] = useState('')
   const [attest, setAttest] = useState(null)
   const [fatal, setFatal] = useState('')
@@ -85,21 +85,17 @@ export default function App() {
   const attestGen = useRef(0)
 
   const load = useCallback(async () => {
-    // Both at once. R2 made the registry authenticated, so a signed-out
-    // visitor's request 401s — swallowed here, because this promise is what
-    // the fatal-error boundary watches and a logged-out landing page must not
-    // report a server failure. Awaiting /api/me first to decide whether to ask
-    // would be tidier, but it serialises two round trips to a managed
-    // database and the page visibly lags behind its own state.
-    const [m, r] = await Promise.all([
+    // R3 removed the registry from this view entirely: it is the cross-user
+    // join (every verified person mapped to their wallets) and now lives
+    // behind the operator role, where each read is written to the access log.
+    // What a signed-in person sees here is their own record, their own
+    // history, and who has looked at them.
+    const [m, log] = await Promise.all([
       api('/api/me'),
-      api('/api/registry').catch(() => null),
+      api('/api/me/access-log').catch(() => null),
     ])
-    // Set together: `me` alone renders the signed-in page against a null
-    // registry, which the ledger states as "the registry is empty" — wrong
-    // rather than merely pending.
     setMe(m)
-    setRegistry(r)
+    setAccessLog(log)
     return m
   }, [])
 
@@ -291,8 +287,15 @@ export default function App() {
 
           {me.authenticated && (
             <>
-              <h2 className="doc-section">Registry</h2>
-              <RegistryLedger identities={registry ? registry.identities : []} />
+              {/* Who has looked at this person's record. The compliance role
+                  can read other people's records; this is how the person read
+                  about finds out. A one-directional capability that nobody
+                  can see is the thing worth being afraid of. */}
+              <h2 className="doc-section">Who has accessed your record</h2>
+              <AccessLedger
+                entries={accessLog ? accessLog.entries : []}
+                total={accessLog ? accessLog.total : 0}
+              />
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button variant="ghost" size="sm" onClick={() => load().catch((e) => setErr(e.message))}>
                   Refresh

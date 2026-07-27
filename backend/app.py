@@ -280,7 +280,18 @@ async def lifespan(app):
     yield
 
 
-app = FastAPI(title="Fayda wallet registry", lifespan=lifespan)
+app = FastAPI(
+    title="Fayda wallet registry",
+    lifespan=lifespan,
+    # No interactive docs outside dev. They are open by default and enumerate
+    # the whole surface — including the operator routes and their request
+    # shapes — to anyone who asks. Nothing here is secret by obscurity, but
+    # publishing a map of the compliance API is not a thing a deployment
+    # should do without deciding to.
+    docs_url="/docs" if DEV_MODE else None,
+    redoc_url="/redoc" if DEV_MODE else None,
+    openapi_url="/openapi.json" if DEV_MODE else None,
+)
 app.add_middleware(ServerSideSessionMiddleware)
 
 # The mock IdP mounts in dev, and in an explicitly opted-in demo deploy.
@@ -803,17 +814,152 @@ def wallet_bind(req: BindReq, request: Request):
     }
 
 
-@app.get("/api/registry")
-def api_registry(request: Request):
-    # R2: the registry stops being public. It was a demo inspector panel over
-    # mock personas; over real Fayda identities it is a directory of verified
-    # Ethiopians and the wallets they control, which is not something to hand
-    # an anonymous caller. Requiring a session also takes the registry-wide
-    # promote_due() off the unauthenticated surface, where it was the cheapest
-    # way to make the server do unbounded work.
-    current(request)
+# ------------------------------------------------------ operator role (R3)
+#
+# The only place in the app where one person can see another's record. Two
+# rules hold it together, and R4's transaction history is built on top of them:
+#
+#   1. Membership is granted out of band, never by an HTTP route.
+#   2. Nothing cross-user is returned until the access is durably logged. The
+#      log write comes FIRST and is allowed to fail the request — a lookup that
+#      answers without leaving a trace is the failure R3 exists to prevent.
+
+MIN_REASON_CHARS = 8
+
+
+def require_operator(request: Request, reason: str, action: str,
+                     subject_id: str | None = None, detail: str = "") -> str:
+    # A Fayda-established session, not merely any session. It made no sense
+    # that a passkey session was too weak to add another passkey but strong
+    # enough to read every identity in the registry — operator powers are the
+    # more sensitive of the two by a wide margin. A passkey is a convenience
+    # for a person reaching their own record; looking at other people's
+    # requires the national-ID check itself.
+    iid = current(request)
+    if request.session.get("auth_method") != "fayda":
+        raise HTTPException(
+            403, "compliance access requires verifying with Fayda in this session")
+    if not store.is_operator(iid):
+        raise HTTPException(403, "this view is restricted to compliance operators")
+    reason = (reason or "").strip()
+    # A required, non-trivial reason is the difference between an audit trail
+    # and a hit counter: "who viewed whom, when" without "why" cannot be
+    # reviewed by anyone afterwards.
+    if len(reason) < MIN_REASON_CHARS:
+        raise HTTPException(
+            400, f"a reason of at least {MIN_REASON_CHARS} characters is required "
+                 f"— it is written to the permanent access log")
+    _clean_token(reason, "reason")
+    if len(reason) > 500:
+        raise HTTPException(400, "reason is too long")
+    # Deliberately NOT wrapped in try/except: if the log cannot be written, the
+    # caller must not get the data.
+    store.log_access(actor_id=iid, action=action, reason=reason,
+                     subject_id=subject_id, detail=detail[:500])
+    return iid
+
+
+class OperatorSearch(BaseModel):
+    query: str
+    reason: str
+
+
+@app.post("/api/operator/search")
+def operator_search(req: OperatorSearch, request: Request):
+    q = (req.query or "").strip()
+    if not q or len(q) > 100:
+        raise HTTPException(400, "search term must be 1-100 characters")
+    _clean_token(q, "query")
+    iid = require_operator(request, req.reason, "search", detail=f"query={q}")
+    results = store.find_identities(q)
+    # One entry per identity the search actually surfaced, not just one for the
+    # query. Logging only the query made the discovery phase invisible to the
+    # people discovered: `%` matches everyone, and no subject would ever see
+    # that their record had been returned. Each subject can now see it in
+    # /api/me/access-log. Written before the results are returned, same rule
+    # as everywhere else here.
+    for r in results:
+        store.log_access(actor_id=iid, action="search_result", reason=req.reason.strip(),
+                         subject_id=r["id"], detail=f"query={q}")
+    return {"results": results}
+
+
+class OperatorView(BaseModel):
+    identity_id: str
+    reason: str
+
+
+@app.post("/api/operator/identity")
+def operator_identity(req: OperatorView, request: Request):
+    iid = (req.identity_id or "").strip()
+    if not iid or len(iid) > 64:
+        raise HTTPException(400, "malformed identity id")
+    _clean_token(iid, "identity id")
+    # Logged BEFORE the read, and logged even when the record turns out not to
+    # exist: an operator probing for which identities are present is itself
+    # something a reviewer should be able to see.
+    require_operator(request, req.reason, "view_identity", subject_id=iid)
+    record = store.identity_full(iid)
+    if not record:
+        raise HTTPException(404, "no such identity")
+    return {"identity": record}
+
+
+@app.post("/api/operator/access-log")
+def operator_access_log(request: Request, before: str | None = None):
+    # Reading the log is itself an access, and is itself logged. Otherwise the
+    # one action an abusive operator most wants to take unobserved — checking
+    # whether anyone is watching — would be the one action nobody records.
+    require_operator(request, "operator reviewing the access log", "read_access_log")
+    try:
+        return store.access_log_all(
+            before=_clean_token(before, "cursor") if before else None)
+    except store.BadCursor as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/me/access-log")
+def my_access_log(request: Request, before: str | None = None):
+    """
+    Who has looked at MY record. The person being surveilled can see the
+    surveillance; without this the log is only ever read by the same office
+    that generates it. Paged, so a burst of activity cannot push an older
+    entry out of the only view its subject has.
+    """
+    try:
+        return store.access_log_about(
+            current(request),
+            before=_clean_token(before, "cursor") if before else None)
+    except store.BadCursor as e:
+        raise HTTPException(400, str(e))
+
+
+class RegistryReq(BaseModel):
+    reason: str
+
+
+@app.post("/api/registry")
+def api_registry(req: RegistryReq, request: Request):
+    # R2 made this require a session; R3 makes it operator-only and logged.
+    # The reason is that this endpoint IS the sensitive cross-user join — a
+    # directory of verified people and the wallets they control — and R3's
+    # rule is that no cross-user visibility ships without an audit entry.
+    # Requiring merely "some session" let an operator read the whole mapping
+    # by the one route that left no trace, which is worse than not having the
+    # audited route at all. An ordinary user now sees their own record, their
+    # own history, and who has looked at them; nothing about anyone else.
+    iid = require_operator(request, req.reason, "list_registry")
     store.promote_due()
-    return {"identities": store.registry(), "cooling_hours": COOLING_HOURS}
+    identities = store.registry()
+    # Per-subject entries, the same rule search follows — and it matters more
+    # here, because this discloses every bound identity's name AND both wallet
+    # addresses in one call. Logging only "someone listed the registry" left
+    # the people listed with nothing in their own view, which made the bulk
+    # route quieter than the narrow one.
+    for row in store.registry_ids():
+        store.log_access(actor_id=iid, action="listed_in_registry",
+                         reason=req.reason.strip(), subject_id=row)
+    return {"identities": identities, "cooling_hours": COOLING_HOURS}
 
 
 @app.get("/api/me")

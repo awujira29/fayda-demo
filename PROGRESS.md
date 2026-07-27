@@ -156,6 +156,73 @@ Ethiopian data-protection rules. Unanswered. Do not integrate before it is.
 
 ## Done
 
+### R3 - Operator role + append-only access log - done 2026-07-26
+
+The first change that lets one person read another's record, so the rule is:
+**nothing cross-user is returned until the access is durably logged.**
+`require_operator()` checks the session, checks membership, demands a
+substantive reason, and writes the log entry — and is deliberately not wrapped
+in try/except, so a failed log write fails the request. A lookup that answers
+without leaving a trace is the thing R3 exists to prevent.
+
+Operator membership is granted by `python backend/store.py grant-operator` and
+by no HTTP route; a route that can grant privilege is a route that can be
+tricked into granting it. Revocation is a tombstone, not a DELETE — hard
+deletion left the log full of entries by an actor with no recorded authority,
+so a reviewer could no longer tell whether the lookups were legitimate at the
+time. Grant and revoke are themselves logged, in the same transaction as the
+change they describe.
+
+**The log is append-only in the database, not by convention.** A trigger
+refuses UPDATE and DELETE for every caller including the table owner the app
+connects as; a second statement-level trigger refuses TRUNCATE (which does not
+fire row triggers, and was the single most effective way to erase everything);
+and both are `ENABLE ALWAYS`, because a plain trigger is skipped whenever
+`session_replication_role = 'replica'` — one statement, no DDL, both guards
+off.
+
+**The subject can see the surveillance.** `GET /api/me/access-log` shows who
+looked at their record, RLS-scoped so it is not a window onto anyone else's.
+The frontend replaces the registry ledger with it. A capability that points one
+way with nobody able to see it is the version worth being afraid of.
+
+**Auditor: 0 criticals, 3 highs, all resolved.** Every one was a case of the
+rule being written but not applied everywhere:
+1. `/api/registry` returned the name→wallet mapping for every bound identity to
+   any authenticated session with **zero** log entries — the most sensitive
+   cross-user join, by the one route that left no trace. Now operator-only and
+   logged; the old GET is gone; ordinary users no longer see a registry at all.
+2. Both log views were capped at `LIMIT 200` with no pagination, so ~210 cheap
+   lookups pushed a sensitive entry out of the only view anyone reads, in both
+   the operator's view and the subject's. Now keyset-paged with the true total.
+   The cursor is `(at, id)`, not `at` — timestamps are not unique (one search
+   writes an entry per result in a tight loop) and an `at`-only cursor skipped
+   every row sharing the last one's timestamp. Test 37 plants five entries at a
+   byte-identical timestamp and walks them one at a time.
+3. Search logged the query but not who it returned, so the discovery phase was
+   invisible to the people discovered — and `%` matches everyone. Now one entry
+   per surfaced identity. The same fix was then needed for the registry, which
+   discloses strictly more (auditor's follow-up round).
+
+Five mediums also fixed: operator powers now require a Fayda-established
+session (a passkey session was too weak to add a passkey yet strong enough to
+read every identity); `revoked_at` migrates in place via ALTER (CREATE TABLE IF
+NOT EXISTS adds nothing to an existing table, so every operator route would
+have 500'd on a pre-existing database — fail-closed but silent until someone
+needed compliance access); TRUNCATE and replica-mode; an index matching the
+paging order; and `identity_full` no longer hands operators the `fin_hmac` that
+`registry()` withholds by name for exactly the same correlation reason.
+
+Also: FastAPI's interactive docs are disabled outside dev — they were open and
+published the whole route table, operator endpoints included.
+
+**Deferred deliberately:** retention/pruning of the access log (a log that
+prunes itself contradicts its own rationale — this is a policy question for the
+NBE/NIDP review, not a code decision) and rate limiting, which is R6. The
+`count(*)` behind each log read is the cost worth watching there.
+
+**Verification:** all 49 checks pass; tests 33-39 are new.
+
 ### R2 - Row-Level Security + passkey return-login + non-public registry - done 2026-07-26
 
 **RLS is enforced by Postgres, not by WHERE clauses.** The catch: the app
@@ -590,10 +657,7 @@ one platform, which collapses persistence, the login layer, and RLS into one dec
 
 ### R2 - Auth + passkey return-login + RLS - DONE 2026-07-26 (see Done)
 
-### R3 - Operator role + immutable access logging
-Privileged role that can look up other identities. Every operator lookup written to
-an append-only access log (who viewed whom, when, why). Mandatory before any
-cross-user visibility ships.
+### R3 - Operator role + immutable access logging - DONE 2026-07-26 (see Done)
 
 ### R4 - Transaction history (F1), behind the operator role
 Combined in-app event timeline + on-chain tx history per bound wallet. Operator-only.

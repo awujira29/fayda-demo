@@ -37,7 +37,13 @@ Correctness properties, not preferences. Breaking any is a bug regardless of wha
    Registering one requires a Fayda-established session (auth_method == "fayda"), so
    a stolen session cannot convert itself into permanent access, and the owner can
    always revoke. Same reasoning as the cooling period: compromise stays recoverable.
-8. **Per-identity data is read and written through store.user_conn().** It switches to
+8. **No cross-user read without an operator check AND an access-log entry.** The
+   log write comes first and is allowed to fail the request: a lookup that answers
+   without leaving a trace is the failure R3 exists to prevent. Operator membership
+   is granted only by backend/store.py, never by an HTTP route. Adding an endpoint
+   that returns another identity's data without going through require_operator()
+   is the way this invariant gets broken.
+9. **Per-identity data is read and written through store.user_conn().** It switches to
    a NOBYPASSRLS role and binds app.identity_id for the transaction, so Postgres row
    policies — not a WHERE clause someone can forget — decide what is visible. The
    privileged store.conn() is for genuinely cross-identity work (the sybil check,
@@ -104,6 +110,21 @@ no gas, no testnet. Keep it that way absent a specific reason to read chain stat
 - New invariants get a test in t.py. A test that cannot fail is not a test.
 - Prefer database constraints over application checks. Do both where it matters.
 - No new dependencies without justification.
+
+## The operator role (R3)
+
+A compliance operator can look up other people's records; nobody else can.
+Membership is granted out of band and never over HTTP:
+
+    python backend/store.py grant-operator <identity_id> "why"
+    python backend/store.py revoke-operator <identity_id>
+
+Every operator read writes to access_log (who, whom, when, why) before the data
+is returned, and the log is append-only in the database — a trigger refuses
+UPDATE, DELETE and TRUNCATE, and is ENABLE ALWAYS so replica mode does not skip
+it. The person looked at can see the accesses about them at
+GET /api/me/access-log; that is the only counterweight to a capability that
+otherwise points one way.
 
 ## Running locally
 

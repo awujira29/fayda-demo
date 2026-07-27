@@ -108,6 +108,41 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
     last_used_at  TEXT
 );
 
+-- R3. Who may look at other people's records. Membership is granted out of
+-- band (backend/store.py grant-operator) and by no HTTP route: an endpoint
+-- that can make someone an operator is an endpoint that can be abused into
+-- making an attacker one.
+CREATE TABLE IF NOT EXISTS operators (
+    identity_id TEXT PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
+    granted_at  TEXT NOT NULL,
+    granted_by  TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    -- Revocation is a tombstone, not a DELETE. Hard-deleting the row left the
+    -- log full of entries by an actor with no recorded authority to make them
+    -- — a reviewer could no longer tell whether the lookups were legitimate
+    -- at the time.
+    revoked_at  TEXT
+);
+
+-- R3. Every operator look at another person's record, recorded before the data
+-- is returned. Binding a national identity to financial history is a
+-- surveillance capability; the log is what makes it accountable, and it is
+-- append-only at the DATABASE (see the trigger in SCHEMA_RLS) rather than by
+-- convention, so a compromised app cannot quietly erase its own tracks.
+CREATE TABLE IF NOT EXISTS access_log (
+    id            TEXT PRIMARY KEY,
+    at            TEXT NOT NULL,
+    actor_id      TEXT NOT NULL,     -- the operator, not FK-bound: the row must
+                                     -- survive the actor's identity being deleted
+    subject_id    TEXT,              -- whose record; NULL for non-subject actions
+    action        TEXT NOT NULL,
+    reason        TEXT NOT NULL,     -- why. Required at the API boundary.
+    detail        TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS ix_access_log_subject ON access_log (subject_id);
+CREATE INDEX IF NOT EXISTS ix_access_log_actor ON access_log (actor_id);
+
 -- Properties of THIS database, as opposed to the process talking to it. The
 -- disposable marker (see reset) lives here because a guard that reads the
 -- caller's own environment is not a guard: the caller sets the environment.
@@ -204,6 +239,59 @@ CREATE POLICY p_credentials_own ON webauthn_credentials
     FOR ALL TO {APP_ROLE}
     USING      (identity_id = nullif(current_setting('app.identity_id', true), ''))
     WITH CHECK (identity_id = nullif(current_setting('app.identity_id', true), ''));
+
+-- R3: the access log is append-only, enforced by the database.
+--
+-- A trigger rather than only a GRANT, because the application connects as the
+-- table's owner: revoking UPDATE and DELETE from {APP_ROLE} does nothing about
+-- the connection that actually runs most statements. This raises for every
+-- caller, owner included. It is not absolute — whoever can ALTER the table can
+-- disable it — but it converts "we promise not to rewrite the audit trail"
+-- into something that has to be deliberately switched off first.
+CREATE OR REPLACE FUNCTION access_log_append_only() RETURNS trigger AS $fn$
+BEGIN
+    RAISE EXCEPTION 'access_log is append-only; % is not permitted', TG_OP;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_access_log_append_only ON access_log;
+CREATE TRIGGER trg_access_log_append_only
+    BEFORE UPDATE OR DELETE ON access_log
+    FOR EACH ROW EXECUTE FUNCTION access_log_append_only();
+
+-- TRUNCATE does not fire row triggers, so the row-level guard above left the
+-- single most effective way to erase the whole log wide open. This one is
+-- statement-level and catches it.
+DROP TRIGGER IF EXISTS trg_access_log_no_truncate ON access_log;
+CREATE TRIGGER trg_access_log_no_truncate
+    BEFORE TRUNCATE ON access_log
+    FOR EACH STATEMENT EXECUTE FUNCTION access_log_append_only();
+
+-- ENABLE ALWAYS, not the default ENABLE: a plain trigger is skipped whenever
+-- session_replication_role is 'replica', which any superuser-ish session can
+-- set for itself — turning both guards off with one statement and no DDL.
+ALTER TABLE access_log ENABLE ALWAYS TRIGGER trg_access_log_append_only;
+ALTER TABLE access_log ENABLE ALWAYS TRIGGER trg_access_log_no_truncate;
+
+-- The reviewer's ordering column, so a growing log does not turn every read
+-- into a full scan and sort.
+-- Matches the paging ORDER BY exactly, tie-break included, so a growing log
+-- does not turn every read into a full scan and sort.
+CREATE INDEX IF NOT EXISTS ix_access_log_at
+    ON access_log (at COLLATE "C" DESC, id DESC);
+
+GRANT SELECT, INSERT ON access_log TO {APP_ROLE};
+REVOKE UPDATE, DELETE ON access_log FROM {APP_ROLE};
+GRANT SELECT ON operators TO {APP_ROLE};
+
+-- A person can see who looked at their record. The surveillance capability R4
+-- builds is one-directional by nature; this is the smallest thing that makes
+-- it observable by the person being surveilled.
+ALTER TABLE access_log ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS p_access_log_subject ON access_log;
+CREATE POLICY p_access_log_subject ON access_log
+    FOR SELECT TO {APP_ROLE}
+    USING (subject_id = nullif(current_setting('app.identity_id', true), ''));
 """
 
 
@@ -433,6 +521,14 @@ def _create_schema(c: psycopg.Connection) -> None:
         if stale:
             c.execute(f"DROP INDEX {name}")
 
+    # CREATE TABLE IF NOT EXISTS adds nothing to a table that already exists,
+    # so a column introduced after the first deploy has to be added explicitly
+    # — exactly as address_norm is above. Without this, a database created
+    # before revocation existed keeps the old shape and every operator route
+    # 500s on UndefinedColumn: fail-closed, but silent until the moment
+    # somebody needs compliance access.
+    c.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS revoked_at TEXT")
+
     # Same migration for the TTL indexes: an earlier cut created them in the
     # default collation, which the sweep's COLLATE "C" predicate cannot use.
     # CREATE INDEX IF NOT EXISTS would leave the useless one in place.
@@ -585,7 +681,7 @@ def reset():
         # weaken the schema it recreates.
         c.execute(
             "DROP TABLE IF EXISTS wallet_bindings, auth_nonces, sessions, "
-            "webauthn_credentials, identities CASCADE"
+            "webauthn_credentials, access_log, operators, identities CASCADE"
         )
         _create_schema(c)
 
@@ -713,6 +809,257 @@ def sweep_expired() -> tuple[int, int]:
             'DELETE FROM auth_nonces WHERE expires_at COLLATE "C" < %s', (cutoff,)
         ).rowcount
     return s, n
+
+
+# --------------------------------------------------- operators + audit (R3)
+
+def is_operator(identity_id: str) -> bool:
+    with conn() as c:
+        return bool(c.execute(
+            "SELECT 1 FROM operators WHERE identity_id = %s AND revoked_at IS NULL",
+            (identity_id,),
+        ).fetchone())
+
+
+def _log_stmt(c: psycopg.Connection, actor_id: str, action: str, reason: str,
+              subject_id: str | None = None, detail: str = "") -> None:
+    """log_access on a caller's connection, so the entry and the change it
+    describes commit or roll back together."""
+    c.execute(
+        """INSERT INTO access_log (id, at, actor_id, subject_id, action, reason, detail)
+           VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+        (str(uuid.uuid4()), iso(now()), actor_id, subject_id, action, reason, detail),
+    )
+
+
+def grant_operator(identity_id: str, granted_by: str, note: str = "") -> None:
+    """Deliberately not reachable over HTTP. See the operators table comment."""
+    # Grant and log in ONE transaction. Elsewhere the log is written first and
+    # allowed to fail the read, because the danger is data escaping unlogged.
+    # A privilege change is the mirror case — logging a grant that then failed
+    # would be its own kind of false record — so atomicity, not ordering, is
+    # what makes this honest.
+    with conn() as c:
+        c.execute(
+            """INSERT INTO operators (identity_id, granted_at, granted_by, note,
+                                      revoked_at)
+               VALUES (%s,%s,%s,%s,NULL)
+               ON CONFLICT (identity_id) DO UPDATE
+                   SET revoked_at = NULL, granted_at = excluded.granted_at,
+                       granted_by = excluded.granted_by, note = excluded.note""",
+            (identity_id, iso(now()), granted_by, note),
+        )
+        # Who was given the power to read other people's records, and when,
+        # belongs in the same trail as the lookups they then make. Without it a
+        # reviewer sees the accesses but not the authority behind them.
+        _log_stmt(c, granted_by, "grant_operator",
+                  note or "operator role granted", identity_id)
+
+
+def revoke_operator(identity_id: str, revoked_by: str = "cli") -> bool:
+    with conn() as c:
+        n = c.execute(
+            "UPDATE operators SET revoked_at = %s "
+            "WHERE identity_id = %s AND revoked_at IS NULL",
+            (iso(now()), identity_id),
+        ).rowcount
+        if n:
+            _log_stmt(c, revoked_by, "revoke_operator",
+                      "operator role revoked", identity_id)
+    return n == 1
+
+
+def cli_actor() -> str:
+    """
+    Identify the human behind a CLI grant. actor_id holds identity UUIDs
+    everywhere else; a bare "cli" left "who did this" unanswerable, which is
+    the one question the log exists for.
+    """
+    import getpass
+    import socket
+    try:
+        return f"cli:{getpass.getuser()}@{socket.gethostname()}"[:200]
+    except Exception:
+        return "cli:unknown"
+
+
+def log_access(actor_id: str, action: str, reason: str,
+               subject_id: str | None = None, detail: str = "") -> str:
+    """
+    Record one access. Raises on failure, and callers must let it — a lookup
+    that returns data without leaving a log entry is precisely what R3 exists
+    to prevent, so failing the request is the correct outcome.
+    """
+    entry_id = str(uuid.uuid4())
+    with conn() as c:
+        c.execute(
+            """INSERT INTO access_log (id, at, actor_id, subject_id, action, reason, detail)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (entry_id, iso(now()), actor_id, subject_id, action, reason, detail),
+        )
+    return entry_id
+
+
+# A page size, not a ceiling on what exists. An unpaginated LIMIT meant an
+# actor could bury an entry simply by generating more: the row stayed in the
+# table but fell off the only view anyone reads, which is eviction from the
+# audit trail in every sense that matters. Both readers below page with a
+# cursor and report the true total.
+LOG_PAGE = 200
+
+# The cursor is (at, id), not at alone. Timestamps are not unique — one search
+# writes an entry per result in a tight loop — and a strict `at < cursor` would
+# skip every row sharing the last row's timestamp, silently dropping entries
+# from the only view anyone reads. That is the same eviction the pagination was
+# added to prevent, just with a smaller window. id breaks the tie.
+_CURSOR_SEP = "|"
+
+
+def _cursor_of(row: dict) -> str:
+    return f"{row['at']}{_CURSOR_SEP}{row['id']}"
+
+
+class BadCursor(ValueError):
+    """A paging cursor that cannot be parsed. Surfaced as a 400."""
+
+
+def _cursor_parts(before: str | None) -> tuple[str, str] | None:
+    if not before:
+        return None
+    at, sep, ident = before.partition(_CURSOR_SEP)
+    if not (sep and at and ident):
+        # Silently falling back to page 1 turns a truncated cursor into an
+        # infinite loop on the head of the log — the reader believes they are
+        # paging while the older entries stay unreachable. Say so instead.
+        raise BadCursor("malformed paging cursor")
+    return at, ident
+
+
+# ORDER BY and the WHERE clause must agree on the tie-break, or paging can
+# revisit or skip rows.
+_ORDER = 'ORDER BY at COLLATE "C" DESC, id DESC'
+_KEYSET = ('(at COLLATE "C" < %s OR (at COLLATE "C" = %s AND id < %s))')
+
+
+def access_log_all(limit: int = LOG_PAGE, before: str | None = None) -> dict:
+    """
+    The operator view of the log. Privileged: it spans every subject. Returns
+    the page plus the total, so truncation is visible rather than silent.
+    """
+    limit = max(1, min(int(limit), 1000))
+    cur = _cursor_parts(before)
+    with conn() as c:
+        total = c.execute("SELECT count(*) AS n FROM access_log").fetchone()["n"]
+        if cur:
+            rows = c.execute(
+                f"SELECT * FROM access_log WHERE {_KEYSET} {_ORDER} LIMIT %s",
+                (cur[0], cur[0], cur[1], limit)).fetchall()
+        else:
+            rows = c.execute(
+                f"SELECT * FROM access_log {_ORDER} LIMIT %s", (limit,)).fetchall()
+        entries = [dict(r) for r in rows]
+    return {"entries": entries, "total": total,
+            "next_before": _cursor_of(entries[-1]) if len(entries) == limit else None}
+
+
+def access_log_about(subject_id: str, limit: int = LOG_PAGE,
+                     before: str | None = None) -> dict:
+    """
+    What a person can see about who looked at them. RLS-scoped, so the policy
+    — not the WHERE clause — is what limits it to their own rows.
+    """
+    limit = max(1, min(int(limit), 1000))
+    cur = _cursor_parts(before)
+    with user_conn(subject_id) as c:
+        total = c.execute("SELECT count(*) AS n FROM access_log").fetchone()["n"]
+        # id is selected so the caller can page, but it is not part of what a
+        # subject learns about the access itself.
+        cols = "id, at, actor_id, action, reason"
+        if cur:
+            rows = c.execute(
+                f"SELECT {cols} FROM access_log WHERE {_KEYSET} {_ORDER} LIMIT %s",
+                (cur[0], cur[0], cur[1], limit)).fetchall()
+        else:
+            rows = c.execute(
+                f"SELECT {cols} FROM access_log {_ORDER} LIMIT %s", (limit,)).fetchall()
+        entries = [dict(r) for r in rows]
+    nxt = _cursor_of(entries[-1]) if len(entries) == limit else None
+    for e in entries:
+        e.pop("id", None)
+    return {"entries": entries, "total": total, "next_before": nxt}
+
+
+def registry_ids() -> list[str]:
+    """
+    The identity ids the registry listing discloses, so each of those people
+    gets an access-log entry. Kept separate from registry() because the ids
+    are for the log, not for the response body.
+    """
+    with conn() as c:
+        return [r["id"] for r in c.execute(
+            """SELECT i.id FROM identities i
+               WHERE EXISTS (SELECT 1 FROM wallet_bindings b
+                             WHERE b.identity_id = i.id AND b.status = 'active')"""
+        ).fetchall()]
+
+
+def find_identities(query: str, limit: int = 25) -> list[dict]:
+    """
+    Operator search. Privileged by definition — this is the cross-user lookup
+    R3 gates. Callers must have logged the access first.
+    """
+    with conn() as c:
+        # No birthdate and no fin_hmac: picking the right record needs a name
+        # and a date of first verification. Search is the discovery step, and
+        # it should hand back the least that lets an operator choose which
+        # record to open — the full record is one audited click away.
+        rows = c.execute(
+            """SELECT id, display_name, verified_at
+               FROM identities WHERE display_name ILIKE %s
+               ORDER BY verified_at DESC LIMIT %s""",
+            (f"%{query}%", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_identity_privileged(identity_id: str) -> dict | None:
+    """
+    Existence check that does not run under RLS — for the CLI, which has no
+    session and therefore no identity to scope to.
+    """
+    with conn() as c:
+        row = c.execute(
+            "SELECT * FROM identities WHERE id = %s", (identity_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def identity_full(identity_id: str) -> dict | None:
+    """
+    One person's record, for an operator. Privileged; log before calling.
+
+    Explicit columns, not SELECT *: fin_hmac is deliberately absent. registry()
+    withholds it because it is a stable pseudonymous key for correlating a
+    person across records, and that reasoning does not stop applying because
+    the reader is an operator — nothing in a compliance review needs it, and a
+    * would have quietly re-added it (and any future column) to this response.
+    Proof signatures are omitted for the same reason: bulky, and not what a
+    reviewer is looking at.
+    """
+    with conn() as c:
+        row = c.execute(
+            """SELECT id, display_name, birthdate, verified_at, last_seen_at
+               FROM identities WHERE id = %s""", (identity_id,)
+        ).fetchone()
+        if not row:
+            return None
+        rec = dict(row)
+        rec["bindings"] = [dict(b) for b in c.execute(
+            """SELECT id, chain, address, status, proof_method, requested_at,
+                      activates_at, activated_at, archived_at
+               FROM wallet_bindings WHERE identity_id = %s
+               ORDER BY requested_at DESC""", (identity_id,)).fetchall()]
+        return rec
 
 
 # ------------------------------------------------------------- webauthn (R2)
@@ -1103,7 +1450,29 @@ if __name__ == "__main__":
     # The only supported way to authorize reset() against a database. Deliberate,
     # explicit, and aimed at one target — never a side effect of running the app
     # or the test suite.
-    if sys.argv[1:2] == ["mark-disposable"]:
+    if sys.argv[1:2] == ["grant-operator"]:
+        # Operator membership is granted here and nowhere else — no HTTP route
+        # creates operators, because a route that grants privilege is a route
+        # that can be tricked into granting it.
+        if len(sys.argv) < 3:
+            print("usage: python backend/store.py grant-operator <identity_id> [note]")
+            sys.exit(2)
+        target = sys.argv[2]
+        init()
+        if not get_identity_privileged(target):
+            print(f"refused: no identity {target}")
+            sys.exit(1)
+        grant_operator(target, granted_by=cli_actor(), note=" ".join(sys.argv[3:]))
+        print(f"granted operator: {target}")
+        print("Every lookup this identity makes is written to access_log.")
+    elif sys.argv[1:2] == ["revoke-operator"]:
+        if len(sys.argv) < 3:
+            print("usage: python backend/store.py revoke-operator <identity_id>")
+            sys.exit(2)
+        init()
+        print("revoked" if revoke_operator(sys.argv[2], revoked_by=cli_actor())
+              else "was not an operator")
+    elif sys.argv[1:2] == ["mark-disposable"]:
         init()
         try:
             target = mark_disposable()
@@ -1114,5 +1483,8 @@ if __name__ == "__main__":
         print(f"marked disposable: {target}")
         print("store.reset() and /api/dev/reset may now drop this database's tables.")
     else:
-        print("usage: APP_ENV=dev python backend/store.py mark-disposable")
+        print("usage: python backend/store.py <command>\n"
+              "  grant-operator <identity_id> [note]   grant compliance access\n"
+              "  revoke-operator <identity_id>         remove it\n"
+              "  mark-disposable                       (APP_ENV=dev) allow reset()")
         sys.exit(2)

@@ -46,33 +46,54 @@ export function HistoryLedger({ history }) {
   )
 }
 
-export function RegistryLedger({ identities }) {
+/**
+ * Who has looked at this person's record (R3). The registry ledger that used
+ * to live here was the cross-user join — every verified person mapped to their
+ * wallets — and moved behind the audited operator role. This replaces it with
+ * the other direction: the surveillance capability, made visible to the person
+ * subject to it.
+ */
+export function AccessLedger({ entries, total }) {
   return (
-    <Card className="p-0 overflow-x-auto">
-      <table className="ledger">
-        <thead>
-          <tr><th>Identity</th><th>Ethereum</th><th>Solana</th></tr>
-        </thead>
-        <tbody>
-          {identities.length ? (
-            identities.map((i) => (
-              <tr key={`${i.display_name}-${i.verified_at}`}>
-                <td data-label="Identity" className="font-ui">{i.display_name}</td>
-                <td data-label="Ethereum" className="max-w-[14rem] break-all">
-                  {i.evm || <span className="text-muted">—</span>}
-                </td>
-                <td data-label="Solana" className="max-w-[14rem] break-all">
-                  {i.solana || <span className="text-muted">—</span>}
+    <>
+      <Card className="p-0 overflow-x-auto">
+        <table className="ledger">
+          <thead>
+            <tr><th>When</th><th>Action</th><th>Stated reason</th></tr>
+          </thead>
+          <tbody>
+            {entries.length ? (
+              entries.map((e, i) => (
+                <tr key={`${e.at}-${i}`}>
+                  <td data-label="When" className="whitespace-nowrap">
+                    {String(e.at).slice(0, 19).replace('T', ' ')}
+                  </td>
+                  <td data-label="Action" className="font-ui">
+                    {e.action === 'view_identity'
+                      ? 'Record opened'
+                      : e.action === 'search_result'
+                        ? 'Returned by a search'
+                        : e.action}
+                  </td>
+                  <td data-label="Stated reason" className="max-w-[22rem]">{e.reason}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={3} className="text-muted">
+                  No one has accessed your record.
                 </td>
               </tr>
-            ))
-          ) : (
-            <tr>
-              <td colSpan={3} className="text-muted">The registry is empty.</td>
-            </tr>
-          )}
-        </tbody>
-      </table>
-    </Card>
+            )}
+          </tbody>
+        </table>
+      </Card>
+      {total > entries.length && (
+        <p className="mt-2 text-[0.8125rem] text-muted">
+          Showing {entries.length} of {total}. Entries are permanent — the log
+          cannot be edited or deleted, including by the operators it records.
+        </p>
+      )}
+    </>
   )
 }
