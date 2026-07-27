@@ -80,7 +80,7 @@ existing wallet must keep working. Do not simplify this into an instant swap.
 | frontend/src/passkey.js | WebAuthn base64url↔ArrayBuffer seam. The only module that touches navigator.credentials. |
 | frontend/src/components/OperatorPanel.jsx | The compliance view (R4). Rendered only for operators; every route it calls re-checks server-side. |
 | backend/verify.py | secp256k1 recovery (EVM), ed25519 verification (Solana) |
-| backend/mock_esignet.py | Throwaway. Deleted in production. |
+| backend/mock_esignet.py | Throwaway. Genuinely deletable in production — app.py imports it only when the mock is mounted (test 45). |
 | backend/t.py | End-to-end tests |
 | frontend/src/wallet/ | THE Privy seam (R2). The only module that may import @privy-io. |
 | frontend/src/App.jsx | State machine + composition; direction contract in its header |

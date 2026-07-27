@@ -41,6 +41,8 @@ returned 404 (`backend/t.py` test 20 pins this).
    | `SUPABASE_DB_URL` | your Supabase connection string (set manually) | Postgres storage (R1). Session-pooler string from the Supabase dashboard. Required — the app refuses to start without it |
    | `CHAIN_EXPLORER_URL` | *(optional)* | Block-explorer endpoint for R4's on-chain history, Etherscan-shaped (`https://api.etherscan.io/v2/api?chainid=1`). Leave unset and the compliance panel reports "no explorer configured" rather than showing an empty history — a distinction it must not blur |
    | `CHAIN_EXPLORER_KEY` | *(optional)* | API key for the above, if the provider needs one |
+   | `FAYDA_CLIENT_PRIVATE_KEY` | required outside dev/demo | PEM of the RSA key whose public JWK is registered with Fayda during partner onboarding. The app refuses to start without it in production: the assertion key must be the registered one, not a per-process key that could never match |
+   | `FAYDA_CLIENT_ID`, `FAYDA_AUTHORIZE_URL`, `FAYDA_TOKEN_URL`, `FAYDA_USERINFO_URL` | for a live IdP | Point the OIDC client at partner.fayda.et. Setting any of them alongside `DEMO_MODE=1` refuses to start — real identities must not sit behind a login any visitor can perform |
 
 4. **Privy dashboard step** (for real wallet connections): at
    [dashboard.privy.io](https://dashboard.privy.io) create an app (free under

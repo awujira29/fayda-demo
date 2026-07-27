@@ -23,6 +23,8 @@ from urllib.parse import urlparse
 import base58
 import httpx
 import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 import nacl.signing
 import psycopg
 import uvicorn
@@ -42,7 +44,6 @@ from pydantic import BaseModel
 from starlette.datastructures import Headers, MutableHeaders
 
 import chain
-import mock_esignet
 import store
 import verify as vf
 
@@ -65,7 +66,8 @@ BASE = os.getenv("BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
 PUBLIC = (os.getenv("PUBLIC_URL")
           or os.getenv("RENDER_EXTERNAL_URL")
           or BASE).rstrip("/")
-CLIENT_ID = os.getenv("FAYDA_CLIENT_ID", "fayda-wallet-demo")
+DEMO_CLIENT_ID = "fayda-wallet-demo"
+CLIENT_ID = os.getenv("FAYDA_CLIENT_ID", DEMO_CLIENT_ID)
 AUTHORIZE_URL = os.getenv("FAYDA_AUTHORIZE_URL", f"{PUBLIC}/authorize")
 TOKEN_URL = os.getenv("FAYDA_TOKEN_URL", f"{BASE}/v1/esignet/oauth/v2/token")
 USERINFO_URL = os.getenv("FAYDA_USERINFO_URL", f"{BASE}/v1/esignet/oidc/userinfo")
@@ -118,9 +120,25 @@ if not DEV_MODE:
 # a login anyone can perform. Nothing prevented that combination, so make it
 # structural rather than a line in DEPLOY.md — same shape as the secrets guard
 # above, and it fails at boot rather than after real people have registered.
+# Whether this process serves the mock identity provider at all. CLAUDE.md says
+# mock_esignet.py is "deleted in production", and until now that was not true:
+# app.py imported it at module scope for the client keypair, so a deployment
+# that actually removed the file could not boot. Importing it only when it is
+# mounted makes the documented posture real, and a production image can drop
+# the throwaway IdP entirely.
 if DEMO_MODE and not DEV_MODE:
+    # The private key and the client id belong to the same list as the URLs:
+    # each is issued by partner onboarding, and the key is the one credential
+    # that cannot be rotated without going back to Fayda. Checking only the
+    # URLs let the most sensitive of them onto a deploy where anybody can log
+    # in with a persona.
+    #
+    # Checked BEFORE the mock is imported, so a dangerous configuration is
+    # refused on its own terms rather than incidentally failing on a missing
+    # module — the operator needs to read why, not what went wrong second.
     _live = [n for n in ("FAYDA_AUTHORIZE_URL", "FAYDA_TOKEN_URL",
-                         "FAYDA_USERINFO_URL") if os.getenv(n)]
+                         "FAYDA_USERINFO_URL", "FAYDA_CLIENT_PRIVATE_KEY",
+                         "FAYDA_CLIENT_ID") if os.getenv(n)]
     if _live:
         raise RuntimeError(
             "refusing to start: DEMO_MODE publishes the mock identity provider, "
@@ -128,6 +146,10 @@ if DEMO_MODE and not DEV_MODE:
             "Real identities must not sit behind a login any visitor can perform. "
             "Unset DEMO_MODE for a live deployment."
         )
+
+MOCK_IDP = DEV_MODE or DEMO_MODE
+if MOCK_IDP:
+    import mock_esignet
 
 # Dev-only fallback so the demo runs with zero setup. NEVER reached in production
 # because the guard above hard-stops a non-dev start with these unset.
@@ -140,10 +162,64 @@ if DEMO_MODE and not DEV_MODE:
 SESSION_SECRET = SESSION_SECRET or secrets.token_hex(32)
 FIN_PEPPER = (_PEPPER_HEX or secrets.token_bytes(32).hex()).encode()
 
-CLIENT_PRIVATE_KEY, CLIENT_PUBLIC_KEY = mock_esignet.generate_client_keypair()
-mock_esignet.CLIENT_PUBLIC_KEY = CLIENT_PUBLIC_KEY
-mock_esignet.TOKEN_ENDPOINT = TOKEN_URL
-mock_esignet.EXPECTED_CLIENT_ID = CLIENT_ID
+# The RSA key that signs the private_key_jwt client assertion — how Fayda
+# authenticates this relying party.
+#
+# R5 readiness: this used to come from mock_esignet.generate_client_keypair(),
+# a FRESH key per process. Against real Fayda that can never work: onboarding
+# registers one public JWK, and a key regenerated every boot (and differing
+# between instances) would fail token exchange on the first request. The
+# roadmap's claim that "only mock_esignet.py changes" was wrong on this point.
+# A registered key therefore comes from the environment, and the ephemeral one
+# remains only for dev and the persona demo, where the mock IdP verifies
+# against whatever this process generated.
+_CLIENT_KEY_PEM = os.getenv("FAYDA_CLIENT_PRIVATE_KEY", "").strip()
+if _CLIENT_KEY_PEM:
+    # PARSE it here, do not merely check that the variable is non-empty.
+    # Truthiness alone let a truncated PEM, the PUBLIC half, an EC key or a
+    # passphrase-protected key boot green and pass the health check, then fail
+    # at the first user's /callback with a message about public keys — the
+    # precise silent-boot failure this whole change exists to remove.
+    try:
+        _parsed = serialization.load_pem_private_key(
+            _CLIENT_KEY_PEM.encode(), password=None)
+    except Exception as e:
+        raise RuntimeError(
+            "refusing to start: FAYDA_CLIENT_PRIVATE_KEY is not a readable "
+            f"unencrypted PEM private key ({type(e).__name__}). It must be the "
+            "RSA private key whose public JWK is registered with Fayda."
+        ) from None
+    if not isinstance(_parsed, rsa.RSAPrivateKey):
+        raise RuntimeError(
+            "refusing to start: FAYDA_CLIENT_PRIVATE_KEY must be an RSA key — "
+            "the client assertion is RS256."
+        )
+    # The client id is issued by the same onboarding as the key, and it goes
+    # into the assertion's iss and sub. Silently defaulting to the demo id
+    # would send a real IdP an assertion claiming to be "fayda-wallet-demo",
+    # which fails at the first login for a reason nothing here would explain.
+    if CLIENT_ID == DEMO_CLIENT_ID:
+        raise RuntimeError(
+            "refusing to start: a registered FAYDA_CLIENT_PRIVATE_KEY is set "
+            f"but FAYDA_CLIENT_ID is still the demo default "
+            f"({DEMO_CLIENT_ID!r}). Set the client id issued with the key."
+        )
+    CLIENT_PRIVATE_KEY, CLIENT_PUBLIC_KEY = _CLIENT_KEY_PEM, None
+elif MOCK_IDP:
+    CLIENT_PRIVATE_KEY, CLIENT_PUBLIC_KEY = mock_esignet.generate_client_keypair()
+else:
+    # Production against a real IdP with no registered key: fail at boot rather
+    # than at the first user's token exchange.
+    raise RuntimeError(
+        "refusing to start: FAYDA_CLIENT_PRIVATE_KEY must be set (the RSA "
+        "private key whose public JWK is registered with Fayda). Only the "
+        "mock IdP accepts a per-process key."
+    )
+
+if MOCK_IDP:
+    mock_esignet.CLIENT_PUBLIC_KEY = CLIENT_PUBLIC_KEY
+    mock_esignet.TOKEN_ENDPOINT = TOKEN_URL
+    mock_esignet.EXPECTED_CLIENT_ID = CLIENT_ID
 
 SESSION_TTL_HOURS = 12
 # A session that has not completed the Fayda round trip holds only oidc_state,
@@ -297,7 +373,7 @@ app.add_middleware(ServerSideSessionMiddleware)
 
 # The mock IdP mounts in dev, and in an explicitly opted-in demo deploy.
 # The /api/dev/* surface is NEVER tied to DEMO_MODE.
-if DEV_MODE or DEMO_MODE:
+if MOCK_IDP:
     app.include_router(mock_esignet.router)
 
 store.init()

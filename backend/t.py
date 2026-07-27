@@ -167,8 +167,22 @@ print("  ", r.status_code, r.json().get("detail","")); assert r.status_code==401
 
 step("13. H1/H2/M3: the whole dev surface 404s when APP_ENV != dev")
 P=8099
+# A production relying party needs its registered client key; the app now
+# refuses to start without one (R5 readiness). Supply one here, as a real
+# deployment would — this test is about the DEV SURFACE being absent, not about
+# the key guard, which test 45 covers.
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa0
+from cryptography.hazmat.primitives import serialization as _ser0
+PROD_CLIENT_KEY = _rsa0.generate_private_key(
+    public_exponent=65537, key_size=2048).private_bytes(
+    encoding=_ser0.Encoding.PEM, format=_ser0.PrivateFormat.PKCS8,
+    encryption_algorithm=_ser0.NoEncryption()).decode()
 srv=server(P, {"APP_ENV":"production","SESSION_SECRET":"s"*32,
-               "FIN_PEPPER":"p"*32,"BASE_URL":f"http://127.0.0.1:{P}"})
+               "FIN_PEPPER":"p"*32,"BASE_URL":f"http://127.0.0.1:{P}",
+               "FAYDA_CLIENT_PRIVATE_KEY":PROD_CLIENT_KEY,
+               # Issued with the key; the app refuses the demo default
+               # alongside a registered key (test 45 covers that guard).
+               "FAYDA_CLIENT_ID":"et-partner-0013"})
 try:
     assert wait_up(P), "production-mode server never came up"
     pb=f"http://127.0.0.1:{P}"
@@ -1699,5 +1713,130 @@ os.environ["T44_TTL"] = "-5"
 assert ch._int_env("T44_TTL", 300) == 300, "a negative TTL was accepted"
 del os.environ["T44_TTL"]
 print("  a malformed cache TTL falls back instead of crashing the boot: ok")
+
+step("45. R5 readiness: the app runs against a real IdP with the mock DELETED")
+# The roadmap said only mock_esignet.py changes for real Fayda. That was wrong
+# in two ways, both of which would have surfaced only at integration time:
+#   1. The client assertion was signed with a keypair generated PER PROCESS, so
+#      the public JWK registered during partner onboarding could never match —
+#      token exchange fails on the first request, and differs per instance.
+#   2. app.py imported mock_esignet at module scope, so the "deleted in
+#      production" posture CLAUDE.md describes could not actually boot.
+# This proves both are fixed, without needing credentials: real URLs, a
+# registered key, and the throwaway IdP physically removed.
+import atexit as _atexit, shutil, tempfile
+prod_dir = tempfile.mkdtemp(prefix="r5ready-")
+# Registered at creation, not after the last assertion: this directory holds a
+# copy of backend/.env, and a failing assertion below would otherwise strand a
+# live database credential in /tmp.
+_atexit.register(shutil.rmtree, prod_dir, True)
+for f in os.listdir(HERE):
+    if f.endswith(".py") and f != "mock_esignet.py":
+        shutil.copy(os.path.join(HERE, f), prod_dir)
+assert not os.path.exists(os.path.join(prod_dir, "mock_esignet.py"))
+if os.path.exists(os.path.join(HERE, ".env")):
+    shutil.copy(os.path.join(HERE, ".env"), prod_dir)
+
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+from cryptography.hazmat.primitives import serialization as _ser
+_k = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+registered_pem = _k.private_bytes(
+    encoding=_ser.Encoding.PEM, format=_ser.PrivateFormat.PKCS8,
+    encryption_algorithm=_ser.NoEncryption()).decode()
+
+prod_env = {
+    "APP_ENV": "production", "DEMO_MODE": "",
+    "SESSION_SECRET": "s" * 32, "FIN_PEPPER": "p" * 32,
+    "FAYDA_CLIENT_PRIVATE_KEY": registered_pem,
+    # The client id is issued alongside the key. Leaving it at the demo default
+    # would send a real IdP an assertion claiming to be "fayda-wallet-demo".
+    "FAYDA_CLIENT_ID": "et-partner-0042",
+    "FAYDA_AUTHORIZE_URL": "https://esignet.fayda.et/authorize",
+    "FAYDA_TOKEN_URL": "https://esignet.fayda.et/v1/token",
+    "FAYDA_USERINFO_URL": "https://esignet.fayda.et/v1/userinfo",
+}
+probe = subprocess.run(
+    [sys.executable, "-c",
+     "import app, sys, jwt;"
+     "print('MOCK_IMPORTED', 'mock_esignet' in sys.modules);"
+     "print('AUTHORIZE', app.AUTHORIZE_URL);"
+     "c = app.client_assertion();"
+     "h = jwt.get_unverified_header(c);"
+     "print('ALG', h['alg']);"
+     "import json,base64;"
+     "p = json.loads(base64.urlsafe_b64decode(c.split('.')[1] + '=='));"
+     "print('AUD', p['aud']); print('ISS', p['iss'])"],
+    cwd=prod_dir, env={**os.environ, **prod_env},
+    capture_output=True, text=True, timeout=120)
+assert probe.returncode == 0, ("production could not boot without the mock",
+                               probe.stdout[-400:], probe.stderr[-600:])
+out = probe.stdout
+assert "MOCK_IMPORTED False" in out, ("the mock was still imported", out)
+assert "AUTHORIZE https://esignet.fayda.et/authorize" in out, out
+assert "ALG RS256" in out, ("client assertion is not RS256", out)
+assert "AUD https://esignet.fayda.et/v1/token" in out, \
+    ("the assertion audience is not the real token endpoint", out)
+# iss/sub carry the REGISTERED client id. An earlier cut printed this and
+# asserted nothing, so it displayed the demo default going to a real IdP while
+# concluding the app was ready.
+assert "ISS et-partner-0042" in out, \
+    ("the assertion does not carry the registered client id", out)
+assert "fayda-wallet-demo" not in out, ("the demo client id leaked into a live "
+                                        "assertion", out)
+print("  boots with mock_esignet.py absent, real URLs, RS256, registered iss: ok")
+
+# The registered key must actually be the one signing — a per-process key would
+# make the registered public JWK useless.
+probe2 = subprocess.run(
+    [sys.executable, "-c",
+     "import app;"
+     "from cryptography.hazmat.primitives import serialization as s;"
+     "k = s.load_pem_private_key(app.CLIENT_PRIVATE_KEY.encode(), password=None);"
+     "import jwt;"
+     "print('VERIFIED', bool(jwt.decode(app.client_assertion(),"
+     "  k.public_key(), algorithms=['RS256'], audience=app.TOKEN_URL)))"],
+    cwd=prod_dir, env={**os.environ, **prod_env},
+    capture_output=True, text=True, timeout=120)
+assert "VERIFIED True" in probe2.stdout, \
+    ("the assertion is not signed by the configured registered key",
+     probe2.stdout[-200:], probe2.stderr[-400:])
+print("  the assertion verifies against the CONFIGURED key, not a fresh one: ok")
+
+# Every misconfiguration below must fail AT BOOT. Each one previously booted
+# green, passed the health check, and failed at the first user's login — which
+# is the failure mode this whole change exists to remove, so each gets a case.
+def boots(env_overrides, drop=()):
+    e = {**os.environ, **prod_env}
+    for k in drop:
+        e.pop(k, None)
+    e.update(env_overrides)
+    return subprocess.run([sys.executable, "-c", "import app"], cwd=prod_dir,
+                          env=e, capture_output=True, text=True, timeout=120)
+
+bad_key_cases = [
+    ("no key at all", {}, ("FAYDA_CLIENT_PRIVATE_KEY",), "FAYDA_CLIENT_PRIVATE_KEY"),
+    ("truncated PEM", {"FAYDA_CLIENT_PRIVATE_KEY":
+                       registered_pem[:len(registered_pem) // 2]}, (), "readable"),
+    ("the PUBLIC half", {"FAYDA_CLIENT_PRIVATE_KEY": _k.public_key().public_bytes(
+        encoding=_ser.Encoding.PEM,
+        format=_ser.PublicFormat.SubjectPublicKeyInfo).decode()}, (), "readable"),
+    ("not a key at all", {"FAYDA_CLIENT_PRIVATE_KEY": "hello"}, (), "readable"),
+    ("demo client id with a real key", {"FAYDA_CLIENT_ID": "fayda-wallet-demo"},
+     (), "FAYDA_CLIENT_ID"),
+]
+for label, override, drop, expect in bad_key_cases:
+    p3 = boots(override, drop)
+    assert p3.returncode != 0, (f"production booted with {label}", p3.stdout[-200:])
+    assert expect in p3.stderr, (f"{label}: unhelpful failure", p3.stderr[-300:])
+print(f"  {len(bad_key_cases)} client-credential misconfigurations all refused at boot: ok")
+
+# A real partner key must never sit on a deploy where anyone can log in with a
+# persona: DEMO_MODE publishes the mock IdP, and the key is the one credential
+# that cannot be rotated without going back to Fayda.
+p4 = boots({"DEMO_MODE": "1"})
+assert p4.returncode != 0 and "DEMO_MODE" in p4.stderr, \
+    ("a registered partner key was allowed onto a DEMO_MODE deploy",
+     p4.stderr[-300:])
+print("  a real partner key is refused on a DEMO_MODE deploy: ok")
 
 print("\n\nALL CHECKS PASSED")

@@ -5,6 +5,294 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Audit - 2026-07-27 — R5 readiness (uncommitted working tree vs 8a154a9)
+
+**Scope:** only the uncommitted diff — `backend/app.py` (+46/-4), `backend/t.py`
+(+98), CLAUDE.md, DEPLOY.md, PROGRESS.md. Nothing else is modified.
+
+**Scope correction.** The brief listed a `backend/verify.py` change
+(`looks_like_address` requiring hex for EVM) as part of this diff. **It is not.**
+`git diff --name-only` returns five files, none of them `verify.py`, and
+`git log -S'0123456789abcdefABCDEF' -- backend/verify.py` puts that change in
+**8a154a9 (HEAD)** — it was committed with R4/F1. It was still re-tested here
+(see Verified safe) but it is not part of what is under review, and R5 readiness
+does not depend on it.
+
+**Method.** No servers started (the machine's port pressure was respected):
+every probe was a short-lived `python -c "import app"` subprocess with a
+synthetic env, plus Starlette's in-process `TestClient` for the HTTP-layer
+checks. Six malformed-PEM shapes were driven through `jwt.encode` directly.
+`store.init()` ran on import as it always does; nothing was reset, no operator
+grant was made, no row was written. No code was modified.
+
+**Counts: 0 critical / 0 high / 3 medium / 7 low.**
+
+Nothing here is attacker-reachable. All three mediums are the same shape: an
+operator misconfiguration that **boots silently and fails at the first real
+user's login** — precisely the failure class this change was written to
+eliminate, left open on three of the four variables that carry it.
+
+---
+
+### Critical
+
+None.
+
+### High
+
+None.
+
+### Medium
+
+#### M1 — `DEMO_MODE` + `FAYDA_CLIENT_PRIVATE_KEY` boots, sets `mock_esignet.CLIENT_PUBLIC_KEY = None`, and 500s every login
+`backend/app.py:165`, `backend/app.py:177-178`, `backend/mock_esignet.py:41,277-285`
+**Confidence: certain (reproduced end-to-end).**
+
+`backend/app.py:165` is `CLIENT_PRIVATE_KEY, CLIENT_PUBLIC_KEY = _CLIENT_KEY_PEM, None`.
+The `if MOCK_IDP:` block three lines later then assigns that `None` straight into
+the mock: `mock_esignet.CLIENT_PUBLIC_KEY = CLIENT_PUBLIC_KEY`. The mock's token
+endpoint verifies with it:
+
+```python
+claims = jwt.decode(client_assertion, CLIENT_PUBLIC_KEY, algorithms=["RS256"], ...)
+except jwt.InvalidTokenError as e:
+```
+
+PyJWT 2.7.0 `RSAAlgorithm.prepare_key(None)` raises **`TypeError: Expecting a
+PEM-formatted key.`** — a builtin, *not* a `jwt.InvalidTokenError`, so the
+`except` does not catch it.
+
+Steps (reproduced):
+1. Deploy the shipped `render.yaml` (`APP_ENV=production`, `DEMO_MODE=1`).
+2. Also set `FAYDA_CLIENT_PRIVATE_KEY` — while staging the R5 cutover, or from a
+   shared Render env group, or because DEPLOY.md:44 introduces the variable and
+   its "required outside dev/demo" qualifier is easy to read past.
+3. The app **boots clean**. No warning.
+4. Any visitor clicks a persona → `POST /v1/esignet/oauth/v2/token` →
+   `500 Internal Server Error` (measured), which `/callback` re-wraps as
+   `502 token exchange failed: Internal Server Error`.
+
+Two problems, one root cause:
+- **Availability:** the demo is 100% dead for every user, with a message that
+  points at nothing.
+- **Secret placement (the real one):** the boot guard at `app.py:130-139` exists
+  specifically to stop real Fayda material from co-existing with a mock IdP that
+  *anyone on the internet can log in through*. It checks the three URL variables
+  and **not** the private key. So the one piece of genuinely irreplaceable
+  partner material — the registered RSA private key — is the one the guard lets
+  through onto a publicly-loginable deploy. The guard's own comment ("Real
+  identities must not sit behind a login any visitor can perform") argues for
+  covering it.
+
+Same breakage in `APP_ENV=dev` with the variable set.
+
+Not a bypass: the exception propagates to a 500 and `/callback` fails closed on
+`status_code != 200`. No key material appears in any body (verified).
+Invariant broken: none of the numbered nine directly — this is the DEMO_MODE
+boot guard failing to cover the variable this diff added.
+
+#### M2 — the key is checked for presence, never for validity; a wrong-but-present PEM boots and fails at the first user's `/callback`
+`backend/app.py:163-175`, `backend/app.py:381-395`
+**Confidence: certain (reproduced).**
+
+`_CLIENT_KEY_PEM = os.getenv(...).strip()` is tested for truthiness only. The PEM
+is never parsed at import — it is first touched inside `client_assertion()`, which
+is first called from `/callback`.
+
+Confirmed boot-clean-then-500 for every realistic wrong key:
+
+| `FAYDA_CLIENT_PRIVATE_KEY` is… | boots? | first login raises |
+|---|---|---|
+| truncated / copy-paste-mangled PEM | **yes** | `ValueError: Unable to load PEM file … MalformedFraming` |
+| a body that is not a key | **yes** | `ValueError: Valid PEM but no BEGIN PUBLIC KEY/END PUBLIC KEY delimiters. Are you sure this is a public key?` |
+| the **public** half | **yes** | `AttributeError: 'RSAPublicKey' object has no attribute 'sign'` |
+| an **EC** key | **yes** | `TypeError: ECPrivateKey.sign() takes 2 positional arguments but 3 were given` |
+| **passphrase-protected** PKCS#8 | **yes** | `TypeError: Password was not given but private key is encrypted` |
+| whitespace only | no — correctly refused | — |
+
+The stated contract of this change, in the code comment at `app.py:169-170`, is
+"fail at boot rather than at the first user's token exchange." For four of the
+five shapes above it does the opposite, and the health check (`healthCheckPath:
+/api/me` in render.yaml) passes throughout, so the deploy is reported green.
+The messages are also misdirecting: a *private*-key variable failing with "Are
+you sure this is a public key?" and an EC key failing with a positional-argument
+`TypeError` will not send anyone to the right env var.
+
+Mitigating: no key material is echoed in any of these messages (checked against
+the supplied bytes, not a substring heuristic), and no traceback reaches the
+client — `debug=True` is not set anywhere, so Starlette's locals-printing 500
+page is off. Notably, a PEM whose newlines have been collapsed to spaces (the
+classic env-var mangling) still signs fine under PyJWT 2.7.0, so that particular
+foot-gun is not one.
+
+#### M3 — `FAYDA_CLIENT_ID` has identical registered-per-partner semantics, has no guard, and silently defaults to `"fayda-wallet-demo"`; test 45's own production config exhibits this and asserts nothing
+`backend/app.py:66`, `backend/t.py:1743-1758`
+**Confidence: certain (reproduced).**
+
+The whole argument for M2's guard is that partner onboarding registers **one**
+value per relying party, so a per-process or defaulted value can never match.
+`CLIENT_ID = os.getenv("FAYDA_CLIENT_ID", "fayda-wallet-demo")` has exactly that
+property and got neither a guard nor a test.
+
+Reproduced with test 45's own env (live `esignet.fayda.et` URLs + a registered
+key, no `FAYDA_CLIENT_ID`) — the app boots and signs:
+
+```
+iss/sub sent to REAL Fayda = 'fayda-wallet-demo' 'fayda-wallet-demo'
+aud = https://esignet.fayda.et/v1/token
+client_id posted in the token form = 'fayda-wallet-demo'
+```
+
+Every token exchange goes to the real IdP claiming to be `fayda-wallet-demo`, and
+is rejected — the same first-real-login failure M2 was written to prevent, from
+the sibling variable.
+
+What makes this a finding rather than a nit is that **test 45 demonstrates it and
+looks away.** `backend/t.py:1758` is `print('AUD', p['aud']); print('ISS', p['iss'])`
+— `AUD` is asserted at line 1766; `ISS` is printed and never asserted. The test
+runs a configuration whose `iss`/`sub` is the hardcoded demo string, prints that
+string, and concludes "R5 readiness". `exp`, `iat` and `jti` are likewise
+unasserted. An assertion on `ISS` would have caught this at authoring time.
+
+### Low
+
+- **L1 — DEPLOY.md:45 documents a guard that does not exist.** The row covering
+  "`FAYDA_CLIENT_ID`, `FAYDA_AUTHORIZE_URL`, `FAYDA_TOKEN_URL`,
+  `FAYDA_USERINFO_URL`" says "Setting **any of them** alongside `DEMO_MODE=1`
+  refuses to start". The guard at `app.py:131-132` lists only the three URLs.
+  Reproduced: `DEMO_MODE=1 FAYDA_CLIENT_ID=real-partner-client` boots, and
+  `app.CLIENT_ID` becomes `real-partner-client`. A doc that promises a structural
+  guarantee the code does not provide is worse than no doc — it is exactly what
+  an operator checks instead of reading the code. *(certain)*
+
+- **L2 — a failing test 45 leaves `backend/.env` in `/tmp`.** `t.py:1730` copies
+  `.env` (158 bytes, mode 0644, holds `SUPABASE_DB_URL` — a live DB credential)
+  into the temp dir; `shutil.rmtree` is at `t.py:1796`, on the **success path
+  only**. Any assert between 1765 and 1795 aborts the suite and strands the
+  credential. `tempfile.mkdtemp` is 0700 so the exposure is same-user, not world
+  — hence Low, not Medium — but t.py is the most-run command in the repo and
+  nothing ever sweeps these. A `try/finally` costs two lines. *(certain)*
+
+- **L3 — the assertion's `iss`/`sub`/`exp`/`jti` are unasserted in test 45.**
+  See M3. The mock covers `iss`/`sub` in dev (`mock_esignet.py:287`), so the
+  production-shaped path is the only one with no coverage — and it is the one
+  the test exists for. *(certain)*
+
+- **L4 — `app.py:166` is `elif DEV_MODE or DEMO_MODE:` where the file already
+  has `MOCK_IDP`.** Functionally identical today, so not a bug. But that branch
+  calls `mock_esignet.generate_client_keypair()`, and the import guarding it
+  (`app.py:127`) is keyed on `MOCK_IDP`. The moment anyone narrows `MOCK_IDP`
+  — e.g. `MOCK_IDP = (DEV_MODE or DEMO_MODE) and not os.getenv("FAYDA_TOKEN_URL")`,
+  a plausible next step — line 166 becomes a `NameError` at import. The invariant
+  is "these two conditions are the same condition"; write it once. *(certain)*
+
+- **L5 — unauthenticated outbound amplification toward the partner IdP, live from
+  R5 on.** `GET /login` (no auth) seeds `oidc_state` and returns it in the
+  redirect; `GET /callback?code=x&state=<that state>` then makes the server
+  perform an RSA-2048 signature and an outbound `POST` to `FAYDA_TOKEN_URL` with
+  a **10-second** timeout, before any credential is validated. Each loop also
+  writes a pre-auth session row. Pre-existing in shape and currently harmless
+  (the mock is in-process, and `PRE_AUTH_SESSION_TTL_HOURS = 0.5` bounds the
+  table), but this diff is what makes `FAYDA_TOKEN_URL` a real third party's
+  endpoint — at which point an anonymous loop is pointing the partner's
+  infrastructure at itself from our IP, with no rate limit anywhere on the path.
+  Worth a bounded retry/rate limit before the cutover, not now. *(likely)*
+
+- **L6 — `aud = TOKEN_URL` is asserted as correct but cannot be verified here.**
+  `client_assertion()` sets `aud` to the token endpoint and `t.py:1766` pins it.
+  RFC 7523 §3 permits the token endpoint URL **or** the issuer identifier, and
+  which one eSignet requires is unconfirmed — the same B1 uncertainty PROGRESS.md
+  correctly flags for the userinfo claim names, not flagged for this. A test that
+  pins an unverified choice reads as confirmation of it. Add it to the
+  credentials-day checklist alongside the claim names. *(worth checking)*
+
+- **L7 — PROGRESS.md:820 "Delete `backend/mock_esignet.py`. Verified to work."
+  contradicts the shipped config.** `render.yaml:17-18` sets `DEMO_MODE=1`, which
+  *requires* the mock; `Dockerfile:22` is `COPY backend/ backend/`, so the image
+  ships `mock_esignet.py` **and** `t.py`. The claim is true only of a future
+  non-demo deploy. The deletion step needs "…and unset `DEMO_MODE`" beside it, or
+  the first person to follow the checklist bricks the running demo. *(certain)*
+
+---
+
+### Verified safe
+
+Actively attacked and could not break — do not re-plough:
+
+- **`MOCK_IDP` gating is complete.** All nine `mock_esignet` references in
+  `app.py` (lines 121, 128, 155, 159, 167, 178-180, 335) are inside
+  `if MOCK_IDP:` / `elif DEV_MODE or DEMO_MODE:` blocks or are comments.
+  Repo-wide grep across `*.py/*.js/*.jsx/*.yaml/*.json` finds no other importer
+  outside `t.py`. **Reproduced: `APP_ENV=production` with `mock_esignet.py`
+  physically absent boots and serves.** The SPA catch-all (`app.py:1310`)
+  explicitly 404s `authorize` and `v1` rather than rendering the shell, so the
+  IdP paths do not silently become HTML when unmounted. No error handler, dev
+  route, or `t.py`-driven path reaches the module when the flag is false.
+- **`CLIENT_PUBLIC_KEY = None` breaks nothing outside M1.** It has exactly two
+  readers: `app.py:178` and `mock_esignet.py:279`. Nothing else in the repo reads
+  it; it is never serialised, returned, or persisted.
+- **The private key never reaches a response.** Checked `/api/me`, `/config.js`,
+  `/`, `/docs`, `/openapi.json` against the actual PEM bytes and against
+  `BEGIN PRIVATE KEY`/`MII` — all clean. `/api/me` unauthenticated returns exactly
+  `{authenticated, cooling_hours, dev, demo, public_origin}`. `docs_url`,
+  `redoc_url` and `openapi_url` are `None` outside dev (`app.py:326-328`). No
+  `logging`/`logger` in `app.py` at all; the single `print` (`app.py:302`, sweep
+  failures) formats only an exception type and message. `debug=True` appears
+  nowhere, so Starlette's frame-locals 500 page — which *would* print
+  `CLIENT_PRIVATE_KEY` — is off. `.dockerignore` still excludes `**/.env`.
+- **Guard ordering is correct, and reproduced.** `DEMO_MODE=1` + a live
+  `FAYDA_TOKEN_URL` + no key raises the **DEMO/live-URL** error, not the key
+  error. That is the right precedence: the URL guard describes a security
+  posture, the key guard describes a missing credential, and reporting the
+  missing credential first would send the operator to supply one for a
+  combination that must never boot regardless.
+- **The empty/whitespace key is handled.** `.strip()` then truthiness →
+  `"   \n  "` correctly falls through to the production refusal.
+- **The key guard fires with the mock present on disk** (the real Docker image
+  layout): `APP_ENV=production`, mock file present, no key → refuses. The guard
+  is not accidentally dependent on the file's absence.
+- **No `alg` confusion on the verifying side.** `mock_esignet.py:277-285` pins
+  `algorithms=["RS256"]` and `options={"require": ["exp","aud","iss","sub"]}`,
+  then checks `iss == sub == client_id`. `alg: none` and HS256-with-the-public-key
+  are both rejected by the pin, and the public PEM is not published anywhere
+  regardless. `aud` is pinned to `TOKEN_ENDPOINT`.
+- **The assertion payload is byte-for-byte unchanged by this diff** — `iss`,
+  `sub`, `aud`, `jti`, `iat`, `exp`, RS256. Only the key *source* moved. No
+  attacker input reaches any claim; all inputs are env vars.
+- **Test 45 is not vacuous.** Reverting either half of the fix makes it fail for
+  the right reason: restoring the module-scope `import mock_esignet` (or the
+  unconditional `generate_client_keypair()` call) makes `import app` raise
+  `ModuleNotFoundError` in a directory that has no `mock_esignet.py`, so
+  `probe.returncode == 0` fails first. `probe3` cannot pass by accident either —
+  with the fix reverted its stderr says `mock_esignet`, not
+  `FAYDA_CLIENT_PRIVATE_KEY`. `probe2`'s `bool(jwt.decode(...))` is non-empty-dict,
+  so it is a real signature check against the configured key's public half.
+- **The dev surface is untouched and correctly *not* widened.** `/api/dev/*`
+  remains gated on `DEV_MODE` alone (`app.py:1195`); `MOCK_IDP` deliberately does
+  not extend to it, preserving "DEMO_MODE mounts the mock IdP but NEVER
+  /api/dev/*". Test 13 still pins the 404s — it now supplies a production client
+  key, which is a legitimate accommodation of the new guard, not a weakening of
+  what it asserts.
+- **`verify.py:96-102` `looks_like_address` (committed in 8a154a9, not this
+  diff).** Re-tested: EIP-55 mixed case, all-lower and all-upper checksummed
+  addresses all accepted; `0x` + non-hex, `0x` + markup at 40 chars, and short
+  input all rejected. It rejects no legitimate EVM address. `0X`-prefixed input
+  is rejected, which is correct — no wallet or checksum scheme emits it. The
+  change is strictly narrowing: nothing is accepted that was not accepted before.
+- **Untouched by this diff, and confirmed untouched:** FIN hashing and the
+  `SAFE_CLAIMS` whitelist, nonce issue/consume, the sybil partial unique index,
+  the cooling period, RLS/`user_conn()`, the operator role and access log. No
+  line of the diff enters any of those paths.
+
+**Verdict: yes, safe to build on — nothing here is attacker-reachable, the
+`MOCK_IDP` gating is genuinely complete (production boots with the mock deleted),
+and the private key never leaves the process; but close M1 and M2 before anyone
+touches real credentials, because all three mediums are silent-boot /
+fail-at-first-login misconfigurations, which is the exact failure this change was
+written to eliminate.**
+
+---
+
 ## Audit - 2026-07-27 — R4/F1 fix review (re-audit of the 2026-07-26 findings)
 
 **Scope:** only the fix deltas on top of the previous run. `git diff` vs `0f9a9ef`

@@ -776,11 +776,69 @@ one platform, which collapses persistence, the login layer, and RLS into one dec
 
 ### R4 - Transaction history (F1), behind the operator role - DONE 2026-07-26 (see Done)
 
-### R5 - Real Fayda credentials
-Replace the mock IdP with live partner.fayda.et integration. External dependency:
-apply for partner credentials. mock_esignet.py is the only thing that should change
-(the OIDC client code is already written against the real contract). Confirm the real
-userinfo claim names against what the mock assumes.
+### R5 - Real Fayda credentials — **BLOCKED** on partner credentials (code now ready)
+
+**Why blocked:** there are no Fayda partner credentials in this environment and
+none can be obtained from here. Verified rather than assumed: no `FAYDA_*` env
+vars are set, `backend/.env` holds only `SUPABASE_DB_URL`, and there is no key
+material anywhere in the repo. Onboarding at partner.fayda.et is an external,
+human process (B1). Faking it — pointing at a stub and calling it live — would
+be worse than not doing it, so the mock stays and this item stops here.
+
+**What I did do, because it did not need credentials: made the claim true.**
+The roadmap said "mock_esignet.py is the only thing that should change (the
+OIDC client is already written against the real contract)." Checked against the
+code, that was **wrong in two ways**, both of which would have surfaced only
+during a live integration, i.e. at the worst possible moment:
+
+1. **The client assertion was signed with a keypair generated per process**
+   (`app.py` called `mock_esignet.generate_client_keypair()` at import). Partner
+   onboarding registers ONE public JWK. A key regenerated every boot — and
+   different on every instance — could never match it, so token exchange would
+   have failed on the very first request. The key now comes from
+   `FAYDA_CLIENT_PRIVATE_KEY`; the ephemeral key remains only for dev and the
+   persona demo, where the mock verifies against whatever this process made.
+   Production without a registered key refuses to boot rather than failing at
+   the first user's login.
+2. **`app.py` imported `mock_esignet` at module scope**, so the posture
+   CLAUDE.md describes — "Throwaway. Deleted in production." — could not
+   actually boot. The import is now conditional on the mock being mounted.
+
+A follow-up audit round found three more of the same species — configurations
+that booted green, passed the health check, and would have failed at the first
+user's login, which is precisely what this change existed to eliminate:
+a malformed key (a truncated PEM, the PUBLIC half, an EC key) was only checked
+for truthiness, so it was never parsed until someone tried to sign;
+`FAYDA_CLIENT_ID` silently kept its demo default, so a real IdP would have been
+handed an assertion claiming to be `fayda-wallet-demo`; and `DEMO_MODE=1`
+alongside a real key booted happily — the guard checked the three URL variables
+but not the one credential that cannot be rotated without going back to Fayda.
+All three now refuse at boot, and the DEMO guard runs before the mock is
+imported so the operator reads why rather than a missing-module error.
+
+Test 45 proves the lot without any credentials: it copies the backend to a temp
+directory **omitting mock_esignet.py entirely**, boots it with real
+`esignet.fayda.et` URLs and a registered key, and asserts the mock was never
+imported, the authorize URL is the real one, the assertion is RS256 carrying
+the *registered* client id with the real token endpoint as its audience, and
+that it verifies against the *configured* key. Then it walks five credential
+misconfigurations and the DEMO_MODE combination, requiring each to be refused
+at boot with a message that names the actual problem.
+
+**What remains for whoever has credentials** — genuinely only configuration
+plus one code check:
+- Set `FAYDA_CLIENT_ID`, `FAYDA_AUTHORIZE_URL`, `FAYDA_TOKEN_URL`,
+  `FAYDA_USERINFO_URL`, `FAYDA_CLIENT_PRIVATE_KEY`; unset `DEMO_MODE` (the app
+  refuses to start if both are set — real identities must never sit behind a
+  login any visitor can perform).
+- Delete `backend/mock_esignet.py`. Verified to work.
+- Confirm the userinfo claim names against the live response. The mock mirrors
+  the official Python client (sub, name, birthdate, gender, phone, picture,
+  residenceStatus, address{kebele,region,woreda,zone}) but that is a reading of
+  a client library, not an observation of the live service — see B1, and
+  `residenceStatus`'s value set is still unconfirmed (B2).
+- L11: the mock's `redirect_uri` check is path-only. It disappears with the
+  mock, but the real IdP's registered redirect URI must be the full origin.
 
 ### R6 - Production hardening
 AML/sanctions screening layer (the Sumsub-style compliance piece), rate limiting on
