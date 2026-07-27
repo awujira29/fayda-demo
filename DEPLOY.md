@@ -26,7 +26,11 @@ returned 404 (`backend/t.py` test 20 pins this).
    **Docker** (it auto-detects `./Dockerfile`) → Instance type: Free. No
    build or start command needed — the Dockerfile carries both (the SPA is
    built in a Node stage; the container starts
-   `uvicorn app:app --host 0.0.0.0 --port $PORT`).
+   `uvicorn app:app --host 0.0.0.0 --port $PORT --no-proxy-headers`).
+   The flag matters: without it uvicorn rewrites the client address from
+   `X-Forwarded-For` before the app sees it, and the rate limiter's key
+   becomes caller-chosen. The app parses that header itself — see
+   `TRUST_PROXY_HEADERS` below.
 
 3. **Environment variables** (Blueprint sets the first four automatically):
 
@@ -142,6 +146,20 @@ configuration, in this order:
    OIDC provider matches it exactly, and a mismatch rejects every login.
 5. Re-run the checks in "Rate limiting behind the proxy" below: the proxy chain
    is what changed.
+
+**The one migration consequence that will surprise people: every registered
+passkey stops working.** A WebAuthn credential is bound to the relying-party
+id, which is the domain — `RP_ID` derives from `PUBLIC_URL` like everything
+else. Moving from `<service>.onrender.com` to a custom domain means the
+authenticator no longer offers the old credentials, and users must re-verify
+with Fayda and register again. There is no way around this; it is how WebAuthn
+scopes credentials, and it is why the domain should be settled before real
+users register. Tell them beforehand rather than letting them discover a
+sign-in that silently offers no key.
+
+Wallet bindings are unaffected — they are proofs already verified and stored,
+not live credentials. Only the *message text* of future signatures changes, to
+name the new domain.
 
 Nothing here is verifiable from a development machine, which is why it is
 written as a procedure rather than claimed as done.

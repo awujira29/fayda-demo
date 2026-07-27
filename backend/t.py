@@ -2303,4 +2303,66 @@ finally:
     try: xs.wait(timeout=10)
     except Exception: xs.kill()
 
+step("56. R7: every browser-facing origin follows PUBLIC_URL, and only PUBLIC_URL")
+# Moving to a custom domain is meant to be one variable. That is only true if
+# EVERY origin-derived value follows it — the OIDC redirect, the authorize URL,
+# the passkey relying-party id, and the origin named in the message a user is
+# asked to sign. A value left deriving from somewhere else does not fail
+# loudly; it produces a wallet prompt naming a different host than the address
+# bar, which is what phishing looks like.
+domain_probe = subprocess.run(
+    [sys.executable, "-c",
+     "import app, verify as vf;"
+     "print('PUBLIC', app.PUBLIC);"
+     "print('REDIRECT', app.REDIRECT_URI);"
+     "print('AUTHORIZE', app.AUTHORIZE_URL);"
+     "print('RPID', app.RP_ID);"
+     "print('MSGURI', vf.URI);"
+     "print('MSGDOMAIN', vf.DOMAIN)"],
+    cwd=HERE, env={**os.environ, "APP_ENV": "dev",
+                   "PUBLIC_URL": "https://registry.fayda.et"},
+    capture_output=True, text=True, timeout=120)
+assert domain_probe.returncode == 0, domain_probe.stderr[-400:]
+got = dict(l.split(" ", 1) for l in domain_probe.stdout.strip().splitlines())
+assert got["PUBLIC"] == "https://registry.fayda.et", got
+assert got["REDIRECT"] == "https://registry.fayda.et/callback", got
+assert got["AUTHORIZE"] == "https://registry.fayda.et/authorize", got
+assert got["RPID"] == "registry.fayda.et", ("the passkey RP id ignores PUBLIC_URL", got)
+assert got["MSGURI"] == "https://registry.fayda.et", \
+    ("the signed message names a different origin than the browser is on", got)
+assert got["MSGDOMAIN"] == "registry.fayda.et", got
+# And none of it may be influenced by a request header — that would let an
+# attacker choose the origin a user is asked to sign for.
+hdr = c.get(f"{B}/api/me", headers={"Host": "evil.example.com",
+                                    "X-Forwarded-Host": "evil.example.com"})
+assert "evil.example.com" not in hdr.text, \
+    "a request header influenced the advertised public origin"
+print("  redirect, authorize, RP id and signed message all follow PUBLIC_URL: ok")
+
+step("57. R6: the production launch flag and the insert gate are pinned in place")
+# Both of these guard against a default that is invisible until it bites, and
+# neither was asserted anywhere — delete the flag from the Dockerfile and the
+# whole suite still passed, because the test harness carries its own copy.
+docker_cmd = open(os.path.join(HERE, "..", "Dockerfile")).read()
+assert "--no-proxy-headers" in docker_cmd, \
+    ("the production CMD lost --no-proxy-headers: uvicorn will rewrite "
+     "scope['client'] from X-Forwarded-For and the rate-limit key becomes "
+     "caller-chosen")
+app_src = open(os.path.join(HERE, "app.py")).read()
+assert "proxy_headers=False" in app_src, \
+    "app.py's uvicorn.run lost proxy_headers=False"
+
+# And the middleware must pass is_new only for a sid it just minted. Test 54
+# pins save_session's contract; this pins the CALLER, which is where the
+# property actually lives — a future edit passing is_new=True unconditionally
+# would reopen the resurrection with 54 still green.
+import inspect as _insp
+mw = _insp.getsource(_app.ServerSideSessionMiddleware)
+assert "is_new=fresh" in mw, \
+    ("the session middleware no longer gates INSERT on a freshly minted sid — "
+     "a request carrying a cookie could re-create a swept session")
+assert "fresh = sid is None" in mw, \
+    "the freshness test is no longer 'this request minted the sid'"
+print("  --no-proxy-headers and the is_new=fresh gate are both asserted: ok")
+
 print("\n\nALL CHECKS PASSED")

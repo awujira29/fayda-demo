@@ -5,6 +5,172 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Closing fix review — R6 round 4, 2026-07-27 (NEW-3, NEW-4 at ddd26d4)
+
+**Scope:** two deltas only — `proxy_headers=False` / `--no-proxy-headers` on every
+launch path, and `save_session(..., is_new=)` with `is_new=fresh` in the session
+middleware. Plus tests 54 and 55.
+
+**Method.** Three fresh uvicorn instances, all terminated: :8155 (unlimited),
+:8156 (limited, `TRUST_PROXY_HEADERS=1`), and :8158 bound to `0.0.0.0` and
+reached over the machine's LAN address — the last one because every previous
+probe of the self-call exemption connected from loopback, where the exemption
+legitimately applies and therefore proves nothing. A scratchpad ASGI probe
+(outside the project tree) read `scope["client"]` as the real server builds it.
+Both original attacks re-driven with the scripts that broke them. `t.py` not run
+(test 32 resets the shared database). No project file modified.
+
+**Status: NEW-3 RESOLVED, NEW-4 RESOLVED. 2 new findings, both low, both
+test-coverage only.**
+
+### NEW-3 — RESOLVED
+
+uvicorn no longer rewrites the client address. With `--no-proxy-headers`,
+`scope["client"]` is the socket peer whatever the header says, and the app's
+right-counting sees the raw header for the first time:
+
+```
+XFF="198.51.100.90"          -> client='127.0.0.1'  peer_of='127.0.0.1'  key='198.51.100.90'
+XFF="127.0.0.1"              -> client='127.0.0.1'  peer_of='127.0.0.1'  key='127.0.0.1'
+XFF="::1"                    -> client='127.0.0.1'  peer_of='127.0.0.1'  key='::1'
+XFF="127.0.0.1, 198.51.100.7"-> client='127.0.0.1'  peer_of='127.0.0.1'  key='198.51.100.7'
+XFF=""                       -> client='127.0.0.1'  peer_of='127.0.0.1'  key='127.0.0.1'
+```
+
+Driven against a server whose socket peer is genuinely **not** loopback — bound
+`0.0.0.0`, reached over the LAN address — the header no longer buys the
+exemption:
+
+```
+80x /v1/esignet/oidc/userinfo, XFF=127.0.0.1  -> 429s: 40   (was 0/80)
+80x /v1/esignet/oidc/userinfo, XFF=::1        -> 429s: 40
+80x /login, rotating forged prefix, real client constant -> 429s: 26 (one bucket)
+```
+
+**Every launch path is covered.** `backend/app.py`'s `__main__`
+(`proxy_headers=False`), `Dockerfile:33` CMD (`--no-proxy-headers`), and
+`backend/t.py`'s `server()` helper. `render.yaml` is `runtime: docker` with
+`dockerfilePath: ./Dockerfile` and no `startCommand` override, so production
+goes through that CMD. README and CLAUDE.md only ever document
+`python backend/app.py`, which is the covered `__main__` path; DEPLOY.md:29-30
+now states the flag and why. The screenshots harness
+(`frontend/scripts/screenshots.mjs`) starts no backend — it names the command in
+a comment only. `grep -rn 'uvicorn'` across the repo finds no fourth invocation.
+
+**Nothing depended on the value that was removed.** There is no `request.client`,
+`request.url`, `base_url`, `url_for` or `.scheme` anywhere in `backend/` (the one
+`.scheme` hit is `mock_esignet.py:117`, parsing a redirect_uri string, unrelated
+to the ASGI scope). `PUBLIC`/`REDIRECT_URI`/`AUTHORIZE_URL` derive from
+`PUBLIC_URL` or `RENDER_EXTERNAL_URL`, both environment variables. The `Secure`
+cookie flag comes from `DEV_MODE`, not from `scope["scheme"]`, so losing
+`X-Forwarded-Proto` handling changes nothing. The `access_log` schema records no
+client address, so the audit trail is not degraded either. Confirmed live with
+Render-shaped headers present (`X-Forwarded-Proto: https`,
+`X-Forwarded-For: 198.51.100.240`): **3/3 complete OIDC logins on the
+rate-limited instance**, so the loopback self-call exemption still recognises the
+app's own token/userinfo calls, and `/` still refuses to echo `evil.example.com`
+from `Host`/`X-Forwarded-Host`.
+
+Test 55 discriminates: it drives a real server through `server()` and asserts 90
+distinct forged header values share one bucket, which is false under the old
+default.
+
+### NEW-4 — RESOLVED
+
+`fresh = sid is None` is evaluated immediately before
+`sid = secrets.token_urlsafe(32)`, so `is_new=True` can only ever accompany a sid
+minted microseconds earlier in the same block. A cookie-borne sid cannot reach
+the INSERT branch structurally, not by convention — there is no ordering of
+events that makes `fresh` true while `sid` still holds a value that arrived in a
+cookie.
+
+The parked-request attack, re-driven end to end:
+
+```
+request parked mid-body (session already loaded)
+logout -> tombstone -> sweep reclaimed it: True
+parked request completed with 200; sent a clearing cookie: True
+row for the revoked sid recreated: False        (was True)
+revoked cookie authenticates: False   /api/wallet/nonce -> 401   (was True / 200)
+```
+
+The full lifecycle battery is clean:
+
+* **Rotation** — sid rotates, the old row is tombstoned, the new row is created,
+  three further logins on the same client all succeed.
+* **`/login` on a revoked sid** and **on a swept sid** — both 307, the old sid's
+  row is never recreated, a new sid is minted, and the user can still sign in.
+* **A session-writing request on a vanished sid** — old row not recreated, a new
+  sid minted instead.
+* **Three concurrent anonymous mints** — three distinct sids, three rows, no
+  collision.
+* **Two revocations racing** (re-checked from round 3) — one tombstone, and the
+  `AND revoked_at IS NULL` predicate makes the loser a no-op.
+
+The one remaining way to create a row is a freshly minted 256-bit sid. `__rotate__`
+reaches the INSERT branch only after setting `sid = None` and minting a new one,
+and both handlers that set it (`/callback`, `passkey_login_complete`) overwrite
+`identity_id` from a fresh authentication — so a rotation cannot carry a revoked
+session's authority into the new row.
+
+---
+
+### NEW-6 — Low. The production launch flag is the one nothing asserts. (`backend/t.py:36-41`) — **certain**
+
+Test 55 boots its server through `t.py`'s own `server()` helper, which carries
+`--no-proxy-headers`. Delete the flag from `Dockerfile:33` or `proxy_headers=False`
+from `app.py`'s `__main__` and the entire suite still passes: the test pins the
+harness, not the two invocations that actually run in production and in local
+dev. Given that this fix exists precisely because a default-on middleware was
+invisible, the assertion worth having is a textual one over the Dockerfile CMD
+and the `uvicorn.run(...)` call, in the style of the existing deploy-config
+checks.
+
+### NEW-7 — Low. Test 54 pins `save_session`'s contract but not the middleware's use of it. (`backend/t.py`, step 54) — **certain**
+
+Test 54 is a store-level unit test: mint-inserts, update-updates, tombstone
+refuses, swept row refuses. All correct, and it fails against the old code. But
+nothing asserts that the middleware passes `is_new=fresh` rather than
+`is_new=True`; a future edit could reopen NEW-4 with test 54 still green. Tests
+49 and 52 cover the tombstone path end to end, so only the swept-row path — the
+one that needed a parked request to find — is unit-only. The HTTP-level version
+is not hard: park a request mid-body, revoke, delete the row, finish the body,
+assert the cookie is dead.
+
+---
+
+### Verified safe / residual
+
+* **The `TRUST_PROXY_HEADERS` trust model itself.** With the flag set, whoever can
+  write the *last* `X-Forwarded-For` entry gets their own bucket — measured, 60
+  requests with 60 distinct trusted-hop values drew 0 refusals. That is the
+  design, not a defect: the last entry is by definition the trusted proxy's
+  observation. It is safe on Render because the service is reachable only through
+  that proxy, and it would be a total bypass on any deployment that sets the flag
+  while remaining directly reachable. DEPLOY.md warns about hop counts; this is
+  the assumption underneath them.
+* **Out of scope, noted:** the working tree carries uncommitted R7 work — a test
+  56 (`PUBLIC_URL` origin derivation) in `t.py` and DEPLOY.md edits. Not reviewed
+  here; this review covers ddd26d4.
+
+---
+
+**Closing verdict: yes — safe to build on.** Both remaining highs are closed, and
+closed structurally rather than patched: `scope["client"]` is a socket fact again
+with one owner for the forwarded-header decision, and the INSERT branch is
+reachable only by a sid the middleware just minted. Each was re-verified by
+re-running the attack that broke it, with a non-loopback peer for the one that
+needed it, and neither fix costs anything elsewhere — self-calls, origin
+derivation, the audit trail and the whole session lifecycle are unaffected. The
+two residual findings are test coverage, not running behaviour: nothing asserts
+the production launch flag, and the swept-row property is unit-tested rather than
+driven over HTTP.
+
+---
+
+
+---
+
 ## Fix review — R6 round 3, 2026-07-27 (NEW-1, NEW-2 and the named lows)
 
 **Scope:** the tombstoning of `delete_sessions_for_credential`, `REVOKED_GRACE_MINUTES`,

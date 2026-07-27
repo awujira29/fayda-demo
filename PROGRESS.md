@@ -958,7 +958,7 @@ resurrection path it claimed to cover; test 46's eviction bound was 10s against
 O(n) code that ran in 1.5s; test 51's "must not sweep" check compared names
 sharing no token. All rewritten.
 
-**Verification:** 55 steps / 109 assertions pass; the Docker image builds; the
+**Verification:** 57 steps / 111 assertions pass; the Docker image builds; the
 full browser flow (login, passkey register, sign out, return by passkey) works
 with rate limiting ON.
 
@@ -967,26 +967,41 @@ with rate limiting ON.
 silent — everyone lands in one bucket and legitimate users see 429s under
 modest load. DEPLOY.md records how to check after the first deploy.
 
-### R7 - Real domain + HTTPS - remaining
+### R7 - Real domain + HTTPS - done as far as it can be here 2026-07-27
 
-Everything R7 needs from the code is already in place and was verified during
-R1/D1: the public origin derives from `PUBLIC_URL || RENDER_EXTERNAL_URL`
-(env-only, never Host-influenced), the cookie is `Secure` outside dev, and the
-signed message's stated origin comes from the same variable, so a custom domain
-is `PUBLIC_URL=https://<domain>` plus two dashboard steps.
+The code side is complete and now pinned by a test. Everything browser-facing
+derives from `PUBLIC_URL` and nothing else — the OIDC redirect_uri, the
+authorize URL, the passkey relying-party id, and the origin named in the
+message a user is asked to sign — and none of it can be influenced by a request
+header. That last property matters more than it looks: a value left deriving
+from somewhere else would not fail loudly, it would produce a wallet prompt
+naming a different host than the address bar, which is what phishing looks
+like. Test 56 asserts all six together.
 
-What it actually requires is not code: a purchased domain, DNS pointed at
-Render, a certificate issued, and the domain added to Privy's allowed origins.
-None of that is reachable from here, and inventing a domain to "verify" it
-would be theatre. Left as configuration with the exact steps in DEPLOY.md.
+Also added, because it is the same failure mode: the app says so at startup
+when neither `PUBLIC_URL` nor `RENDER_EXTERNAL_URL` is set (the old L9
+footgun). It fails safe — the cookie lands on the wrong origin and sign-in
+silently does nothing — which is exactly why nobody notices.
 
-### R6 - Production hardening
-AML/sanctions screening layer (the Sumsub-style compliance piece), rate limiting on
-all endpoints, the deferred audit mediums (unbounded tables, mock /authorize XSS,
-etc.), error monitoring, Supabase automated backups verified, structured logging.
+**What remains is not code and cannot be done from here:** buying a domain,
+pointing DNS at Render, waiting for the certificate, adding the domain to
+Privy's allowed origins, and (once R5 lands) re-registering the redirect URI
+with Fayda. DEPLOY.md carries the ordered procedure, including the step people
+skip — setting `PUBLIC_URL` after the domain resolves, or every user returns
+apparently signed out.
 
-### R7 - Real domain + HTTPS
-Custom domain, cookie/OIDC origin updated, Privy allowed-origins updated.
+**One migration consequence worth knowing before real users register:** every
+passkey stops working. A WebAuthn credential is bound to the relying-party id,
+which is the domain, so moving from `<service>.onrender.com` to a custom domain
+means authenticators no longer offer the old credentials and people must
+re-verify with Fayda and register again. There is no way around it — that is
+how WebAuthn scopes credentials. Settle the domain first. Wallet bindings are
+unaffected; they are stored proofs, not live credentials.
+
+### R6 - Production hardening - DONE 2026-07-27 (see Done)
+
+### R7 - Real domain + HTTPS - DONE in code 2026-07-27; the rest is
+configuration that needs a purchased domain (see Done)
 
 Lawful-basis / data-protection review with NBE/NIDP runs alongside R3-R5 -- binding
 a national ID to persistent, queryable financial history is the most sensitive thing
