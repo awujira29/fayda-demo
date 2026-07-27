@@ -42,6 +42,15 @@ services:
         sync: false
       - key: CHAIN_EXPLORER_KEY
         sync: false
+      # R6. Render terminates TLS at its proxy, so the socket peer is always
+      # the proxy: without this every visitor shares one rate-limit bucket.
+      # Safe here precisely because a trusted proxy sets the header.
+      - key: TRUST_PROXY_HEADERS
+        value: "1"
+      # Sanctions list for R6 screening (optional). Unset means screening
+      # reports "not configured" rather than pretending a clean result.
+      - key: SANCTIONS_LIST_PATH
+        sync: false
       # The public origin (PUBLIC_URL) is NOT set here on purpose: app.py
       # derives it from RENDER_EXTERNAL_URL, which Render injects
       # automatically. Set PUBLIC_URL only for a custom domain.

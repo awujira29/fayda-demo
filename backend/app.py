@@ -44,6 +44,8 @@ from pydantic import BaseModel
 from starlette.datastructures import Headers, MutableHeaders
 
 import chain
+import ratelimit
+import screening
 import store
 import verify as vf
 
@@ -66,6 +68,20 @@ BASE = os.getenv("BASE_URL", f"http://127.0.0.1:{os.getenv('PORT', '8000')}")
 PUBLIC = (os.getenv("PUBLIC_URL")
           or os.getenv("RENDER_EXTERNAL_URL")
           or BASE).rstrip("/")
+# L9 / R7. Falling back to BASE is deliberate — it keeps the single-origin
+# test run working — but it is also the quiet way a deployment half-works: the
+# browser is sent to a different origin than it is on, the session cookie lands
+# there, and the user comes back apparently signed out. It fails safe (never
+# signed in as someone else) which is exactly why it goes unnoticed. Say so at
+# startup rather than leaving it to be rediscovered, and say it again for R7,
+# where moving to a custom domain without setting PUBLIC_URL produces the same
+# symptom on a URL nobody is watching yet.
+if not os.getenv("PUBLIC_URL") and not os.getenv("RENDER_EXTERNAL_URL"):
+    print(f"[startup] PUBLIC_URL is unset — browser-facing URLs will use {PUBLIC}. "
+          f"If the browser is on a different origin (a separate frontend dev "
+          f"server, or a custom domain), set PUBLIC_URL to it or the session "
+          f"cookie lands on the wrong origin and sign-in silently does nothing.",
+          file=sys.stderr, flush=True)
 DEMO_CLIENT_ID = "fayda-wallet-demo"
 CLIENT_ID = os.getenv("FAYDA_CLIENT_ID", DEMO_CLIENT_ID)
 AUTHORIZE_URL = os.getenv("FAYDA_AUTHORIZE_URL", f"{PUBLIC}/authorize")
@@ -238,8 +254,83 @@ PRE_AUTH_SESSION_TTL_HOURS = 0.5
 FRESH_AUTH_SECONDS = 900
 
 
+# ------------------------------------------------------ structured logs (R6)
+
+# A whitelist, not a redaction list. Anything not named here never reaches a log
+# line, which is the only way this stays true as fields are added: a
+# blocklist has to be updated every time someone adds a claim, and the cost of
+# forgetting once is a FIN or a neighbourhood address in a log aggregator.
+_LOG_SAFE = frozenset({
+    "event", "path", "tier", "status", "chain", "identity", "action",
+    "outcome", "reason_len", "count", "ms", "error", "detail",
+})
+
+
+def log_event(event: str, **fields) -> None:
+    """
+    One JSON object per line, for an aggregator to parse.
+
+    Deliberately carries no raw FIN, no claims, no session id, no address and
+    no reason text. `identity` is the internal UUID, which is meaningless
+    outside this database — never fin_hmac, which is a stable correlator.
+    """
+    safe = {k: v for k, v in fields.items() if k in _LOG_SAFE}
+    safe["event"] = event
+    safe["at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        print(json.dumps(safe, default=str), file=sys.stderr, flush=True)
+    except Exception:
+        # Logging must never be the thing that breaks a request.
+        pass
+
+
+# How often a session in active use has its sliding expiry pushed forward.
+# Every request was far too often (a write per read); an hour keeps a busy
+# session alive indefinitely while a 12-hour TTL still expires an idle one.
+SESSION_RENEW_SECONDS = 3600
+
+
+def _expiry_due(session: dict) -> bool:
+    last = session.get("__renewed__")
+    return not isinstance(last, int) or (time.time() - last) > SESSION_RENEW_SECONDS
+
+
 def _sign_sid(sid: str) -> str:
     return hmac.new(SESSION_SECRET.encode(), sid.encode(), hashlib.sha256).hexdigest()
+
+
+class RateLimitMiddleware:
+    """
+    Outermost middleware, deliberately: a refused request must cost no database
+    work. Placed inside the session layer it would still load a session row —
+    which is exactly the resource being protected.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._refusals = 0
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not ratelimit.ENABLED:
+            await self.app(scope, receive, send)
+            return
+        allowed, rule, retry = ratelimit.check(
+            scope.get("path", ""), ratelimit.client_key(scope),
+            peer=ratelimit.peer_of(scope))
+        if not allowed:
+            # Sampled. Logging every refusal turns a request flood into a
+            # flood of metered log output — paying for the attack twice.
+            self._refusals += 1
+            if self._refusals % 50 == 1:
+                log_event("rate_limited", path=scope.get("path", ""),
+                          tier=rule.name, count=self._refusals)
+            await JSONResponse(
+                {"detail": "too many requests — slow down and try again"},
+                status_code=429,
+                headers={"Retry-After": str(int(retry))},
+            )(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 class ServerSideSessionMiddleware:
@@ -279,10 +370,20 @@ class ServerSideSessionMiddleware:
             return
         sid = self._sid_from_cookie(Headers(scope=scope).get("cookie", ""))
         session = store.load_session(sid) if sid else None
+        # M6: a snapshot to compare against at response time. Every
+        # authenticated request used to rewrite its session row and re-set the
+        # cookie unconditionally, so polling /api/me turned each read into a
+        # write — against a managed database where every write is a network
+        # round trip. Only genuine changes are persisted now.
+        original = json.dumps(session, sort_keys=True, default=str) if session else None
         if session is None:
             sid = None
             session = {}
         scope["session"] = session
+        # Handlers that must act on the session ROW (logout revoking it) need
+        # the id; the cookie is HttpOnly and the sid is not otherwise reachable
+        # from a handler.
+        scope["session_sid"] = sid
 
         async def send_wrapper(message):
             nonlocal sid
@@ -295,20 +396,55 @@ class ServerSideSessionMiddleware:
                 if session.pop("__rotate__", None) and sid is not None:
                     store.delete_session(sid)
                     sid = None
+                # M7: a killed session is deleted and cleared here, at the one
+                # point every request funnels through — so a concurrent request
+                # holding a stale snapshot cannot re-save it. Checked before
+                # the `if session:` branch, which would otherwise persist the
+                # tombstone as if it were live session data.
+                if session.pop("__killed__", None):
+                    session.clear()
                 if session:
-                    if sid is None:
+                    fresh = sid is None
+                    if fresh:
                         sid = secrets.token_urlsafe(32)
                     # An anonymous, mid-login session gets minutes; only a
                     # completed Fayda authentication earns the full TTL.
                     ttl = (SESSION_TTL_HOURS if session.get("identity_id")
                            else PRE_AUTH_SESSION_TTL_HOURS)
-                    store.save_session(sid, session, ttl)
-                    headers.append(
-                        "set-cookie",
-                        f"{self.COOKIE}={sid}.{_sign_sid(sid)}; Path=/; HttpOnly; "
-                        f"SameSite=Lax; Max-Age={int(ttl * 3600)}"
-                        + ("" if DEV_MODE else "; Secure"),
-                    )
+                    # M6: write only when there is something to write. A read
+                    # that did not touch the session leaves the row alone, so
+                    # polling no longer costs a round trip and a lock. The
+                    # sliding expiry is refreshed at a coarse interval instead
+                    # of on every request — a session that is being used
+                    # actively is renewed long before it lapses.
+                    changed = fresh or json.dumps(
+                        session, sort_keys=True, default=str) != original
+                    written = True
+                    if changed or _expiry_due(session):
+                        session["__renewed__"] = int(time.time())
+                        # False means the row is tombstoned — this session was
+                        # revoked while the request was in flight. Handing back
+                        # a Set-Cookie for a sid that was deliberately NOT
+                        # written would tell the browser it still has a session
+                        # the server has already killed.
+                        # is_new=fresh: only a sid this request just minted may
+                        # create a row. A request carrying a cookie can update
+                        # its row, never resurrect one that has gone.
+                        written = store.save_session(sid, session, ttl,
+                                                      is_new=fresh)
+                    if written and (changed or fresh):
+                        headers.append(
+                            "set-cookie",
+                            f"{self.COOKIE}={sid}.{_sign_sid(sid)}; Path=/; HttpOnly; "
+                            f"SameSite=Lax; Max-Age={int(ttl * 3600)}"
+                            + ("" if DEV_MODE else "; Secure"),
+                        )
+                    elif not written:
+                        headers.append(
+                            "set-cookie",
+                            f"{self.COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+                            + ("" if DEV_MODE else "; Secure"),
+                        )
                 elif sid is not None:
                     store.delete_session(sid)
                     headers.append(
@@ -370,6 +506,10 @@ app = FastAPI(
     openapi_url="/openapi.json" if DEV_MODE else None,
 )
 app.add_middleware(ServerSideSessionMiddleware)
+# Added last, so it runs FIRST: Starlette applies middleware in reverse
+# registration order. A rate-limited request must be refused before the session
+# layer touches the database.
+app.add_middleware(RateLimitMiddleware)
 
 # The mock IdP mounts in dev, and in an explicitly opted-in demo deploy.
 # The /api/dev/* surface is NEVER tied to DEMO_MODE.
@@ -513,7 +653,20 @@ async def callback(request: Request, code: str = "", state: str = ""):
 
 @app.post("/logout")
 def logout(request: Request):
-    request.session.clear()
+    # M7: revoke in the DATABASE, here, immediately — not by emptying this
+    # request's own dict and hoping the response path tidies up.
+    #
+    # An earlier cut did exactly that, and it did not work: a concurrent
+    # request for the same sid holds its OWN request-start snapshot and cannot
+    # observe a flag set in this one, so it re-saved that snapshot and the
+    # upsert recreated the row with a fresh 12-hour TTL. Measured failing 5
+    # times in 6 against an attacker polling with a stolen cookie. The
+    # tombstone now lands in the row, where every other request can see it, and
+    # save_session refuses to write over it.
+    sid = request.scope.get("session_sid")
+    if sid:
+        store.delete_session(sid)
+    request.session["__killed__"] = True
     return JSONResponse({"ok": True})
 
 
@@ -832,7 +985,8 @@ def wallet_nonce(req: NonceReq, request: Request):
     message = vf.build_message(req.chain, req.address, nonce, t.isoformat(),
                                (t + timedelta(seconds=NONCE_TTL)).isoformat(),
                                ident["display_name"])
-    store.issue_nonce(nonce, req.address, req.chain, message, NONCE_TTL)
+    store.issue_nonce(nonce, req.address, req.chain, message, NONCE_TTL,
+                      identity_id=iid)
     return {"nonce": nonce, "message": message, "expires_in": NONCE_TTL}
 
 
@@ -852,7 +1006,8 @@ def wallet_bind(req: BindReq, request: Request):
 
     # Consuming the nonce returns the exact message the server issued. The
     # signature is verified against that, never against anything the client sent.
-    ok, err, message, issued_via = store.consume_nonce(req.nonce, req.address, req.chain)
+    ok, err, message, issued_via = store.consume_nonce(
+        req.nonce, req.address, req.chain, identity_id=iid)
     if not ok:
         raise HTTPException(400, err)
 
@@ -1101,6 +1256,38 @@ def operator_onchain(req: OperatorOnchain, request: Request):
             **chain.transactions(req.chain, req.address)}
 
 
+class OperatorScreen(BaseModel):
+    identity_id: str
+    reason: str
+
+
+@app.post("/api/operator/screen")
+def operator_screen(req: OperatorScreen, request: Request):
+    """
+    Sanctions screening for one identity (R6). Operator-only and logged like
+    every other cross-user read — the result is about a named person.
+
+    It decides nothing. A match is a signal for a human to adjudicate; nothing
+    here blocks a binding, because automatically refusing a Fayda-verified
+    person on a fuzzy name match is a determination with legal weight that this
+    system has no authority to make.
+    """
+    iid = (req.identity_id or "").strip()
+    if not iid or len(iid) > 64:
+        raise HTTPException(400, "malformed identity id")
+    _clean_token(iid, "identity id")
+    operator_id = require_operator(request, req.reason, "screen", subject_id=iid)
+    record = store.identity_full(iid)
+    if not record:
+        raise HTTPException(404, "no such identity")
+    result = screening.screen(record["display_name"])
+    log_event("sanctions_screen", identity=iid, outcome=result["status"],
+              count=len(result["matches"]))
+    return {"identity": {"id": record["id"],
+                         "display_name": record["display_name"]},
+            "screening": result}
+
+
 @app.post("/api/operator/access-log")
 def operator_access_log(request: Request, before: str | None = None):
     # Reading the log is itself an access, and is itself logged. Otherwise the
@@ -1288,7 +1475,7 @@ if DEV_MODE:
                                    (t + timedelta(seconds=NONCE_TTL)).isoformat(),
                                    ident["display_name"])
         store.issue_nonce(nonce, address, req.chain, message, NONCE_TTL,
-                          issued_via="dev-test-key")
+                          issued_via="dev-test-key", identity_id=iid)
 
         if req.chain == "evm":
             signature = Account.sign_message(
@@ -1361,4 +1548,13 @@ else:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+    # proxy_headers=False: uvicorn's own ProxyHeadersMiddleware is ON by
+    # default and, when the connecting peer is trusted, OVERWRITES
+    # scope["client"] from X-Forwarded-For before any application middleware
+    # runs. That left two X-Forwarded-For parsers with different trust models,
+    # and ours was reading a value the other had already rewritten — so
+    # `peer_of` was not the socket peer at all, and a header claiming 127.0.0.1
+    # bought the rate-limiter's self-call exemption. One owner for that
+    # decision, and it is ratelimit.client_key.
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning",
+                proxy_headers=False)

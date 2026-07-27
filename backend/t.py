@@ -34,7 +34,11 @@ def server(port, env_extra):
     env=dict(os.environ); env.update(env_extra)
     return subprocess.Popen(
         [sys.executable,"-m","uvicorn","app:app","--host","127.0.0.1",
-         "--port",str(port),"--log-level","warning"],
+         "--port",str(port),"--log-level","warning",
+         # Matches the Dockerfile. Without it uvicorn rewrites
+         # scope["client"] from X-Forwarded-For, so the limiter tests would
+         # exercise a scope the production server does not produce.
+         "--no-proxy-headers"],
         env=env, cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 def wait_up(port, tries=100):
@@ -1838,5 +1842,465 @@ assert p4.returncode != 0 and "DEMO_MODE" in p4.stderr, \
     ("a registered partner key was allowed onto a DEMO_MODE deploy",
      p4.stderr[-300:])
 print("  a real partner key is refused on a DEMO_MODE deploy: ok")
+
+step("46. R6: rate limiting refuses a burst without a database round trip")
+# Every audit round said the same thing: nothing anywhere had any limit. Tested
+# on its own instance with limiting ON — the server this suite drives has it
+# off, because the suite's deliberate bursts (racing binds, ten-round loops)
+# are exactly what a limiter should refuse.
+RP = 8101
+rl = server(RP, {"APP_ENV": "dev", "BASE_URL": f"http://127.0.0.1:{RP}",
+                 "RATE_LIMIT": "on"})
+try:
+    assert wait_up(RP), "rate-limited server never came up"
+    rb = f"http://127.0.0.1:{RP}"
+    # /login is the "login" tier: burst 10, then refusal.
+    # The login burst allowance is deliberately generous (several real people
+    # can share one NAT address), so drive well past it.
+    probe_n = rlmod_burst = 90
+    codes = [httpx.get(f"{rb}/login", follow_redirects=False, timeout=10).status_code
+             for _ in range(probe_n)]
+    assert 429 in codes, (f"a {probe_n}-request burst was never rate limited",
+                          set(codes))
+    assert codes[0] != 429, "the very first request was refused"
+    first429 = codes.index(429)
+    assert 10 <= first429 < probe_n, ("the burst allowance is wrong", first429)
+    # A refusal must be answerable: tell the caller when to come back.
+    r = httpx.get(f"{rb}/login", follow_redirects=False, timeout=10)
+    assert r.status_code == 429 and r.headers.get("retry-after"), dict(r.headers)
+    assert "too many requests" in r.text.lower(), r.text[:120]
+    # Reads are a looser tier than session-minting: the limiter must not make
+    # ordinary polling feel broken.
+    read_codes = [httpx.get(f"{rb}/api/me", timeout=10).status_code for _ in range(30)]
+    assert 429 not in read_codes, \
+        ("ordinary reads were rate limited at 30 requests", set(read_codes))
+    print(f"  login burst refused after {first429} with Retry-After; "
+          f"30 reads unaffected: ok")
+finally:
+    rl.terminate()
+    try: rl.wait(timeout=10)
+    except Exception: rl.kill()
+
+# Tiers are assigned by longest-prefix match, so a specific rule can sit under
+# a general one. Assert the classification directly — a route silently landing
+# in the loose "read" tier is how a limiter stops protecting anything.
+import ratelimit as rlmod
+for path, expect in (("/login", "login"), ("/callback", "login"),
+                     ("/v1/esignet/oauth/v2/token", "login"),
+                     ("/api/wallet/bind", "bind"),
+                     ("/api/operator/onchain", "expensive"),
+                     ("/api/me/access-log", "expensive"),
+                     ("/api/registry", "expensive"),
+                     ("/api/passkey/login/begin", "login"),
+                     ("/api/passkey/register/begin", "bind"),
+                     ("/api/me", "read"), ("/", "read")):
+    got = rlmod.tier_for(path)
+    assert got == expect, (f"{path} landed in the {got} tier, expected {expect}")
+# A spoofable header must not become the limiter key unless the deployment
+# says its proxy sets it — otherwise an attacker gets a fresh bucket per
+# request and the limiter is worse than useless.
+assert rlmod.TRUST_FORWARDED is False, \
+    "forwarded client IPs are trusted by default"
+
+# And when a deployment DOES trust it (render.yaml sets it), the key must come
+# from the right-hand end. Read from the left it is whatever the caller sent:
+# a fresh bucket per request, plus the ability to drain a named victim's.
+def key_with_xff(xff, peer="203.0.113.9"):
+    return rlmod.client_key({"headers": [(b"x-forwarded-for", xff.encode())],
+                             "client": (peer, 1234)})
+
+rlmod.TRUST_FORWARDED = True
+try:
+    # One trusted proxy: the last entry is what it observed.
+    assert key_with_xff("198.51.100.7") == "198.51.100.7"
+    # An attacker prepending forged hops must not move the key.
+    spoofed = key_with_xff("1.2.3.4, 5.6.7.8, 198.51.100.7")
+    assert spoofed == "198.51.100.7", ("a forged left-hand entry set the key", spoofed)
+    # Two different forgeries must land in the SAME bucket, or the limiter is
+    # a no-op for anyone willing to vary a header.
+    a = key_with_xff("11.11.11.11, 198.51.100.7")
+    b_ = key_with_xff("22.22.22.22, 198.51.100.7")
+    assert a == b_, ("varying the forged prefix produced different buckets", a, b_)
+    # Junk in the header falls back to the socket peer rather than being trusted.
+    assert key_with_xff("not-an-ip") == "203.0.113.9"
+    assert key_with_xff("") == "203.0.113.9"
+finally:
+    rlmod.TRUST_FORWARDED = False
+print("  tiers correct; a forged X-Forwarded-For cannot choose the bucket: ok")
+
+# The eviction path must be O(1). At 20k entries a min() scan held the lock for
+# ~0.8ms per new key — a denial of service inside the defence.
+rlmod.reset()
+t0 = time.time()
+for i in range(rlmod._MAX_BUCKETS + 2000):
+    rlmod.check("/api/me", f"10.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}")
+evict_elapsed = time.time() - t0
+assert len(rlmod._BUCKETS) <= rlmod._MAX_BUCKETS, len(rlmod._BUCKETS)
+assert evict_elapsed < 0.6, \
+    (f"{rlmod._MAX_BUCKETS + 2000} keys took {evict_elapsed:.1f}s — eviction is "
+     f"not O(1)")
+rlmod.reset()
+print(f"  {rlmod._MAX_BUCKETS + 2000} distinct keys in {evict_elapsed:.2f}s, "
+      f"table bounded: ok")
+
+# The server's own OIDC self-calls are not user traffic and must not be
+# throttled — otherwise the deployment rate-limits its own sign-in.
+allowed_all = all(rlmod.check("/v1/esignet/oauth/v2/token", "127.0.0.1")[0]
+                  for _ in range(200))
+assert allowed_all, "the app's loopback self-calls are being rate limited"
+# The exemption must be narrow on BOTH axes. Loopback alone would leave
+# anything sharing the host unlimited; the path alone would let anyone hit /v1/.
+loop_other = [rlmod.check("/login", "127.0.0.1")[0] for _ in range(120)]
+assert not all(loop_other), \
+    "loopback is exempt for NON-self-call paths — far too broad"
+rlmod.reset()
+remote_v1 = [rlmod.check("/v1/esignet/oauth/v2/token", "203.0.113.5")[0]
+             for _ in range(120)]
+assert not all(remote_v1), "a remote caller is exempt on the self-call path"
+rlmod.reset()
+print("  self-call exemption requires loopback AND the /v1/ path: ok")
+
+step("47. R6/M6: a read no longer rewrites the session row")
+# Every authenticated request used to re-save the session and re-set the
+# cookie, turning a polled read into a write against a managed database where
+# every write is a network round trip.
+sid_now = c.cookies.get("session").rsplit(".", 1)[0]
+with st.conn() as sc:
+    before_row = sc.execute("SELECT data, expires_at FROM sessions WHERE sid=%s",
+                            (sid_now,)).fetchone()
+r1 = c.get(f"{B}/api/me")
+r2 = c.get(f"{B}/api/me")
+assert r1.status_code == 200 and r2.status_code == 200
+with st.conn() as sc:
+    after_row = sc.execute("SELECT data, expires_at FROM sessions WHERE sid=%s",
+                           (sid_now,)).fetchone()
+assert after_row["expires_at"] == before_row["expires_at"], \
+    ("a plain read still slid the session expiry — write on every read",
+     before_row["expires_at"], after_row["expires_at"])
+assert "set-cookie" not in {k.lower() for k in r2.headers}, \
+    "a plain read still re-set the session cookie"
+# ... but a request that genuinely CHANGES the session must still persist it,
+# or sign-in would not stick.
+probe = httpx.Client(follow_redirects=False, timeout=30)
+assert fayda_login(probe, fins[1])["authenticated"], "login no longer persists"
+assert probe.get(f"{B}/api/me").json()["authenticated"], \
+    "the session did not survive the request that created it"
+print("  reads leave the row untouched; writes still persist: ok")
+
+step("48. R6: a nonce is bound to the identity it was issued to")
+# The signed message embeds the requester's NAME, so a nonce issued to one
+# person and redeemed by another persisted a proof_message attesting to
+# somebody who did not make the binding. The signature still proved key
+# control and the sybil indexes still held — but this row is stored evidence,
+# and stored evidence must not be able to name the wrong person.
+victim = c            # holds a Fayda session
+other = httpx.Client(follow_redirects=False, timeout=30)
+assert fayda_login(other, fins[2])["authenticated"]
+shared_addr = rnd_addr()
+n = victim.post(f"{B}/api/wallet/nonce",
+                json={"chain": "evm", "address": shared_addr}).json()
+assert n.get("nonce"), n
+# The other identity redeems it. Signature validity is irrelevant — this must
+# be refused on the binding, before verification is even reached.
+r = other.post(f"{B}/api/wallet/bind",
+               json={"chain": "evm", "address": shared_addr,
+                     "nonce": n["nonce"], "signature": "0x" + "11" * 65})
+assert r.status_code == 400, r.status_code
+assert "different identity" in r.text, \
+    ("a nonce issued to someone else was accepted for redemption", r.text[:160])
+# And the rightful owner can still use their own nonce.
+n2 = victim.post(f"{B}/api/wallet/nonce",
+                 json={"chain": "evm", "address": shared_addr}).json()
+ok, err, msg, via = st.consume_nonce(
+    n2["nonce"], shared_addr, "evm",
+    identity_id=victim.get(f"{B}/api/me").json()["identity"]["id"])
+assert ok, ("the issuing identity could not redeem its own nonce", err)
+print("  a nonce redeemed by another identity is refused: ok")
+
+step("49. R6/M7: logout is not undone by a concurrent in-flight request")
+# The middleware loads a session at request start and re-saves that snapshot at
+# response start, so a request already in flight when /logout ran re-INSERTed
+# the row and re-set the cookie. Two tabs was enough. Signing out is how a user
+# ends a session they may believe is compromised.
+# The concurrent request must be one that WRITES the session, and it must be a
+# separate client sharing the stolen cookie — an earlier version of this test
+# re-logged-in each round and raced a read-only endpoint, so it could never
+# reach the resurrection path it claimed to cover and passed against code that
+# demonstrably failed 5 times in 6.
+for attempt in range(6):
+    victim_tab = httpx.Client(follow_redirects=False, timeout=30)
+    assert fayda_login(victim_tab, fins[0])["authenticated"]
+    stolen = victim_tab.cookies.get("session")
+    # The attacker holds the same cookie and keeps hitting an endpoint that
+    # writes to the session (passkey login/begin stores a challenge).
+    attacker = httpx.Client(follow_redirects=False, timeout=30,
+                            cookies={"session": stolen})
+    stop = threading.Event()
+    def hammer():
+        while not stop.is_set():
+            try: attacker.post(f"{B}/api/passkey/login/begin")
+            except Exception: pass
+    h = threading.Thread(target=hammer, daemon=True); h.start()
+    time.sleep(0.25)
+    out = victim_tab.post(f"{B}/logout")
+    assert out.status_code == 200, out.status_code
+    time.sleep(0.6)          # let the attacker keep writing after logout
+    stop.set(); h.join(timeout=5)
+    # The stolen cookie must be dead, and must stay dead.
+    check = httpx.Client(follow_redirects=False, timeout=30,
+                         cookies={"session": stolen})
+    assert not check.get(f"{B}/api/me").json()["authenticated"], \
+        ("a concurrent session-writing request resurrected a logged-out "
+         "session — logout does not end a compromised session", attempt)
+    r = check.post(f"{B}/api/wallet/nonce",
+                   json={"chain": "evm", "address": rnd_addr()})
+    assert r.status_code == 401, ("the revoked session can still act", r.status_code)
+print("  6 logout-vs-concurrent-writer races, the session stays dead: ok")
+
+step("50. R6: structured logs carry no identity-bearing data")
+# Logs go to an aggregator that is not this database. The whitelist means a
+# field added later cannot leak by default — a blocklist would have to be
+# updated every time, and forgetting once puts a FIN or a kebele in a log.
+import app as _app
+assert "fin" not in _app._LOG_SAFE and "fin_hmac" not in _app._LOG_SAFE, _app._LOG_SAFE
+assert "claims" not in _app._LOG_SAFE and "address" not in _app._LOG_SAFE, _app._LOG_SAFE
+assert "sid" not in _app._LOG_SAFE and "session" not in _app._LOG_SAFE, _app._LOG_SAFE
+import io, contextlib
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    _app.log_event("probe", path="/api/me", fin_hmac="SHOULD-NOT-APPEAR",
+                   claims={"address": {"kebele": "SHOULD-NOT-APPEAR"}},
+                   sid="SHOULD-NOT-APPEAR", status=200)
+line = buf.getvalue()
+assert "SHOULD-NOT-APPEAR" not in line, ("a non-whitelisted field reached the log", line)
+emitted = json.loads(line)
+assert emitted["event"] == "probe" and emitted["path"] == "/api/me", emitted
+assert emitted["status"] == 200 and emitted["at"], emitted
+print("  whitelisted fields only; identity-bearing fields dropped: ok")
+
+step("51. R6: sanctions screening is operator-only, logged, and honest")
+import screening as scr
+# Unconfigured must SAY so — an empty match list would read as "screened
+# clean", which is a different and much stronger claim.
+scr.LIST_PATH = ""; scr.reset()
+out = scr.screen("Tesfaye Bekele")
+assert out["status"] == "not_configured" and out["matches"] == [], out
+assert "no screening was performed" in out["detail"], out
+print("  no list configured is reported, not rendered as 'clean': ok")
+
+# With a list, exact and partial matches are found and LABELLED as signals.
+list_path = os.path.join(prod_dir if False else tempfile.mkdtemp(), "sdn.json")
+with open(list_path, "w") as f:
+    json.dump([
+        {"name": "Tesfaye Bekele", "list": "TEST-SDN", "reference": "T-001"},
+        {"name": "Tesfaye Bekele Alemu", "list": "TEST-SDN", "reference": "T-002"},
+        {"name": "Someone Else Entirely", "list": "TEST-SDN", "reference": "T-003"},
+    ], f)
+scr.LIST_PATH = list_path; scr.reset()
+hit = scr.screen("Tesfaye Bekele")
+assert hit["status"] == "screened" and hit["list_size"] == 3, hit
+names = {m["name"] for m in hit["matches"]}
+assert "Tesfaye Bekele" in names, hit
+assert "Someone Else Entirely" not in names, ("an unrelated name matched", hit)
+assert any(m["confidence"] == "exact" for m in hit["matches"]), hit
+assert "not a determination" in hit["detail"], \
+    "the result does not say a hit requires human adjudication"
+clean = scr.screen("Hiwot Girma")
+assert clean["matches"] == [] and clean["list_size"] == 3, \
+    ("a clean result must still report the list size it was checked against", clean)
+# The false-clean that matters most here. Ethiopian names are given name plus
+# father's name, often with a grandfather's name appended or dropped depending
+# on the document — so the queried name and the listed entry routinely differ
+# in length for the SAME person. One-way containment returned no hits for a
+# three-part name against a two-part entry and reported `screened`, which
+# reads as cleared.
+longer = scr.screen("Tesfaye Bekele Alemu")
+assert longer["matches"], \
+    ("a longer form of a listed name was reported clean", longer)
+assert any(m["name"] == "Tesfaye Bekele" for m in longer["matches"]), longer
+# ... without matching everyone: a single common part must not sweep the list.
+narrow = scr.screen("Someone")   # shares a token with "Someone Else Entirely"
+swept = {m["name"] for m in narrow["matches"]}
+assert "Tesfaye Bekele" not in swept, ("a one-word name swept the list", swept)
+assert len(swept) <= 1, ("a single common token matched too broadly", swept)
+# Accents and case must not defeat it, but this is explicitly NOT a
+# transliteration engine and the module says so.
+assert scr.screen("TESFAYE  BEKELE")["matches"], "case/whitespace defeated the match"
+# A malformed list must not crash, and must not look like a clean list either.
+bad_path = os.path.join(tempfile.mkdtemp(), "bad.json")
+open(bad_path, "w").write("{not json")
+scr.LIST_PATH = bad_path; scr.reset()
+broken = scr.screen("Tesfaye Bekele")
+assert broken["status"] == "screened" and broken["list_size"] == 0, broken
+print("  matches are found, labelled as signals, and list size is always reported: ok")
+
+# The endpoint is operator-gated and logged like every other cross-user read.
+scr.LIST_PATH = ""; scr.reset()
+r = c2.post(f"{B}/api/operator/screen",
+            json={"identity_id": subject["id"], "reason": "sanctions review 7001"})
+assert r.status_code == 403, ("screening served a non-operator", r.status_code)
+r = anon.post(f"{B}/api/operator/screen",
+              json={"identity_id": subject["id"], "reason": "sanctions review 7001"})
+assert r.status_code == 401, r.status_code
+n_before = st.access_log_about(subject["id"], limit=1)["total"]
+r = c.post(f"{B}/api/operator/screen",
+           json={"identity_id": subject["id"], "reason": "sanctions review 7001"})
+assert r.status_code == 200, (r.status_code, r.text[:160])
+assert st.access_log_about(subject["id"], limit=1)["total"] == n_before + 1, \
+    "a screening of a named person went unlogged"
+print("  screening is operator-only and written to the subject's log: ok")
+
+step("52. R6: revoking a passkey kills its session and it STAYS killed")
+# The same bug as logout, one door over, and it had no test at all. Logout was
+# fixed to tombstone; passkey revocation still hard-DELETEd, and save_session's
+# guard only refuses to overwrite a TOMBSTONED row — a deleted row has no row
+# to refuse, so the upsert took its INSERT branch and recreated the session
+# with a fresh 12-hour TTL and no tombstone, leaving the owner no lever at all.
+# Measured defeating revocation 5 times out of 5.
+for attempt in range(4):
+    owner = httpx.Client(follow_redirects=False, timeout=30)
+    assert fayda_login(owner, fins[1])["authenticated"]
+    key = SoftAuthenticator()
+    opts = owner.post(f"{B}/api/passkey/register/begin").json()
+    assert owner.post(f"{B}/api/passkey/register/complete",
+                      json={"credential": key.register(opts["challenge"]),
+                            "label": "kill-me"}).status_code == 200
+    # The attacker signs in with that passkey and keeps writing to the session.
+    intruder = httpx.Client(follow_redirects=False, timeout=30)
+    o2 = intruder.post(f"{B}/api/passkey/login/begin").json()
+    assert intruder.post(f"{B}/api/passkey/login/complete",
+                         json={"credential": key.assert_(o2["challenge"])}
+                         ).status_code == 200
+    assert intruder.get(f"{B}/api/me").json()["authenticated"]
+    stop = threading.Event()
+    def keep_writing():
+        while not stop.is_set():
+            try: intruder.post(f"{B}/api/passkey/login/begin")
+            except Exception: pass
+    w = threading.Thread(target=keep_writing, daemon=True); w.start()
+    time.sleep(0.25)
+    r = owner.post(f"{B}/api/passkey/revoke",
+                   json={"credential_id": b64u(key.cred_id)})
+    assert r.status_code == 200, (r.status_code, r.text[:160])
+    time.sleep(0.6)                     # keep writing after the revocation
+    stop.set(); w.join(timeout=5)
+    assert not intruder.get(f"{B}/api/me").json()["authenticated"], \
+        ("a concurrent writer resurrected a session whose passkey was revoked",
+         attempt)
+    nr = intruder.post(f"{B}/api/wallet/nonce",
+                       json={"chain": "evm", "address": rnd_addr()})
+    assert nr.status_code == 401, ("the revoked session can still act", nr.status_code)
+print("  4 revoke-vs-concurrent-writer races, the session stays dead: ok")
+
+step("53. R6: the limiter key cannot be chosen by the caller, by any header shape")
+rlmod.TRUST_FORWARDED = True
+try:
+    def key_hdrs(pairs, peer="203.0.113.9"):
+        return rlmod.client_key({"headers": [(b"x-forwarded-for", v.encode())
+                                             for v in pairs],
+                                 "client": (peer, 1234)})
+    # DUPLICATE headers are equivalent to one comma-joined value in order. An
+    # earlier cut read only the FIRST and stopped, so a proxy that emits its
+    # own header rather than appending left position 0 caller-controlled.
+    honest = key_hdrs(["198.51.100.7"])
+    spoof_first = key_hdrs(["127.0.0.1", "198.51.100.7"])
+    assert spoof_first == honest, \
+        ("a leading duplicate X-Forwarded-For header chose the bucket",
+         spoof_first, honest)
+    assert key_hdrs(["1.1.1.1, 2.2.2.2", "198.51.100.7"]) == honest, \
+        "a multi-value leading header chose the bucket"
+    # And claiming loopback must NOT buy the self-call exemption, which is now
+    # judged on the socket peer.
+    allowed = [rlmod.check("/v1/esignet/oauth/v2/token",
+                           key_hdrs(["127.0.0.1", "198.51.100.7"]),
+                           peer="203.0.113.9")[0] for _ in range(80)]
+    assert not all(allowed), \
+        "a spoofed loopback header bought the self-call rate-limit exemption"
+finally:
+    rlmod.TRUST_FORWARDED = False
+    rlmod.reset()
+print("  duplicate/forged headers cannot choose the bucket or the exemption: ok")
+
+# A revoked session's row must not park for its original TTL — that is the
+# table growth the sweep exists to bound.
+tomb = httpx.Client(follow_redirects=False, timeout=30)
+assert fayda_login(tomb, fins[0])["authenticated"]
+tomb_sid = tomb.cookies.get("session").rsplit(".", 1)[0]
+tomb.post(f"{B}/logout")
+with st.conn() as sc:
+    row = sc.execute("SELECT revoked_at, expires_at FROM sessions WHERE sid=%s",
+                     (tomb_sid,)).fetchone()
+assert row and row["revoked_at"], "logout did not tombstone the row"
+left = st.parse(row["expires_at"]) - st.now()
+assert left.total_seconds() < st.REVOKED_GRACE_MINUTES * 60 + 120, \
+    ("a tombstoned row keeps its full TTL and parks for hours", left)
+print(f"  a tombstoned row is reclaimable in {int(left.total_seconds()/60)} min, "
+      f"not 12 h: ok")
+
+step("54. R6: a session that is GONE cannot be re-created by a stale request")
+# The tombstone stops a revoked row being overwritten but says nothing about a
+# row that has simply been swept away — and shortening the tombstone's TTL (a
+# fix for table growth) made that window arrive in 10 minutes instead of 12
+# hours. An attacker parks a request mid-body (the session loads when headers
+# arrive; uvicorn has no body timeout), waits for the owner to log out and the
+# sweep to run, then finishes the body: no row, no conflict, INSERT branch,
+# session back with a fresh TTL and no tombstone. No race timing — just
+# patience. Only a freshly minted sid may insert.
+gone_sid = "t54-" + secrets.token_hex(8)
+assert st.save_session(gone_sid, {"identity_id": "x"}, 12, is_new=True), \
+    "a freshly minted sid must be insertable"
+assert st.save_session(gone_sid, {"identity_id": "y"}, 12), \
+    "an existing row must still be updatable"
+st.delete_session(gone_sid)
+assert st.save_session(gone_sid, {"identity_id": "z"}, 12) is False, \
+    "a tombstoned row was overwritten"
+with st.conn() as sc:                      # the sweep reclaims the tombstone
+    sc.execute("DELETE FROM sessions WHERE sid=%s", (gone_sid,))
+assert st.save_session(gone_sid, {"identity_id": "z"}, 12) is False, \
+    ("a stale request re-created a session whose row had been reclaimed — "
+     "revocation is only as durable as the tombstone")
+assert st.load_session(gone_sid) is None, "the session came back"
+print("  a reclaimed session cannot be re-inserted by a cookie-bearing request: ok")
+
+step("55. R6: the limiter reads the scope the real server produces")
+# Every other limiter test builds an ASGI scope by hand, which is exactly where
+# the last bug hid: uvicorn's own ProxyHeadersMiddleware is on by default and
+# OVERWRITES scope["client"] from X-Forwarded-For before any app middleware
+# runs, so `peer_of` was reading a value derived from the very header it exists
+# to distrust. Drive a REAL server and check the header cannot buy the
+# self-call exemption.
+XP = 8103
+xs = server(XP, {"APP_ENV": "dev", "BASE_URL": f"http://127.0.0.1:{XP}",
+                 "RATE_LIMIT": "on"})
+try:
+    assert wait_up(XP), "proxy-header probe server never came up"
+    xb = f"http://127.0.0.1:{XP}"
+    # The property under test: a header cannot change which bucket a caller
+    # lands in. TRUST_PROXY_HEADERS is unset here, so the app ignores
+    # X-Forwarded-For entirely and keys on the socket peer — but uvicorn's own
+    # ProxyHeadersMiddleware, ON BY DEFAULT, rewrites scope["client"] from that
+    # same header when the peer is trusted (loopback is). If it were still
+    # enabled, every distinct forged value would arrive as a distinct
+    # scope["client"], hand the caller a fresh bucket, and the burst would
+    # never be refused — bypassing TRUSTED_PROXY_HOPS because the app's own
+    # parser never runs.
+    varied = [httpx.get(f"{xb}/login", follow_redirects=False, timeout=10,
+                        headers={"X-Forwarded-For": f"203.0.113.{i % 250}"}
+                        ).status_code for i in range(90)]
+    assert 429 in varied, \
+        ("varying X-Forwarded-For produced a fresh bucket per request — "
+         "uvicorn is still rewriting scope['client'] from the header",
+         set(varied))
+    # ... and the same caller without any header is refused at a similar point,
+    # i.e. both shapes share one bucket rather than the header opening a new one.
+    assert varied.count(429) > 20, \
+        ("only a few requests were refused; the bucket is still being split by "
+         "the header", varied.count(429))
+    print(f"  90 requests with 90 different forged X-Forwarded-For values share "
+          f"one bucket ({varied.count(429)} refused): ok")
+finally:
+    xs.terminate()
+    try: xs.wait(timeout=10)
+    except Exception: xs.kill()
 
 print("\n\nALL CHECKS PASSED")

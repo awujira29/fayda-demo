@@ -43,6 +43,10 @@ returned 404 (`backend/t.py` test 20 pins this).
    | `CHAIN_EXPLORER_KEY` | *(optional)* | API key for the above, if the provider needs one |
    | `FAYDA_CLIENT_PRIVATE_KEY` | required outside dev/demo | PEM of the RSA key whose public JWK is registered with Fayda during partner onboarding. The app refuses to start without it in production: the assertion key must be the registered one, not a per-process key that could never match |
    | `FAYDA_CLIENT_ID`, `FAYDA_AUTHORIZE_URL`, `FAYDA_TOKEN_URL`, `FAYDA_USERINFO_URL` | for a live IdP | Point the OIDC client at partner.fayda.et. Setting any of them alongside `DEMO_MODE=1` refuses to start — real identities must not sit behind a login any visitor can perform |
+   | `RATE_LIMIT` | *(leave unset)* | On by default. `off` disables it — only the test suite should ever do that, because its deliberate bursts are exactly what a limiter refuses |
+   | `TRUST_PROXY_HEADERS` | `1` on Render | The app sits behind Render's proxy, so the socket peer is always the proxy and without this every visitor shares one rate-limit bucket. Set it ONLY when a trusted proxy sets `X-Forwarded-For` — a spoofable header as the limiter key gives an attacker a fresh bucket per request |
+   | `SUPABASE_CA_CERT` | *(optional, recommended)* | Path to Supabase's downloadable root certificate. Present, the connection upgrades from `sslmode=require` (encrypts but authenticates nothing) to `verify-full`. Not defaulted on: without the right CA bundle every connection would fail |
+   | `SANCTIONS_LIST_PATH` | *(optional)* | JSON file of sanctions entries for R6 screening. Unset means screening reports "not configured" rather than pretending a clean result. No list is bundled |
 
 4. **Privy dashboard step** (for real wallet connections): at
    [dashboard.privy.io](https://dashboard.privy.io) create an app (free under
@@ -110,6 +114,91 @@ One consequence for the demo posture: because data persists, `FIN_PEPPER`
 and `SESSION_SECRET` genuinely must be treated as permanent now — rotating
 the pepper orphans every identity row in a database that no longer resets
 itself on redeploy.
+
+## Moving to a custom domain (R7)
+
+The code side is already done and was verified during R1/D1: the public origin
+comes from `PUBLIC_URL || RENDER_EXTERNAL_URL` — env only, never influenced by
+the `Host` header — the cookie is `Secure` outside dev, and `verify.py` builds
+the signed message's stated origin from the same variable, so the domain the
+wallet shows the user matches the address bar. A custom domain is therefore
+configuration, in this order:
+
+1. **Add the domain in Render** (Settings → Custom Domains) and create the CNAME
+   it asks for. Wait for the certificate to issue — Render does this
+   automatically via Let's Encrypt. Confirm `https://<domain>` serves the app
+   before going further.
+2. **Set `PUBLIC_URL=https://<domain>`.** Until this is set, the app keeps
+   deriving its origin from `RENDER_EXTERNAL_URL`, so `/login` would redirect to
+   the `.onrender.com` host, the session cookie would land there, and the user
+   would come back to the custom domain signed out. This is the failure mode to
+   expect if you skip the step, and it fails safe — never signed in as someone
+   else.
+3. **Add the domain to Privy's allowed origins** (dashboard → your app →
+   Settings → Domains). Miss this and Privy's modal silently refuses to open on
+   the new host; wallet connection is the only thing that breaks.
+4. **If real Fayda credentials are in play**, the redirect URI registered with
+   partner.fayda.et must be updated to `https://<domain>/callback` too — an
+   OIDC provider matches it exactly, and a mismatch rejects every login.
+5. Re-run the checks in "Rate limiting behind the proxy" below: the proxy chain
+   is what changed.
+
+Nothing here is verifiable from a development machine, which is why it is
+written as a procedure rather than claimed as done.
+
+## Rate limiting behind the proxy — verify this after the first deploy
+
+The limiter buckets by client address. Behind Render's proxy the socket peer is
+always the proxy, so `TRUST_PROXY_HEADERS=1` makes it read `X-Forwarded-For`
+instead — **counting from the right**, because that header is a list each proxy
+appends to and everything to the left of the last trusted hop is whatever the
+caller chose to send. Reading it from the left made the limiter a no-op and let
+an attacker drain a named victim's bucket.
+
+`TRUSTED_PROXY_HOPS` (default 1) is how many proxies sit in front. **Leave it
+at 1 for Render.** That is correct whether Render appends to the caller's
+header (`1.2.3.4, <client>` → picks `<client>`) or replaces it outright
+(`<client>` → picks `<client>`); both give the true client.
+
+**Raising it is the dangerous direction, and it is not symmetric with lowering
+it.** Each extra hop moves the key one position left — towards the part of the
+header the caller wrote — so an over-counted hop hands the bucket back to the
+attacker silently, with no symptom at all. Under-counting fails the other way:
+everyone lands in one bucket and legitimate users see 429s under modest load,
+which is visible and annoying but safe. If you see that symptom, the cause is
+almost certainly something else; do not reach for this variable.
+
+Check after the first deploy: two different clients hitting `/login` should
+each get their own allowance, and a single client should be refused after
+roughly 40 rapid requests.
+
+## Backups — what is verified and what is not (R6)
+
+Queried from the database itself: `wal_level=logical`, `archive_mode=on`,
+`max_wal_senders=5`. WAL archiving — the mechanism managed backups and
+point-in-time recovery are built on — **is enabled**.
+
+That is the prerequisite, not the guarantee. Three things could not be checked
+from the application and remain **unverified**:
+
+1. **Retention.** Whether Supabase is keeping those archives, and for how long,
+   is a project-plan setting visible only in the dashboard (Database →
+   Backups). Free-tier projects historically get a shorter window than paid.
+2. **That a restore actually works.** An untested backup is a hypothesis. The
+   only way to know is to restore into a scratch project and run
+   `APP_ENV=dev python backend/t.py` against it.
+3. **That the pepper is backed up with the data.** This one bites hardest and
+   is not a database setting at all: `FIN_PEPPER` lives in the platform's env
+   vars, not in Postgres. Restoring the database without the same pepper
+   orphans **every** identity row — each is keyed by `fin_hmac`, every FIN
+   re-hashes differently, and the sybil index then blocks each user from
+   re-binding their own wallet. Store the pepper wherever the backups are
+   stored, and treat losing it as equivalent to losing the database.
+
+**The drill, to run before this holds real data:** restore the most recent
+backup into a scratch Supabase project, point `SUPABASE_DB_URL` at it with the
+*same* `FIN_PEPPER`, run the suite, and confirm an existing identity can still
+reach its own binding. Record the date it last passed.
 
 ## Local rehearsal (what CI or a fresh clone should do)
 

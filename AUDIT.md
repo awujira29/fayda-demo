@@ -5,6 +5,938 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Fix review — R6 round 3, 2026-07-27 (NEW-1, NEW-2 and the named lows)
+
+**Scope:** the tombstoning of `delete_sessions_for_credential`, `REVOKED_GRACE_MINUTES`,
+the joined-header `client_key`, the peer-based self-call exemption
+(`check(..., peer=)` + `peer_of`), the `elif not written` cookie branch, the
+`/api/passkey/revoke` tier entry, and tests 52/53 plus the tightened 46/51.
+
+**Method.** Fresh uvicorn on :8145 (unlimited) and :8146 (limited,
+`TRUST_PROXY_HEADERS=1`), both terminated. Each previous finding re-driven with
+the script that broke it. Header parsing exercised across 18 shapes. One
+scratchpad ASGI probe (outside the project tree) to read `scope["client"]` as
+the real server builds it. `t.py` not run (test 32 resets the shared database).
+No project file modified.
+
+**Status: NEW-1 RESOLVED, NEW-2 PARTIAL (logic correct, input is not), all five
+named lows RESOLVED. 2 new findings, both high.**
+
+| # | Finding | Status |
+|---|---|---|
+| NEW-1 | passkey revocation resurrectable | **RESOLVED** |
+| NEW-2a | duplicate/multi-value XFF chose the bucket | **RESOLVED** |
+| NEW-2b | spoofed loopback bought the exemption | **PARTIAL** — logic fixed, see NEW-3 |
+| low | tombstones parked 12 h | **RESOLVED** — but see NEW-4 |
+| low | `save_session` bool discarded | **RESOLVED** |
+| low | `/api/passkey/revoke` in `read` tier | **RESOLVED** (`bind`) |
+| low | test 46 eviction bound unfailable | **RESOLVED** (0.6 s) |
+| low | test 51 one-word sweep check vacuous | **RESOLVED** |
+
+### NEW-1 — RESOLVED
+
+`delete_sessions_for_credential` now tombstones with the same UPDATE as logout.
+The attack that defeated revocation 5/5 now loses every round:
+
+```
+attempt 0..4: authed=False  nonce=401  tombstoned=True  reclaim_in=10.0min
+=> passkey revocation defeated: 0/5
+```
+
+`grep 'DELETE FROM sessions'` leaves exactly two sites, neither a kill path:
+`load_session`'s lazy cleanup of an already-expired row (which returns `None`
+regardless) and the TTL sweep. Two revocations racing the same row
+(`/logout` and `delete_sessions_for_credential` on a barrier) produce one
+tombstone and one dead session — the `AND revoked_at IS NULL` predicate makes
+the loser a no-op. Rotation, the swept-sid path and the `_expiry_due` renewal
+were re-checked from the previous round and still hold. Test 52 drives a real
+`SoftAuthenticator` registration and sign-in, so it tests the code and not a
+mock, and would fail against the previous cut.
+
+### NEW-2a — RESOLVED
+
+`client_key` joins every `x-forwarded-for` header before counting from the
+right. Eighteen shapes, peer `203.0.113.9`, one trusted hop — the attacker's
+prefix never wins, and every malformed proxy entry falls back to the peer (the
+visible-but-safe direction), never to a caller value:
+
+```
+duplicate: attacker first, proxy second  -> '198.51.100.7'
+attacker multi-value + proxy header      -> '198.51.100.7'
+three headers                            -> '198.51.100.7'
+attacker claims loopback first           -> '198.51.100.7'
+attacker trailing comma / only commas    -> '198.51.100.7'
+whitespace soup / empty header + proxy   -> '198.51.100.7'
+IPv6 proxy entry                         -> '2001:db8::1'
+IPv6-with-port / IPv4-with-port          -> peer   (unparseable, falls back)
+>64-char entry / '_hidden' (RFC 7239)    -> peer
+empty-only / commas-only / no header     -> peer
+```
+
+`TRUSTED_HOPS` cannot be walked left by any of them: the trusted proxy always
+appends last, so `parts[-1]` is its observation whatever precedes it.
+
+### NEW-2b — PARTIAL
+
+The logic is right. Exercised in isolation, the exemption follows the peer and
+not the key:
+
+```
+peer=127.0.0.1      key=198.51.100.90  -> allowed 200/200  (exempt)
+peer=198.51.100.90  key=127.0.0.1      -> allowed  40/200  (spoof refused)
+```
+
+But the value the middleware hands it is not the socket peer — see **NEW-3**.
+The self-call exemption is otherwise sound: on the limited instance three
+complete OIDC logins succeeded (3/3), so the token/userinfo self-calls are not
+throttled, and a loopback peer on a non-`/v1/` path is still limited
+(`90x /login -> 33 refusals`).
+
+### The named lows — all RESOLVED
+
+* Tombstones now carry `expires_at = now + 10 min` (measured `reclaim_in=10.0min`
+  on every revocation) instead of parking for the original 12 h. **This fix is
+  also the cause of NEW-4.**
+* `elif not written` is correct and cannot misfire: `written` is only ever
+  assigned from `save_session`, which returns `False` only when
+  `revoked_at IS NOT NULL`. Six plain reads plus a forced renewal write on a
+  healthy session emitted no clearing cookie and left it authenticated.
+* `/api/passkey/revoke` now resolves to the `bind` tier.
+* Test 46's bound is now `< 0.6 s`; the replaced `min()` implementation needed
+  ~1.5 s for the same loop, so the assertion can now fail against the regression
+  it guards.
+* Test 51 screens `"Someone"` against `"Someone Else Entirely"` — names that
+  share a token — so the one-word sweep check can now fail.
+
+---
+
+### NEW-3 — High. `peer_of` is not the socket peer: uvicorn has already rewritten `scope["client"]` from `X-Forwarded-For`, so a header still buys the self-call exemption — and, with `TRUST_PROXY_HEADERS` unset, still chooses the bucket. (`backend/ratelimit.py` `peer_of`; `Dockerfile:28`) — **certain** for the code, **likely** for reachability
+
+`peer_of`'s docstring says "The socket peer — never caller-influenced, whatever
+the headers say." It reads `scope["client"]`, which is not a socket-level fact.
+uvicorn 0.51 enables `ProxyHeadersMiddleware` by default
+(`proxy_headers=True`, `forwarded_allow_ips` resolving to `"127.0.0.1"`); when
+the connecting peer is trusted it joins every `x-forwarded-for` value and
+**overwrites `scope["client"]`** before any application middleware runs. A
+scratchpad ASGI probe wrapping the real functions, served by the same uvicorn
+invocation the project uses:
+
+```
+XFF="198.51.100.90"  -> client='198.51.100.90'  peer_of='198.51.100.90'  self_call=False
+XFF="127.0.0.1"      -> client='127.0.0.1'      peer_of='127.0.0.1'      self_call=True
+XFF="::1"            -> client='::1'            peer_of='::1'            self_call=True
+XFF=""               -> client='127.0.0.1'      peer_of='127.0.0.1'      self_call=True
+```
+
+End to end against the limited instance, one header line apart:
+
+```
+80x /v1/esignet/oidc/userinfo, XFF=198.51.100.99 -> 429s: 40   (limited)
+80x /v1/esignet/oidc/userinfo, XFF=127.0.0.1     -> 429s:  0   (exempt)
+90x /login,                    XFF=127.0.0.1     -> 429s: 33   (still limited)
+```
+
+Zero refusals in eighty. The exemption the fix moved onto the peer specifically
+to stop this is bought by writing `127.0.0.1` into a header.
+
+The second half is worse in principle: when `TRUST_PROXY_HEADERS` is **unset** —
+the documented default, "*(leave unset)*" — `client_key` skips its careful
+right-counting entirely and returns `peer_of(scope)`. If uvicorn has rewritten
+that value, the bucket key is caller-chosen again. That is the original H2
+bypass, reinstated in the configuration chosen to avoid it, and it bypasses
+`TRUSTED_PROXY_HOPS` because the app's parser never runs.
+
+**Reachability.** Not the shipped Render topology: the Dockerfile binds
+`0.0.0.0` and Render's proxy connects from a non-loopback address, so uvicorn
+does not trust it and leaves `client` alone. It **is** live in local dev
+(`uvicorn --host 127.0.0.1`) and in any deployment fronted by a same-host
+reverse proxy — nginx, Caddy, Apache on 127.0.0.1 — which is the ordinary
+self-hosting shape and exactly the topology `TRUST_PROXY_HEADERS` exists for.
+Exploitability there depends on the local proxy's own XFF policy: if it passes
+the client's header through (nginx adds no `X-Forwarded-For` unless configured
+to), the caller owns `scope["client"]` outright.
+
+The underlying defect is structural: there are now **two** `X-Forwarded-For`
+parsers in the stack with different trust models — uvicorn's (trusts loopback
+peers, walks right skipping trusted hosts) and the app's
+(`TRUST_PROXY_HEADERS` + a fixed hop count) — and the app's runs on a value the
+other has already rewritten. Every comment in `ratelimit.py` describes a
+single-owner decision the process does not actually make. Starting with
+`proxy_headers=False` (`--no-proxy-headers`) makes `scope["client"]` the socket
+peer again and leaves the app the only parser, which is what the code already
+believes.
+
+Test 53 passes `peer="203.0.113.9"` explicitly, so it asserts `check`'s logic
+and can never observe what `scope["client"]` actually contains. Nothing in
+46–53 exercises the composed server.
+
+### NEW-4 — High. Pulling the tombstone in to 10 minutes reopened resurrection: a parked request outlives the sweep and `save_session` takes its INSERT branch. (`backend/store.py` `REVOKED_GRACE_MINUTES`, `save_session`; `backend/app.py` session middleware) — **certain**
+
+`save_session` refuses to overwrite a **tombstoned** row. It has nothing to say
+about a **missing** one — no row means no conflict, so the INSERT branch runs
+and the session is recreated with `revoked_at = NULL` and a fresh 12-hour TTL.
+The sweep now removes the tombstone after ten minutes, so the attacker only has
+to outlast ten minutes rather than the twelve hours the previous cut left.
+
+The session is loaded by the middleware when the request headers arrive; the
+body is read later, downstream. So a request parked mid-body holds a
+pre-revocation snapshot for as long as the attacker likes — uvicorn applies no
+request-body timeout by default. Driven end to end:
+
+```
+request parked mid-body (session already loaded, response not started)
+logout -> tombstoned: True
+sweep reclaimed the tombstone (as it does at +10min): True
+parked request completed with 200
+row for the revoked sid RECREATED: True  identity_id=True  expires=2026-07-28T05:36
+revoked cookie authenticates again: True   /api/wallet/nonce -> 200
+```
+
+No race timing is involved — the attacker sends headers plus one byte, waits,
+and finishes. The recreated row carries **no tombstone**, so logout and passkey
+revocation are both defeated again and the owner is back to having no lever.
+The precondition is only that `save_session` be called on the response path,
+which `_expiry_due` guarantees for any session older than an hour — the normal
+state of a session worth stealing.
+
+The fix that closed the parking problem and the fix that closed resurrection are
+in tension because both are expressed as row lifetime. They separate cleanly if
+the middleware distinguishes the two cases it already knows apart: a sid it
+minted this request (`fresh`) may INSERT; a sid that arrived in a cookie may
+only UPDATE an existing, unrevoked row. Then no sweep timing can matter.
+
+### NEW-5 — Low
+
+Test 53's exemption assertion supplies `peer` directly, and tests 46–53 build
+their scopes by hand, so no test in the suite observes the ASGI scope as the
+production server actually composes it. That is the gap NEW-3 lives in; a single
+end-to-end assertion (a spoofed loopback header against a limited instance must
+still be refused on `/v1/`) would close it.
+
+---
+
+**Fix-review verdict: no — one more round, and it is the same root cause both
+times.** NEW-1 is properly dead: no kill path hard-DELETEs, racing revocations
+converge on one tombstone, and test 52 exercises a real passkey. NEW-2a is
+comprehensively fixed across every header shape I could construct. But the two
+remaining highs are both "the guard is correct, the input to it is not" — the
+exemption trusts a `scope["client"]` that uvicorn rewrote from a header, and
+`save_session` trusts a row's absence as evidence that the sid is new. Both are
+small: start uvicorn with `--no-proxy-headers`, and let only a freshly minted
+sid take the INSERT branch.
+
+
+---
+
+## Audit - 2026-07-27 — R6 production hardening (uncommitted working tree vs 7f0a748)
+
+**Scope:** the uncommitted diff only — `backend/app.py` (+167/-15), `backend/store.py`
+(+45/-6), `backend/t.py` (+219), CLAUDE.md, DEPLOY.md, render.yaml, plus the two
+new untracked files `backend/ratelimit.py` (129 lines) and `backend/screening.py`
+(126 lines).
+
+**Method.** Two throwaway uvicorn instances of the current tree on ports 8123/8125/8126
+(rate limiting on, off, and on-with-`TRUST_PROXY_HEADERS=1`), all terminated. Raw
+sockets for path-normalisation probes so no client library could normalise the request
+line for me. Barrier-synchronised 3-thread races for the logout work (6 attempts each,
+modest concurrency). Direct `store.conn()` reads of the `sessions` table to observe
+rows rather than infer them. `t.py` was **not** run — its test 32 calls `store.reset()`
+and would have wiped the database the dev server on :8000 is using. No code modified.
+
+**Counts: 0 critical / 2 high / 6 medium / 13 low.**
+
+Both highs are the same failure: a control whose *documented* mechanism is not the
+mechanism actually doing the work. `__killed__` cannot reach the request it was written
+to stop, and the rate-limit key is chosen by the caller in the one deployment config
+that ships. Everything R6 claims about tiers, middleware order, path normalisation,
+the log whitelist and the nonce binding held up under attack.
+
+---
+
+## Re-audit of the R6 fixes — 2026-07-27 (same working tree, after the fix delta)
+
+**Scope:** the fix delta only — `sessions.revoked_at` + tombstoning
+`delete_session` + conditional `save_session` + synchronous revoke in `/logout`
+(`scope["session_sid"]`), `client_key` counting X-Forwarded-For from the right,
+the login-tier retune, the `OrderedDict` LRU, sampled refusal logging, the
+`SUPABASE_CA_CERT` startup raise, bidirectional subset screening, the narrowed
+`/v1/` self-call exemption, and the rewrites of tests 46/49/51.
+
+**Method.** Two fresh uvicorn instances (:8135 unlimited, :8136 limited with
+`TRUST_PROXY_HEADERS=1`), both terminated. Every original finding was re-driven
+with the *same* attack script that broke it the first time, not a new one. Raw
+sockets for header-shape probes. `t.py` was again not run (test 32 resets the
+database the :8000 dev server uses). No code modified.
+
+**Status: 7 of 8 RESOLVED, 1 PARTIAL. 2 new findings (2 high). Counts after
+re-audit: 0 critical / 3 high / 0 medium / 17 low.**
+
+| # | Finding | Status |
+|---|---|---|
+| H1 | `/logout` resurrection | **RESOLVED** |
+| H2 | attacker-chosen limiter key | **PARTIAL** — see NEW-2 |
+| M1 | shared-NAT login lockout | **RESOLVED** |
+| M2 | O(n) eviction under the lock | **RESOLVED** |
+| M3 | refusal log flood | **RESOLVED** |
+| M4 | silent TLS downgrade | **RESOLVED** |
+| M5 | screening false-clean | **RESOLVED** |
+| M6 | self-throttled OIDC token exchange | **RESOLVED** |
+
+### H1 — RESOLVED
+
+The tombstone now lives in the row (`sessions.revoked_at`), `delete_session` is an
+UPDATE rather than a DELETE so the sid cannot be INSERTed back, `save_session`'s
+`ON CONFLICT … WHERE sessions.revoked_at IS NULL` refuses to write over it, and
+`/logout` revokes synchronously in the handler off `scope["session_sid"]` rather
+than trusting the response path. The same attack that won 5 times in 6 now loses
+every time — attacker polling `/api/passkey/login/begin` with the stolen cookie
+across the logout and for 0.6 s after:
+
+```
+attempt 0..5: authed=False  nonce_status=401  revoked=yes
+=> stolen cookie survived logout: 0/6
+```
+
+Checked separately, all clean:
+
+* **The `_expiry_due` variant.** A session aged past `SESSION_RENEW_SECONDS` and
+  then logged out stays dead; the renewal write is refused by the WHERE clause
+  (`aged+revoked: authed=False, still tombstoned=True`).
+* **Rotation.** `__rotate__` tombstones the old sid, the new row is written clean
+  (`revoked_at=None`, no `__killed__`, keys exactly
+  `__renewed__/auth_at/auth_method/claims/identity_id`), the old row's `data` is
+  emptied to `{}`, and three consecutive logins on the same client all succeed.
+  The tombstone does not leak into the new session.
+* **Reuse after the sweep.** With the tombstone row deleted outright (simulating
+  the TTL sweep), replaying the old cookie authenticates `False` and a
+  session-writing request on that sid mints a **fresh** sid rather than
+  recreating the old row — `load_session` returning `None` forces `sid = None` in
+  the middleware, so a client can never steer a write back onto a dead sid.
+* **The handler-to-response window.** The double revoke (handler, then the
+  middleware's `elif sid is not None` branch) is idempotent: the UPDATE's
+  `AND revoked_at IS NULL` makes the second a no-op.
+
+Test 49 is now a real test — it reproduces the winning attack (separate client,
+stolen cookie, session-*writing* endpoint, kept running past the logout) and
+asserts against both `/api/me` and `/api/wallet/nonce`. It would have failed
+against the previous code.
+
+### H2 — PARTIAL
+
+The left-to-right change itself is correct, and correct **for Render
+specifically**: `TRUSTED_PROXY_HOPS=1` takes `parts[-1]`, which is the true
+client whether the fronting proxy appends to a caller-supplied header
+(`1.2.3.4, <client>` → `<client>`) or replaces it wholesale (`<client>` →
+`<client>`). Both cases give the same answer, so the documented Render
+assumption is safe in either direction. Verified over HTTP on :8136 — 60
+requests with a rotating forged prefix and a constant real client all landed in
+**one** bucket (`429s: 1, first at 59`, exactly the single-bucket refill curve),
+where the old code allowed 60/60. Junk and empty headers fall back to the socket
+peer as intended.
+
+It is PARTIAL because the caller can still choose the key by two other routes,
+both of which also hand over the `/v1/` self-call exemption — see **NEW-2**.
+
+### M1 — RESOLVED
+
+`login` retuned to `1.0/s burst 40`. Nine consecutive visitors sharing one NAT
+address each completed a full four-token sign-in:
+
+```
+visitor 0..8: [307, 200, 303, 307] authed=True
+=> 9/9 signed in behind one address (previously the 5th was refused at /login)
+```
+
+### M2 — RESOLVED
+
+`OrderedDict` with `popitem(last=False)` and pop/re-insert on every touch.
+Measured: 22 000 distinct keys in **0.016 s (0.7 µs/call)**, table capped at
+20 000; 5 000 further inserts against a full table also 0.7 µs/call, against
+~770 µs before. The event loop is no longer blocked and the ~1 300 req/s
+process-wide ceiling is gone. LRU semantics are correct — a continuously-touched
+key survived 5 000 evictions (`True`), so an attacker cannot flush a specific
+victim's bucket by keeping it "at the front"; touching a key is what protects it,
+and only the attacker's own keys age out. The added
+`and bucket_key not in _BUCKETS` guard correctly stops an existing caller from
+evicting a stranger on every request.
+
+### M3 — RESOLVED
+
+Sampled 1 in 50, and the sample carries `count` so the true volume is still
+legible. Over the ~300 refusals driven in this session the server emitted **two**
+lines: `"count": 1` and `"count": 51`.
+
+### M4 — RESOLVED
+
+```
+$ SUPABASE_CA_CERT=/nonexistent/ca.crt python -c "import store; store._conninfo()"
+RuntimeError: refusing to start: SUPABASE_CA_CERT points at '/nonexistent/ca.crt',
+which is not a readable file...
+```
+
+Set-but-unreadable is now a startup failure rather than a silent fall back to
+unauthenticated TLS.
+
+### M5 — RESOLVED
+
+Subset in either direction. The false-clean is gone and the feared noise did not
+materialise:
+
+```
+'Tesfaye Bekele'        -> [('Tesfaye Bekele','exact')]
+'Tesfaye Bekele Alemu'  -> [('Tesfaye Bekele','partial')]     <- was []
+'Abebe Kebede'          -> [('Abebe Kebede Tesfaye','partial')]
+'Hiwot Girma'           -> []                                  <- still clean
+'Ali Mohammed Hassan' vs a 2 000-entry list with one 1-token entry -> 1 match
+```
+
+A one-token list entry adds exactly one match rather than sweeping, and the cap
+of 25 still holds.
+
+### M6 — RESOLVED
+
+`BASE` defaults to `http://127.0.0.1:${PORT}` and `render.yaml` does not set
+`BASE_URL`, so on Render the token/userinfo self-calls are genuinely loopback and
+hit the exemption. The exemption is narrow on both axes (`_is_self_call` requires
+loopback **and** the `/v1/` prefix), and `/v1/` is now in the route table at the
+`login` tier, so a remote caller is limited — confirmed on :8136: an honest
+single-header client hitting `/v1/esignet/oidc/userinfo` was refused 30 times in
+70. Test 46 asserts both axes independently and both assertions can fail.
+
+---
+
+### NEW — High
+
+#### NEW-1. The *other* session-kill path was not fixed: passkey revocation still hard-DELETEs, so an in-flight write resurrects the revoked session. (`backend/store.py:790-805` `delete_sessions_for_credential`; `backend/app.py:797-819`) — **certain**
+
+`save_session`'s new guard only refuses to overwrite a **tombstoned** row. A row
+that has been DELETEd carries no tombstone, so the INSERT branch takes the
+conflict-free path and succeeds. `delete_sessions_for_credential` — the only
+thing `/api/passkey/revoke` uses to end the attacker's session — is still a hard
+`DELETE`:
+
+```
+delete_sessions_for_credential -> 1 row(s) removed
+row after revoke: GONE (hard DELETE, no tombstone)
+concurrent save_session returned True; load_session -> RESURRECTED, identity_id=d15c5846
+--- contrast, same row via the logout path ---
+after delete_session (tombstone): save_session returned False; load_session -> None
+```
+
+Over HTTP, with the attacker holding a passkey-established session and polling
+`/api/passkey/login/begin` while the owner revokes the credential:
+
+```
+attempt 0..4: revoked session still authed=True  can_start_a_bind=True
+=> passkey revocation defeated: 5/5
+```
+
+The resurrected row carries a fresh 12-hour TTL and **no tombstone**, so the
+attacker can keep re-winning the same race indefinitely; the owner has no
+remaining lever, because revoking the credential a second time only repeats the
+DELETE. `can_start_a_bind=True` means the resurrected session can reach
+`/api/wallet/nonce` — the binding surface, not just a read.
+
+This is the exact failure H1 was fixed for, on the path whose own docstring says
+"Revocation that only blocks the NEXT sign-in is not an escape hatch … leaving
+that session alive for the rest of its 12h TTL would make revocation a
+formality." It is the *more* attacker-relevant of the two, because the session
+being killed is by construction the attacker's, and the attacker is the party
+with a reason to be polling. Nothing in tests 46-51 covers it; test 49 tests only
+`/logout`.
+
+Same shape, unaudited: any future kill path that DELETEs rather than tombstones.
+The invariant now belongs in `save_session`'s contract, not in each caller.
+
+#### NEW-2. `client_key` still lets the caller choose the bucket — via a duplicated `X-Forwarded-For` header, or via a `TRUSTED_PROXY_HOPS` over-count that DEPLOY.md explicitly invites — and either one also grants the loopback self-call exemption to a remote caller. (`backend/ratelimit.py:139-160`; `DEPLOY.md:127-134`) — **certain** for the code path, **likely** for reachability
+
+Two independent triggers, both restoring the full H2 bypass.
+
+**(a) Duplicated header.** RFC 7230 §3.2.2 makes repeated field-names
+semantically one comma-joined list. `client_key` iterates `scope["headers"]`,
+takes the **first** `x-forwarded-for` and `break`s — so if the fronting proxy
+emits its own header instead of appending to the caller's, position 0 of the
+first header is again whatever the caller sent:
+
+```
+attacker header first, proxy header second -> '9.9.9.9'        (proxy said 198.51.100.7)
+single joined header                       -> '198.51.100.7'   (correct)
+attacker claims loopback, proxy appends    -> '127.0.0.1'
+```
+
+uvicorn preserves both headers separately in the scope, so this is reachable end
+to end. Demonstrated on :8136 against the self-call surface:
+
+```
+70x /v1/esignet/oidc/userinfo, first header claims 127.0.0.1 -> 429s: 0
+70x /v1/esignet/oidc/userinfo, honest single header          -> 429s: 30
+```
+
+Zero refusals in seventy — not merely a fresh bucket per request but **complete
+exemption**, because `_is_self_call` believes the caller is loopback.
+
+**(b) Hop over-count.** With one appending proxy and `TRUSTED_PROXY_HOPS=2`,
+`parts[-2]` is the attacker's last forged entry:
+
+```
+hops=2, XFF '1.2.3.4, 198.51.100.7'   -> key '1.2.3.4'
+        XFF '5.5.5.5, 198.51.100.7'   -> key '5.5.5.5'      (fresh bucket per request)
+        XFF '127.0.0.1, 198.51.100.7' -> key '127.0.0.1'
+        -> _is_self_call('/v1/…') == True
+```
+
+DEPLOY.md:134 tells the operator, when the hop count looks wrong, to "raise or
+lower `TRUSTED_PROXY_HOPS` by one" — presenting the two directions as
+symmetric. They are not. Lowering costs availability (everyone shares a bucket,
+loudly). Raising silently hands the key, and the exemption, to the caller. The
+guidance points at the dangerous direction half the time and the observable
+symptom it describes (everyone refused together) is the symptom of the *safe*
+direction, so an operator debugging that symptom will raise the value.
+
+Both are cheap to close: join every `x-forwarded-for` value before splitting, and
+clamp the candidate so the exemption can never come from a forwarded header at
+all (require the socket peer to be loopback for `_is_self_call`, not the derived
+key). Test 46 builds its probe scope with a single header and never varies the
+hop count, so neither trigger is covered.
+
+---
+
+### NEW — Low
+
+* **NEW-L1.** Test 46's O(1) assertion cannot fail against the implementation it
+  guards. `assert evict_elapsed < 10.0` for `_MAX_BUCKETS + 2000` keys; the
+  replaced `min()` code costs 0.749 ms per new key at 20 000 entries, so the old
+  implementation completes the same loop in **~1.51 s** — six times inside the
+  threshold. Measured. A threshold near 0.5 s, or a per-call assertion, would
+  actually pin the property.
+* **NEW-L2.** Test 51's "a one-word name must not sweep the list" assertion is
+  vacuous: it screens `"Tesfaye"` and asserts `"Someone Else Entirely"` is absent,
+  but those two share no token, so no subset rule in any direction could ever
+  match them. To fail, the control entry would have to share a token with the
+  one-word query.
+* **NEW-L3.** `delete_session` tombstones without shortening `expires_at`, so a
+  logged-out session's row now occupies the table for the remainder of its
+  original TTL — up to 12 hours — where it used to be freed at once. Observed: 28
+  of 188 rows tombstoned after this session's testing. The asymptotic bound
+  (arrival rate × TTL) is unchanged and the sweep still reclaims them, but on the
+  one table CLAUDE.md flags as attacker-growable the constant got worse for no
+  benefit; `revoked_at = now, expires_at = now` would let the next ten-minute
+  sweep take it.
+* **NEW-L4.** `save_session` now returns whether it wrote and the middleware
+  discards the result, so a refused write is silent — no log, no metric. In the
+  same branch the middleware still appends `Set-Cookie` for a sid it just failed
+  to persist, handing the browser a cookie for a dead session. Harmless today
+  (`load_session` returns `None` for it, verified) but it means the one signal
+  that a resurrection attempt was blocked is thrown away.
+* **NEW-L5.** `/api/passkey/revoke` remains in the loosest `read` tier
+  (10/s, burst 120) — unchanged from the first run's L1, but now more pointed:
+  NEW-1 makes it the security-critical escape hatch, and it is the one
+  passkey route the tier table does not name.
+
+Still open from the first pass, unchanged by this delta: L2 (cookie `Max-Age` no
+longer slides while the row does), L3 (`SESSION_RENEW_SECONDS` > pre-auth TTL),
+L7 and L8 (test 51's `scr.LIST_PATH = ""` mutates the test process, not the
+server, so the endpoint's `not_configured` path is still unasserted over HTTP;
+`prod_dir if False else …` is still dead code), L9 (`RATE_LIMIT=off` silent in
+production), L10 (tests 1-45 still run unlimited).
+
+---
+
+**Re-audit verdict: no — one more round.** The R6 fixes are real and hold up:
+`/logout` is genuinely un-resurrectable across rotation, the sweep, the hourly
+renewal and every session-writing endpoint I could reach, and six of the seven
+other findings are closed with margin. But the same bug survives one door over —
+passkey revocation, the escape hatch, is defeated 5 times in 5 because it DELETEs
+where logout now tombstones — and the limiter key is still caller-choosable
+through a duplicated header or the hop count DEPLOY.md tells operators to raise.
+Both are small: make every kill path tombstone, and derive the self-call
+exemption from the socket peer rather than the forwarded key.
+
+
+---
+
+### Critical
+
+None.
+
+---
+
+### High
+
+#### H1. `/logout` does not reliably end the session. M7's tombstone cannot reach the request it was written to stop. (`backend/app.py:379-380`, `:395-399`, `:621`; `backend/store.py:773-782`) — **certain** — **RESOLVED (re-audit 2026-07-27)**
+
+`__killed__` is written into `request.session` — the dict belonging to the *logout*
+request. The concurrent request that M7 exists to defeat holds a **different dict**,
+deserialised independently by `store.load_session` at its own request start. Nothing
+the logout request pops from its own dict is ever observable by that other request. The
+tombstone is therefore functionally identical to the `request.session.clear()` it
+replaced: both make `if session:` false and both fall to `store.delete_session(sid)`.
+It fixes nothing.
+
+What actually suppresses most resurrections is M6's change detection (`:395`) — and
+that fails open in two ways:
+
+* **any concurrent request that writes to the session** sets `changed = True` and
+  unconditionally re-saves its stale snapshot;
+* **any concurrent request on a session whose `__renewed__` is older than
+  `SESSION_RENEW_SECONDS`** (once per hour per session) takes the `_expiry_due` branch
+  and re-saves for the same reason.
+
+`save_session` is `INSERT … ON CONFLICT(sid) DO UPDATE` (`store.py:778`), so the re-save
+re-creates the row logout just deleted, **with `expires_at` reset to a full 12 hours**.
+
+Concrete attack, measured on a fresh instance of this tree:
+
+1. Attacker holds a stolen session cookie (the exact premise CLAUDE.md names: "an
+   attacker with a live session"; logout is the user's remedy).
+2. Attacker loops `POST /api/passkey/login/begin` with the stolen cookie. It is
+   unprivileged, it is reachable to any session, and it writes `passkey_challenge`
+   into the session — so every one of its responses re-saves.
+3. Victim clicks Sign out.
+
+Result over 6 barrier-synchronised trials: **the stolen cookie still authenticated in
+5 of 6**, with the row's `expires_at` pushed to now + 12 h each time:
+
+```
+attempt 0: stolen cookie still authenticated=True  row_expires=2026-07-28T04:15:51
+attempt 1: stolen cookie still authenticated=True  row_expires=2026-07-28T04:15:58
+attempt 2: stolen cookie still authenticated=False row_expires=gone
+attempt 3: stolen cookie still authenticated=True  row_expires=2026-07-28T04:16:09
+attempt 4: stolen cookie still authenticated=True  row_expires=2026-07-28T04:16:16
+attempt 5: stolen cookie still authenticated=True  row_expires=2026-07-28T04:16:22
+STOLEN COOKIE SURVIVES VICTIM'S LOGOUT: 5/6
+```
+
+The `_expiry_due` variant needs no attacker at all — two ordinary tabs, one polling
+`/api/me`, on a session last renewed over an hour ago, resurrected the row in **3 of 6**
+trials (`row=PRESENT, identity_id_in_row=True, replayed_cookie_authenticated=True`).
+
+The victim gets a cleared cookie and a signed-out UI, so the failure is invisible to
+them. The attacker can hold it open indefinitely; each resurrection buys another 12 h.
+
+**Invariant broken:** the session-compromise remedy CLAUDE.md builds the cooling period
+around — "Signing out is the user's means of ending a session they may believe is
+compromised; it must not be undone by their own overlapping request" (the code's own
+comment at `app.py:614-620`).
+
+**Why test 49 misses it:** it calls `fayda_login()` at the top of every attempt, so
+`__renewed__` is always ~0 seconds old and `_expiry_due` is always false, and it races
+`GET /api/me`, which never writes to the session. It exercises only the interleaving
+that M6 already covers. It passes for a reason unrelated to the mechanism it names.
+
+#### H2. The rate-limit key is attacker-chosen wherever `TRUST_PROXY_HEADERS` is set, and `render.yaml` sets it for production. (`backend/ratelimit.py:92-99`; `render.yaml:45-49`) — **likely** (certain for the code; deployment-dependent for Render specifically) — **PARTIAL (re-audit 2026-07-27; see NEW-2)**
+
+`client_key` takes the **left-most** `X-Forwarded-For` entry, with no proxy-hop count,
+no validation that it is an IP, and no check that it came from the trusted hop:
+
+```python
+return value.decode("latin-1").split(",")[0].strip()[:64]
+```
+
+The left-most entry is only trustworthy if the fronting proxy **replaces** the header.
+Every proxy that *appends* — nginx `proxy_add_x_forwarded_for`, HAProxy `option
+forwardfor`, AWS ALB, Cloudflare, Fly — leaves the client's own bytes in position 0.
+DEPLOY.md's guidance is generic ("Set it ONLY when a trusted proxy sets
+`X-Forwarded-For`"), which is satisfied by all of them.
+
+Measured against this tree with `TRUST_PROXY_HEADERS=1`:
+
+```
+no XFF,      30x GET /login  -> first 429 at index 13
+spoofed XFF, 60x GET /login  -> 429 count 0
+XFF = 200 x 'A' (not an IP)  -> 307 (accepted as a bucket key, truncated to 64)
+```
+
+Sixty consecutive session-minting requests, zero refused. Three consequences:
+
+* **Bypass.** The limiter — the only thing bounding the unbounded `sessions` table,
+  the `/api/me/access-log` `count(*)`, the signature-verification CPU and the outbound
+  IdP amplification, all of which prior audit rounds flagged — is a no-op.
+* **Weaponisation.** Because the key is chosen by the caller, an attacker can send
+  `X-Forwarded-For: <victim IP>` and drain *that* IP's login bucket, denying a named
+  user the ability to sign in. The limiter becomes an offensive primitive.
+* **It feeds M2 below.** One keep-alive connection sprayed 21 000 unique keys into the
+  bucket table in 9.3 s with zero database work.
+
+There is currently **no correct setting of this variable**. Off, every visitor behind a
+proxy shares one bucket (M1). On, the key is caller-supplied. The missing piece is a
+trusted-proxy hop count and taking the Nth entry from the right.
+
+`render.yaml` hard-codes `value: "1"`, so this is the shipped production configuration,
+not an operator mistake. Test 46's `assert rlmod.TRUST_FORWARDED is False` reads the
+*test process's* environment and pins a property that render.yaml explicitly negates.
+
+---
+
+### Medium
+
+#### M1. Behind a proxy without `TRUST_PROXY_HEADERS`, one bucket serves the entire internet; even with it, a shared NAT is locked out of login after ~3 sign-ins. (`backend/ratelimit.py:39-48`, `:92-99`) — **certain** — **RESOLVED**
+
+A full login costs **four** `login`-tier tokens — `/login`, `/authorize`,
+`/authorize/confirm`, `/callback` all match that tier — against `burst=10` refilling at
+`0.5/s`. So one public IP supports ~2 back-to-back sign-ins and then one per 8 seconds.
+Measured with five visitors sharing one NAT address:
+
+```
+visitor 0..3: [('login',307),('authorize',200),('confirm',303),('callback',...)]
+visitor 4:    [('login', 429)]
+```
+
+The fifth person to click Sign in is refused at the first hop. DEMO_MODE's stated
+purpose is "a credential-less shared demo" — a room of people on one venue Wi-Fi is
+precisely one NAT address. On a deployment behind Cloudflare/nginx/ALB where the
+operator followed DEPLOY.md's "*(leave unset)*" default, `scope["client"]` is always the
+proxy and **all** users worldwide share that one bucket at 10 reads/s.
+
+#### M2. Eviction is an O(n) `min()` under a global lock on every new key once the table is full, and it blocks the event loop. (`backend/ratelimit.py:111-116`) — **certain** — **RESOLVED**
+
+`check()` tests the cap on every call, before it knows whether the key already exists.
+Once `len(_BUCKETS)` reaches 20 000, every request bearing a **new** key scans all
+20 000 entries. Measured in-process on this machine:
+
+```
+fill to 19 990 buckets      : 0.6 us/call
+table full (20 000)         : 0.771 ms/call  -> ceiling ~1 297 req/s process-wide
+existing-bucket hit         : 0.001 ms/call
+```
+
+`ratelimit.check` is a synchronous call from an async middleware, so those 0.771 ms are
+spent with the asyncio event loop blocked — no other request in the process progresses.
+~1 300 cheap requests/s stalls the whole instance, and via H2 that is reachable from a
+single connection. Two secondary effects: eviction is global, so a `read`-tier flood
+destroys `login`-tier buckets belonging to real users (the limiter loses state on the
+callers it should be tracking); and the table never shrinks, so a process that has once
+seen a spike pays the scan for every new visitor forever.
+
+Memory itself is fine — ~4 MB at the cap. The vector is CPU under a lock, not RAM.
+
+#### M3. A refused request writes a flushed JSON line to stderr, so the cheap path for the app is the expensive path for the log pipeline. (`backend/app.py:305`) — **certain** — **RESOLVED**
+
+`log_event("rate_limited", …)` runs on every refusal with `flush=True`, ~107 bytes per
+line, with no sampling, no suppression and no per-key backoff. One keep-alive connection
+sustained ~2 250 req/s against this tree with zero database work; if all were refused
+that is ~240 KB/s of log output from one attacker, on a platform where log ingestion is
+metered. A limiter that converts a request flood into a log flood has moved the cost,
+not removed it.
+
+#### M4. `SUPABASE_CA_CERT` pointing at a missing file silently downgrades to `sslmode=require`, contradicting the comment that says the absence is visible at startup. (`backend/store.py:386-390`) — **certain** — **RESOLVED**
+
+```
+$ SUPABASE_CA_CERT=/nonexistent/ca.crt python -c "import store; store._conninfo()"
+sslmode = require
+sslrootcert present: False
+```
+
+`if ca and Path(ca).is_file()` fails closed on the *check* and open on the *outcome*:
+no exception, no warning, no startup log. The store.py comment claims "the upgrade is
+explicit and its absence is visible at startup" — it is not. The realistic failure is a
+container where the certificate was not baked into the image or the mount path differs
+between the Dockerfile and render.yaml: the operator sets the variable, believes the
+connection is `verify-full`, and gets a TLS connection that authenticates nothing —
+exactly the state the code's own comment describes as leaving "the credential and every
+row" readable to anything that can intercept. Nothing in tests 46-51 covers this path.
+
+#### M5. Screening's partial-match rule is backwards for the naming convention the module is written for. (`backend/screening.py:104`) — **certain** — **RESOLVED**
+
+`needle_parts <= set(e["_norm"].split())` requires every token of the **queried** name to
+appear in the **listed** name. Ethiopian names are given + father + grandfather; Fayda's
+`name` claim will carry all three. Sanctions lists routinely carry two. Measured against
+a list holding `Tesfaye Bekele`:
+
+```
+'Tesfaye Bekele'        -> [('Tesfaye Bekele', 'exact')]
+'Tesfaye Bekele Alemu'  -> []            <-- the common real case, no hit
+'Bekele Tesfaye'        -> [('Tesfaye Bekele', 'partial')]
+'Mohammed'              -> [('Mohammed Ali','partial'), ('Mohammed Hassan Ibrahim','partial')]
+```
+
+The dominant real-world shape — a three-part Fayda name against a two-part list entry —
+produces a **clean report**, and `status: "screened"` with `list_size: 40000` reads as a
+positive statement that the person was checked. That is the one outcome the module's
+docstring is at pains to avoid ("a screening module that overstates itself is worse than
+none"). The inverse direction — a bare given name matching every entry sharing it — is
+noisy but honest, and capped at 25.
+
+Test 51 puts *both* `Tesfaye Bekele` and `Tesfaye Bekele Alemu` in the list and queries
+the two-token name, which is the direction that works. The failing direction is never
+exercised.
+
+#### M6. In DEMO_MODE the app rate-limits its own OIDC token exchange, and all logins share one bucket. (`backend/ratelimit.py:52-63`; `backend/app.py:74-75`) — **likely** — **RESOLVED**
+
+`TOKEN_URL`/`USERINFO_URL` default to `{BASE}/v1/esignet/…` — this process calling
+itself over HTTP. Neither path is in `ROUTES`, so both land in `read`, and every
+self-call carries the *same* client key (the app's own peer address), not the visitor's:
+
+```
+tier for /v1/esignet/oauth/v2/token : read
+tier for /v1/esignet/oidc/userinfo  : read
+self-calls allowed from one key: 120 (= 60 demo logins), then 10/s = 5 logins/s
+```
+
+Sixty logins of burst, then five per second **for the whole deployment**, after which
+`/callback` fails with a token-exchange error for everyone. Combined with H2 an attacker
+who sets `X-Forwarded-For` to the app's own egress address can drain that shared bucket
+directly and deny logins to every visitor.
+
+---
+
+### Low
+
+* **L1.** `/api/passkey/revoke` sits in the loosest `read` tier (10/s, burst 120) while
+  `/api/passkey/register/` and `/api/passkey/login/` are explicitly tiered. It performs
+  `delete_sessions_for_credential`, a `DELETE … WHERE data->>'passkey_credential_id' = %s`
+  — an unindexed JSONB scan of the whole `sessions` table — plus a second durable delete.
+  `/logout` is in the same tier and also does a durable delete per hit.
+  (`ratelimit.py:52-63`, `app.py:797`)
+* **L2.** The session cookie's `Max-Age` no longer slides while the database row does
+  (`app.py:397` vs `:400`). A renewal-only save refreshes `expires_at` to now + 12 h but
+  emits no `Set-Cookie` — confirmed empirically. An actively-used session is therefore
+  dropped by the *browser* exactly 12 h after the last session *change*, while the server
+  keeps writing renewals for a row nobody can present a cookie for. The renewal writes
+  buy nothing for the client; they only extend the row's lifetime in the table the sweep
+  exists to bound.
+* **L3.** `SESSION_RENEW_SECONDS` (3600) is longer than `PRE_AUTH_SESSION_TTL_HOURS`
+  (0.5 h = 1800 s), so a pre-auth session's sliding expiry can never fire before the row
+  dies. Harmless today because nothing touches the server during the IdP round trip, but
+  the two constants are in contradiction. (`app.py:235`, `:276`)
+* **L4.** Test 46's `assert rlmod.TRUST_FORWARDED is False` (t.py:1893) asserts the
+  *test process's* environment, not the server's. It would pass unchanged against a
+  server started with `TRUST_PROXY_HEADERS=1` — which is what render.yaml does.
+* **L5.** Test 46's `assert 5 <= first429 <= 20` (t.py:1859) would pass for a configured
+  burst of 5 or of 20. It does not pin the value in `RULES`.
+* **L6.** Test 49 (t.py:1954) re-logs-in on every attempt and races a read-only endpoint,
+  so it can never reach either resurrection path (see H1). It is the test for the finding
+  it cannot detect.
+* **L7.** Test 51's `scr.LIST_PATH = ""` at t.py:2046 mutates the **test** process; the
+  server under test has its own `screening` module and its own env. The endpoint's
+  `not_configured` behaviour is never asserted over HTTP — only the module's, in-process.
+* **L8.** Test 51's `os.path.join(prod_dir if False else tempfile.mkdtemp(), …)`
+  (t.py:2015) is dead code left in.
+* **L9.** `RATE_LIMIT=off` disables the entire control with no startup warning, in
+  production as in dev. Production refuses to start without `SESSION_SECRET` and
+  `FIN_PEPPER`; it says nothing about having no limiter. CLAUDE.md's Testing section now
+  leads with `RATE_LIMIT=off` as the normal command to copy. (`ratelimit.py:77`)
+* **L10.** The whole committed suite (tests 1-45) now runs against a server with the
+  limiter disabled, so nothing but test 46 exercises any interaction between limiting and
+  the binding, cooling, passkey or operator flows.
+* **L11.** `screening._load()` caches keyed only on the path (`screening.py:56`), so an
+  updated sanctions list file is never re-read without a process restart; and the module
+  lock is held across the file read.
+* **L12.** `_expiry_due` accepts `True` as an int — `isinstance(True, int)` is true, so a
+  `__renewed__` of `True` would compute `time.time() - True`. Not reachable (the key is
+  server-set), but the type guard does not do what it looks like it does. (`app.py:280`)
+* **L13.** `store.py:389-390` — `kw.setdefault("sslmode", "verify-full")` immediately
+  followed by `kw["sslmode"] = "verify-full"`. The `setdefault` is dead.
+
+---
+
+### Verified safe
+
+Actively attacked, could not break. Do not re-plough these.
+
+**Rate limiter classification and path normalisation.** No bypass exists. uvicorn
+percent-decodes into `scope["path"]` *before* either the limiter or Starlette's router
+sees it, so the two always agree. Raw-socket probes (no client-side normalisation):
+`/api%2Fwallet%2Fbind` and `/%61pi/wallet/bind` reach the real bind handler **and** are
+classified `bind` — a 40-request burst hit its first 429 at index 15, which is `burst=15`,
+not the `read` tier's 120. `/API/wallet/bind`, `//api/wallet/bind`, `/./api/wallet/bind`,
+`/api/./wallet/bind`, `/api/x/../wallet/bind`, `/api/wallet//bind` and
+`/api/wallet/bind%20` all 404 at the router, so a loose tier buys nothing. Query strings
+are excluded from `scope["path"]`, so `?x=1` neither changes the tier nor reaches the log
+line. Trailing-slash forms redirect within the same tier. HTTP method is irrelevant to
+classification but no method reaches a handler a mismatched tier protects.
+
+**Middleware order — verified empirically, not by reading the registration lines.**
+40 × `GET /login` against a limited instance: 11 allowed, 29 refused, and exactly **+11**
+rows in `sessions`. Zero refused requests reached the session layer, and no 429 carried a
+`Set-Cookie`. `app.add_middleware(RateLimitMiddleware)` last is genuinely outermost.
+
+**Tier assignment across the real route table.** All 29 routes enumerated from
+`app.app.routes` with `DEMO_MODE=1` and checked against `tier_for`. Every wallet, operator,
+registry, access-log, passkey-login and passkey-register route lands where R6 claims. The
+only misfits are L1 and M6 above; nothing sensitive silently fell into `read` beyond those.
+
+**`__killed__` / `__renewed__` are not client-reachable.** Every `request.session[...]`
+write in app.py uses a server-side literal key (`oidc_state`, `identity_id`, `claims`,
+`auth_method`, `auth_at`, `passkey_challenge`, `passkey_credential_id`, `__rotate__`,
+`__killed__`); there is no `session.update()` and nothing merges a request body into the
+session. No client can plant either key.
+
+**The tombstone is never persisted.** `session.pop("__killed__")` precedes the
+`if session:` branch, so the killed dict is empty by the time anything could write it.
+`sessions` rows inspected after 12 logout races contained no `__killed__`. (The tombstone
+is useless — H1 — but it is not itself dangerous.)
+
+**`__renewed__` does not leak.** Present in the stored row
+(`['__renewed__','auth_at','auth_method','claims','identity_id']`), absent from the
+`/api/me` response body, absent from the cookie (which carries only `sid.hmac`).
+
+**M6 does not lose a legitimate change.** `original` is a string captured before the
+handler runs, so later mutation of the same dict cannot corrupt it; `sort_keys=True`
+recurses into nested dicts, so key ordering cannot produce a false "unchanged";
+`default=str` cannot raise on the load side because everything came out of JSONB. Login
+still persists and still sets the cookie (`fresh` forces both). An empty-data row is
+still deleted. The lost-write failure mode I was looking for is not there — the M6 defect
+is the opposite one (H1: it saves when it should not).
+
+**The whitelist logger.** `log_event` cannot raise: the only failure-capable calls
+(`json.dumps` with `default=str`, `print`) are inside the `try`. The whitelist genuinely
+drops `fin_hmac`, `claims`, `sid`, `address`. `path` is the only attacker-influenced
+field and it cannot carry a subject: no route in the table has a path parameter other
+than the SPA catch-all, the frontend does no client-side routing (no `pushState`,
+`pathname` or router in `frontend/src`), and the query string is not in `scope["path"]`.
+`json.dumps` escapes newlines and quotes, so no log-line injection. Only two call sites
+exist, so R6's "structured logging" is thin but not leaky.
+
+**No raw FIN anywhere in R6.** `hash_fin` untouched. `/api/operator/screen` returns only
+`{id, display_name}` — both already visible to an operator through `/api/operator/identity`
+— and screens the stored `display_name`, never a client-supplied string. `fin_hmac` appears
+in no log line, response body or cookie added by this diff.
+
+**Nonce identity binding.** Both `issue_nonce` call sites (`app.py:944` real,
+`app.py:1433` dev test-key) pass `identity_id`, so the dev path is bound too and no new
+code path creates a NULL row. `wallet_bind` derives `iid` from `current(request)`, which
+401s first — the argument cannot be omitted or nulled by a client. The NULL escape only
+covers rows predating the `ALTER TABLE`, which the sweep clears within `NONCE_TTL`. The
+check sits after the address/chain comparison and **before** the `consumed = 1` UPDATE,
+which is the right order: a wrong-identity attempt does not burn the nonce, so the
+rightful owner can still redeem it. Verified end to end — a second identity redeeming
+another's nonce gets 400 "different identity" before verification is reached.
+
+**Dev surface.** `APP_ENV` of `''`, `'Dev'`, `'development'` and `'prod'` all refuse to
+start (missing `FAYDA_CLIENT_PRIVATE_KEY`) and register zero `/api/dev/*` routes. The new
+`/api/dev/` entry in the tier table is inert outside dev. R6 changed none of this.
+
+**Bucket table memory.** Hard-capped at 20 000 entries, ~4 MB. Not a memory-exhaustion
+vector; the cost is CPU (M2).
+
+**Screening input handling.** `_normalise` is linear — NFKD, a combining-mark filter, and
+`re.sub(r"[^\w\s]", " ", …)`, a character class with no backtracking. Accents, case and
+repeated whitespace all fold correctly (`Tesfayé Bekele`, `TESFAYE  bekele` both match).
+Matches cap at 25. Malformed JSON yields `status: screened, list_size: 0` rather than a
+clean-looking empty result. The list path is operator-supplied via env, never client-
+supplied, so it is not a traversal vector. The endpoint is operator-gated (403 for an
+ordinary session, 401 anonymous) and writes to the subject's access log.
+
+**Not touched by R6, spot-checked for regression:** the sybil indexes, the cooling
+period, `create_binding`'s `BindingConflict` handling, signature verification, and the
+`__rotate__` session-fixation path all behave as they did at 7f0a748.
+
+---
+
+**Verdict: no — not safe to build on as it stands.** `/logout` demonstrably fails to end
+a session 5 times in 6 against an attacker who is merely polling with the stolen cookie,
+and the fix credited with preventing that (`__killed__`) cannot reach the request it
+targets; separately, the limiter's key is caller-supplied in the configuration
+`render.yaml` ships. Both are small, local fixes — compare `X-Forwarded-For` from the
+right with a hop count, and give the session a server-side kill that a concurrent
+request can observe (a generation counter or a conditional `UPDATE … WHERE sid = %s`
+instead of an upsert). Everything else in R6 — the tiering, the middleware order, the
+nonce binding, the log whitelist — survived attack intact.
+
+---
+
+
 ## Audit - 2026-07-27 — R5 readiness (uncommitted working tree vs 8a154a9)
 
 **Scope:** only the uncommitted diff — `backend/app.py` (+46/-4), `backend/t.py`

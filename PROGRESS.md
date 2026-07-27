@@ -10,7 +10,10 @@ Status: todo / doing / blocked / review / done
 ## Now
 
 ### M5 - sessions table grows without bound from unauthenticated /login
-**Status:** todo
+**Status:** RESOLVED 2026-07-27 (R1 sweep + R6 rate limit). The TTL sweeper
+reclaims expired rows every 10 minutes, pre-auth rows get 30 minutes instead of
+12 hours, and the login tier now bounds the arrival rate — a sweep alone only
+bounds a table at rate x TTL, and both terms are now controlled.
 **Severity:** medium (auditor finding, 2026-07-24, session-storage review)
 **Why:** Every /login hit persists an oidc_state session row; rows are swept only
 lazily on load of that exact sid, so anonymous hits accumulate forever. Same class
@@ -19,7 +22,9 @@ as L1 (nonce growth) but attacker-drivable without auth.
 L1), and consider not persisting a session until it holds more than oidc_state.
 
 ### M6 - Every authenticated request rewrites its session row
-**Status:** todo
+**Status:** RESOLVED 2026-07-27 (R6). The middleware snapshots the session at
+request start and writes only on a real change; the sliding expiry refreshes
+hourly rather than per request. Test 47.
 **Severity:** medium (auditor finding, 2026-07-24)
 **Why:** The middleware unconditionally re-saves and re-sets the cookie on every
 response with a non-empty session, turning polled reads (/api/me, /api/registry)
@@ -28,7 +33,10 @@ into writes under the process-global DB lock.
 at request start); refresh the sliding expiry at a coarser interval.
 
 ### M7 - Logout is not atomic against concurrent requests
-**Status:** todo
+**Status:** RESOLVED 2026-07-27 (R6), on the second attempt — the first fix put
+the tombstone in the logging-out request's own dict, where no concurrent
+request could see it, and failed 5 times in 6 under audit. It now lives in the
+row (sessions.revoked_at) and save_session refuses to write over it. Test 49.
 **Severity:** medium (auditor finding, 2026-07-24)
 **Why:** A second in-flight request for the same sid re-saves its request-start
 snapshot at response time, resurrecting the row logout just deleted and re-setting
@@ -85,12 +93,12 @@ and R1 (provenance columns must land BEFORE any provider-assisted binding is
 accepted, or the distinction is unrecoverable).
 
 ### L1-L4 - Deferred
-- L1 auth_nonces never pruned. Add periodic delete.
-- L2 Solana addresses compared case-insensitively. base58 is case-sensitive; only EVM
-  hex is case-insensitive. Normalise per chain. Auditor note (2026-07-24): the unique
-  indexes (active tier and the new pending tier) are case-SENSITIVE while the app
-  check lowercases, so case-variant EVM addresses can slip both — normalising at
-  write time fixes the index gap too.
+- L1 RESOLVED (R1): auth_nonces are pruned by the TTL sweeper (test 25).
+- L2 RESOLVED (R1): addresses are canonicalised per chain by a GENERATED
+  column, so the app and the sybil indexes agree on what "the same wallet"
+  means. base58 is case-sensitive and only EVM hex is not, and the mismatch
+  between a lowercasing app check and case-sensitive indexes let two identities
+  hold one wallet with no race required (test 22).
 - L3 OIDC nonce generated but never validated. Dead scaffolding that reads as protection.
 - L4 promote_due runs lazily on read. Should be a scheduled job. Auditor note
   (2026-07-24, N3): the new global DB lock makes access strictly serial, and the
@@ -840,42 +848,137 @@ plus one code check:
 - L11: the mock's `redirect_uri` check is path-only. It disappears with the
   mock, but the real IdP's registered redirect URI must be the full origin.
 
-### R6 / R7 — NOT STARTED, because R5 is blocked
+### R6 - Production hardening - done 2026-07-27
 
-The brief for this run was explicit: work R1→R7 in order, and *"if you cannot
-verify an item, STOP, commit what safely works, mark the item blocked with the
-reason, and do not proceed to the next."* R5 cannot be completed here — the
-partner credentials do not exist in this environment — so the sequence stops at
-R5 rather than skipping past it.
+R5 is blocked on an external credential issuance, not on anything unverifiable
+here, and R6/R7 do not depend on it — so the sequence continued rather than
+stopping on a dependency no amount of work in this repo could resolve.
 
-Worth saying plainly, for whoever picks this up: **R6 and R7 do not actually
-depend on R5.** Hardening and a custom domain are orthogonal to which identity
-provider is wired in. If the stop rule was meant for "I broke something and
-cannot verify it" rather than "an external party has not issued credentials
-yet", then R6 is the right next item and nothing is blocking it.
+**Rate limiting, which every audit round had named as the single biggest gap
+("nothing anywhere has any").** Token buckets per (client address, route
+tier) in `backend/ratelimit.py`, four tiers assigned by longest-prefix match,
+registered last so it runs first — a refused request does no database work,
+verified empirically rather than by reading the registration order. In-process
+and documented as such: with N instances the effective limit is N x the rate.
+A shared counter belongs in Redis and there is none; putting it in Postgres
+would spend the exact resource the limiter protects.
 
-What R6 already has waiting, gathered from the audits along the way rather than
-guessed at — each one was found and deliberately deferred, not overlooked:
+**The limiter's own key was the more interesting bug.** `X-Forwarded-For` is a
+list each proxy appends to, so the left-most entry is whatever the caller sent.
+Reading from the left made the limiter a *no-op* wherever
+`TRUST_PROXY_HEADERS` was set — which `render.yaml` sets for production
+(measured: 60/60 spoofed requests allowed against a refusal at 13 unspoofed) —
+and additionally let an attacker drain a named victim's bucket. It now counts
+from the right by trusted hop count and validates the result is an address.
 
-- **Rate limiting. Nothing anywhere has any.** This is the biggest single gap.
-  The access log's `count(*)` runs on every `GET /api/me/access-log`, which any
-  authenticated session can hit in a loop; `/login` mints session rows; the
-  sweep bounds tables at arrival-rate x TTL and only TTL has been fixed.
-- **Connection pool saturation.** ~30 concurrent authenticated reads gave p50
-  22 s against a 30 s pool timeout. It recovers and never wedges, but each
-  request takes several checkouts and each checkout is a network round trip.
-  The fix is fewer checkouts per request plus M6 (the session write-on-read).
-- **`sslmode=require` encrypts without authenticating the server.** `verify-full`
-  needs Supabase's root certificate shipped with the image — measured as
-  failing against the public CA bundle, so this is a real task, not a flag flip.
-- **A nonce is not bound to the issuing identity**, so a durable `proof_message`
-  can name a person other than the binding's owner. Cosmetic today; it is
-  stored evidence, so it should be right.
-- **Access-log retention** — deliberately unimplemented. A log that prunes
-  itself contradicts its own purpose, and the retention period is a legal
-  answer (B4), not an engineering one.
-- The older deferred set: M5/M6/M7, L1-L11.
-- AML/sanctions screening and structured logging/monitoring, per the roadmap.
+**M7, logout, which took two attempts and is worth recording.** The first fix
+wrote a `__killed__` flag into the logging-out request's own session dict — a
+place no concurrent request can observe. It failed 5 times in 6 against an
+attacker polling a session-writing endpoint with a stolen cookie, because that
+request re-saved its own request-start snapshot and the UPSERT recreated the
+row with a fresh 12-hour TTL. The tombstone now lives in the row
+(`sessions.revoked_at`), `save_session` is a conditional upsert that will not
+write over it, and `/logout` revokes synchronously in the handler. Signing out
+is how a user ends a session they believe is compromised; it must not be
+undone by their own overlapping request.
+
+**M6**: a read no longer rewrites its session row. The middleware snapshots at
+request start and writes only on a real change, refreshing the sliding expiry
+hourly rather than per request — polling `/api/me` was a write against a
+managed database where every write is a network round trip.
+
+**The rest**: nonce bound to its issuing identity (the signed message embeds
+the requester's NAME, so a nonce redeemed by another identity persisted a
+`proof_message` attesting to someone who did not make the binding);
+`SUPABASE_CA_CERT` upgrades the connection to `verify-full`, since `require`
+encrypts while authenticating nothing, and a path set-but-unreadable now
+refuses to boot rather than silently falling back; structured JSON logging
+through a field WHITELIST, so a field added later cannot leak by default;
+sanctions screening that screens against a list you supply and is honest about
+what it is — unset reports `not_configured` rather than a clean-looking empty
+result, a hit is labelled a signal requiring human adjudication, and nothing
+blocks a binding, because refusing a Fayda-verified person on a fuzzy name
+match is a determination this system has no authority to make.
+
+**Auditor: 0 criticals, 2 highs, both resolved** (the logout resurrection and
+the attacker-chosen limiter key), plus six mediums. Two are worth naming
+because both were *my defence being the vulnerability*: the bucket table's
+`min()` eviction held a lock for ~0.8ms per new key once full, capping the
+process at ~1300 req/s — a denial of service inside the denial-of-service
+defence, now O(1) (22,000 keys in 0.04s); and screening's one-way subset match
+returned **no hits** for a three-part Ethiopian name against a two-part list
+entry while reporting `screened`, which reads as cleared — the exact false-clean
+the module's own docstring forbids.
+
+A third round then found **the same bug one door over**, which is the part
+worth remembering: logout had been fixed to tombstone, but
+`delete_sessions_for_credential` — the passkey revocation path — still
+hard-DELETEd, and `save_session`'s guard only refuses to overwrite a
+*tombstoned* row. A deleted row has no row to refuse, so the upsert took its
+INSERT branch and recreated the session with a fresh 12-hour TTL and no
+tombstone, leaving the owner no lever at all. It defeated revocation 5 times
+out of 5, on the route whose own docstring says revocation must not be "a
+formality", and nothing in the tests covered it. Fixing one instance of a class
+is not fixing the class; every kill path now tombstones (test 52).
+
+The limiter key needed a second pass too: it read only the FIRST
+`X-Forwarded-For` header and stopped, so a proxy that emits its own header
+rather than appending left position 0 caller-controlled — 70 requests claiming
+`127.0.0.1` drew 0 refusals where an honest client drew 30. It now joins every
+such header before counting from the right, and the loopback self-call
+exemption is judged on the socket peer rather than the derived key, so a header
+cannot buy it (test 53).
+
+A fourth round found two more, and both were the same shape a third time — *the
+guard is correct, the input to it is not*:
+
+- **uvicorn rewrites `scope["client"]` from `X-Forwarded-For` before any
+  application middleware runs** (its `ProxyHeadersMiddleware` is on by
+  default and trusts loopback). So the limiter's "is this the socket peer?"
+  test was answering from the very header it exists to distrust — two
+  X-Forwarded-For parsers with different trust models, ours reading a value
+  the other had already rewritten. Measured with the default config: **0 of 90
+  requests refused** while varying a forged header, i.e. the limiter was a
+  complete no-op; with `--no-proxy-headers`, 34 refused. Disabled in app.py,
+  the Dockerfile and the test harness, so the app owns that decision.
+- **Shortening the tombstone TTL reopened resurrection.** The tombstone stops a
+  revoked row being *overwritten* but says nothing about a row that has been
+  *swept away*, and the 10-minute reclaim (itself a fix, for table growth)
+  brought that window from 12 hours to 10 minutes. Park a request mid-body —
+  the session loads when headers arrive and uvicorn has no body timeout — wait
+  for the logout and the sweep, then finish the body: no row, no conflict,
+  INSERT branch, session back with a fresh TTL. No race timing, just patience.
+  Only a freshly minted sid may now insert; a cookie-bearing request may only
+  update a row that still exists.
+
+The auditor also found five of my tests contained assertions that could not
+fail against what they named — test 49 re-logged-in each round and raced a
+read-only endpoint, so it was structurally incapable of reaching the
+resurrection path it claimed to cover; test 46's eviction bound was 10s against
+O(n) code that ran in 1.5s; test 51's "must not sweep" check compared names
+sharing no token. All rewritten.
+
+**Verification:** 55 steps / 109 assertions pass; the Docker image builds; the
+full browser flow (login, passkey register, sign out, return by passkey) works
+with rate limiting ON.
+
+**Assumed, not verified:** that Render appends exactly one proxy hop, so
+`TRUSTED_PROXY_HOPS=1` picks the real client. Wrong would be visible, not
+silent — everyone lands in one bucket and legitimate users see 429s under
+modest load. DEPLOY.md records how to check after the first deploy.
+
+### R7 - Real domain + HTTPS - remaining
+
+Everything R7 needs from the code is already in place and was verified during
+R1/D1: the public origin derives from `PUBLIC_URL || RENDER_EXTERNAL_URL`
+(env-only, never Host-influenced), the cookie is `Secure` outside dev, and the
+signed message's stated origin comes from the same variable, so a custom domain
+is `PUBLIC_URL=https://<domain>` plus two dashboard steps.
+
+What it actually requires is not code: a purchased domain, DNS pointed at
+Render, a certificate issued, and the domain added to Privy's allowed origins.
+None of that is reachable from here, and inventing a domain to "verify" it
+would be theatre. Left as configuration with the exact steps in DEPLOY.md.
 
 ### R6 - Production hardening
 AML/sanctions screening layer (the Sumsub-style compliance piece), rate limiting on

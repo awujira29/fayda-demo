@@ -25,4 +25,9 @@ COPY --from=ui /ui/dist frontend/dist
 WORKDIR /app/backend
 # Render sets PORT (default 10000). app.py derives its self-call base URL from
 # the same variable, so the OIDC token/userinfo self-requests always match.
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# --no-proxy-headers: uvicorn rewrites scope["client"] from
+# X-Forwarded-For before any app middleware sees it, which made the
+# rate limiter's "is this the socket peer?" check answer from the very
+# header it exists to distrust. The app owns that decision (see
+# backend/ratelimit.py client_key / TRUSTED_PROXY_HOPS).
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --no-proxy-headers"]

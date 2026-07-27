@@ -77,7 +77,12 @@ CREATE TABLE IF NOT EXISTS auth_nonces (
     -- how the proof will be produced: 'wallet' or 'dev-test-key'. Recorded
     -- server-side at issue time so a test-key binding can never masquerade
     -- as a real wallet attestation in the audit trail.
-    issued_via  TEXT NOT NULL DEFAULT 'wallet'
+    issued_via  TEXT NOT NULL DEFAULT 'wallet',
+    -- Who asked for it. The message embeds the requester's name, so a nonce
+    -- redeemed by a different identity would persist a proof_message naming
+    -- someone who did not make the binding (R6). Nullable: rows predating the
+    -- column, and the dev test-key path, have none.
+    identity_id TEXT
 );
 
 -- Session data stays server-side. The claims now include address.kebele and
@@ -88,7 +93,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     sid         TEXT PRIMARY KEY,
     data        JSONB NOT NULL,
     created_at  TEXT NOT NULL,
-    expires_at  TEXT NOT NULL
+    expires_at  TEXT NOT NULL,
+    -- Logout tombstone (M7). A DELETE was not enough: another request for the
+    -- same sid, already in flight, re-saved its own snapshot through an UPSERT
+    -- and recreated the row with a fresh TTL. The signal has to live where the
+    -- concurrent request can SEE it — in the row — not in the logging-out
+    -- request's own dict. Swept on TTL like any other row.
+    revoked_at  TEXT
 );
 
 -- R2 return-login. A passkey is registered only by an already Fayda-verified
@@ -368,6 +379,30 @@ def _conninfo() -> str:
             k, _, v = p.partition("=")
             kw[k] = unquote(v)
     kw.setdefault("sslmode", "require")
+
+    # R6. 'require' encrypts but authenticates NOTHING: libpq validates no
+    # certificate, so anything that can intercept the connection can terminate
+    # TLS and read the credential and every row. Upgrading needs a CA bundle
+    # the server's certificate actually chains to — the public bundle does not
+    # verify Supabase's — so point SUPABASE_CA_CERT at their downloadable root
+    # and this becomes verify-full. Not defaulted on: silently failing every
+    # connection because a certificate is missing would be worse than the
+    # weaker mode it replaces, so the upgrade is explicit and its absence is
+    # visible at startup.
+    ca = os.getenv("SUPABASE_CA_CERT", "").strip()
+    if ca:
+        # Set but unreadable is a configuration error, not a reason to quietly
+        # continue on the weaker mode. Falling back silently is how a
+        # deployment believes it has certificate verification and does not —
+        # worse than never having asked for it.
+        if not Path(ca).is_file():
+            raise RuntimeError(
+                f"refusing to start: SUPABASE_CA_CERT points at {ca!r}, which "
+                f"is not a readable file. Fix the path or unset it — silently "
+                f"falling back to unauthenticated TLS is not an option."
+            )
+        kw["sslrootcert"] = ca
+        kw["sslmode"] = "verify-full"
     return psycopg.conninfo.make_conninfo(**kw)
 
 
@@ -528,6 +563,8 @@ def _create_schema(c: psycopg.Connection) -> None:
     # 500s on UndefinedColumn: fail-closed, but silent until the moment
     # somebody needs compliance access.
     c.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS revoked_at TEXT")
+    c.execute("ALTER TABLE auth_nonces ADD COLUMN IF NOT EXISTS identity_id TEXT")
+    c.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revoked_at TEXT")
 
     # Same migration for the TTL indexes: an earlier cut created them in the
     # default collation, which the sweep's COLLATE "C" predicate cannot use.
@@ -738,10 +775,19 @@ def get_identity(identity_id: str) -> dict | None:
 
 # ----------------------------------------------------------------- sessions
 
+# How long a revoked session's tombstone survives. It has to outlive any
+# request that was already in flight when the revocation happened — that is the
+# entire point — but not the original TTL, or logged-out rows park for hours.
+REVOKED_GRACE_MINUTES = 10
+
+
 def load_session(sid: str) -> dict | None:
     with conn() as c:
         row = c.execute("SELECT * FROM sessions WHERE sid = %s", (sid,)).fetchone()
         if not row:
+            return None
+        # A revoked sid is dead even though the row survives until the sweep.
+        if row["revoked_at"]:
             return None
         if parse(row["expires_at"]) < now():
             c.execute("DELETE FROM sessions WHERE sid = %s", (sid,))
@@ -749,21 +795,62 @@ def load_session(sid: str) -> dict | None:
         return row["data"]
 
 
-def save_session(sid: str, data: dict, ttl_hours: float) -> None:
+def save_session(sid: str, data: dict, ttl_hours: float,
+                 is_new: bool = False) -> bool:
+    """
+    Persist a session. Returns whether the row was written.
+
+    `is_new` is the whole safety property, and it took two attempts to get
+    right. A tombstone stops a revoked row being overwritten — but says nothing
+    about a row that is simply GONE, and tombstones are reclaimed by the TTL
+    sweep. An attacker could park a request mid-body (the session is loaded
+    when headers arrive; uvicorn has no body timeout), let the owner log out,
+    wait for the sweep to clear the tombstone, then finish the body: no row, no
+    conflict, INSERT branch, session back with a fresh 12-hour TTL and no
+    tombstone. No race timing needed — just patience.
+
+    So only a caller that just MINTED the sid may insert. Everyone else may
+    only update a row that still exists and is not revoked; if it has gone,
+    they get False and their session is over, which is the correct reading of
+    "the row I loaded is no longer there".
+    """
     with conn() as c:
-        c.execute(
-            """INSERT INTO sessions (sid, data, created_at, expires_at)
-               VALUES (%s,%s,%s,%s)
-               ON CONFLICT(sid) DO UPDATE SET
-                   data = excluded.data, expires_at = excluded.expires_at""",
-            (sid, Json(data), iso(now()),
-             iso(now() + timedelta(hours=ttl_hours))),
-        )
+        if is_new:
+            n = c.execute(
+                """INSERT INTO sessions (sid, data, created_at, expires_at, revoked_at)
+                   VALUES (%s,%s,%s,%s,NULL)
+                   ON CONFLICT(sid) DO UPDATE SET
+                       data = excluded.data, expires_at = excluded.expires_at
+                   WHERE sessions.revoked_at IS NULL""",
+                (sid, Json(data), iso(now()),
+                 iso(now() + timedelta(hours=ttl_hours))),
+            ).rowcount
+        else:
+            n = c.execute(
+                """UPDATE sessions SET data = %s, expires_at = %s
+                   WHERE sid = %s AND revoked_at IS NULL""",
+                (Json(data), iso(now() + timedelta(hours=ttl_hours)), sid),
+            ).rowcount
+    return n == 1
 
 
 def delete_session(sid: str) -> None:
+    """
+    Revoke a session. A tombstone rather than a DELETE, so that a concurrent
+    request cannot simply INSERT the sid back.
+
+    expires_at is pulled in to REVOKED_GRACE_MINUTES so the sweep reclaims the
+    row shortly after the last in-flight request could still be holding it —
+    keeping its original 12-hour expiry parked dead rows for half a day, which
+    is the table growth the sweep exists to bound.
+    """
     with conn() as c:
-        c.execute("DELETE FROM sessions WHERE sid = %s", (sid,))
+        c.execute(
+            "UPDATE sessions SET revoked_at = %s, data = %s, expires_at = %s "
+            "WHERE sid = %s AND revoked_at IS NULL",
+            (iso(now()), Json({}),
+             iso(now() + timedelta(minutes=REVOKED_GRACE_MINUTES)), sid),
+        )
 
 
 def delete_sessions_for_credential(credential_id: str) -> int:
@@ -774,12 +861,20 @@ def delete_sessions_for_credential(credential_id: str) -> int:
     attacker who registered a passkey on a compromised session is already
     signed in, and would keep that session for the rest of its TTL after the
     owner revoked. Privileged by necessity — sessions are keyed by sid, and the
-    row being deleted belongs to the attacker, not to the caller.
+    row belongs to the attacker, not to the caller.
+
+    TOMBSTONE, not DELETE — the same lesson as logout, which this route missed.
+    save_session refuses to write over a revoked row, but a DELETEd row has no
+    row to refuse: the upsert simply takes its INSERT branch and recreates the
+    session with a fresh 12-hour TTL and no tombstone, leaving the owner no
+    further lever. Measured defeating revocation 5 times out of 5.
     """
     with conn() as c:
         return c.execute(
-            "DELETE FROM sessions WHERE data->>'passkey_credential_id' = %s",
-            (credential_id,),
+            "UPDATE sessions SET revoked_at = %s, data = %s, expires_at = %s "
+            "WHERE data->>'passkey_credential_id' = %s AND revoked_at IS NULL",
+            (iso(now()), Json({}), iso(now() + timedelta(minutes=REVOKED_GRACE_MINUTES)),
+             credential_id),
         ).rowcount
 
 
@@ -1181,17 +1276,19 @@ def touch_credential(credential_id: str, sign_count: int) -> None:
 # ------------------------------------------------------------------- nonces
 
 def issue_nonce(nonce: str, address: str, chain: str, message: str,
-                ttl_seconds: int, issued_via: str = "wallet") -> None:
+                ttl_seconds: int, issued_via: str = "wallet",
+                identity_id: str | None = None) -> None:
     with conn() as c:
         c.execute(
-            "INSERT INTO auth_nonces (nonce, address, chain, message, expires_at, issued_via) "
-            "VALUES (%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO auth_nonces (nonce, address, chain, message, expires_at, "
+            "issued_via, identity_id) VALUES (%s,%s,%s,%s,%s,%s,%s)",
             (nonce, address, chain, message,
-             iso(now() + timedelta(seconds=ttl_seconds)), issued_via),
+             iso(now() + timedelta(seconds=ttl_seconds)), issued_via, identity_id),
         )
 
 
-def consume_nonce(nonce: str, address: str, chain: str) -> tuple[bool, str, str, str]:
+def consume_nonce(nonce: str, address: str, chain: str,
+                  identity_id: str | None = None) -> tuple[bool, str, str, str]:
     """
     Single use, bound to the address and chain it was issued for.
     Returns the exact message that was issued, so the caller verifies the
@@ -1219,6 +1316,16 @@ def consume_nonce(nonce: str, address: str, chain: str) -> tuple[bool, str, str,
         if (normalize_address(chain, row["address"]) != normalize_address(chain, address)
                 or row["chain"] != chain):
             return False, "nonce was issued for a different address or chain", "", ""
+        # R6: and to the identity it was issued to. The message embeds the
+        # requester's name, so a nonce issued to one person and redeemed by
+        # another produced a durable proof_message attesting to someone who did
+        # not make the binding. Not a sybil break — the signature still proves
+        # key control, and the indexes still hold — but this row is stored
+        # evidence, and stored evidence should not be able to name the wrong
+        # person. NULL identity_id means a nonce predating this column.
+        if (identity_id and row["identity_id"]
+                and row["identity_id"] != identity_id):
+            return False, "nonce was issued to a different identity", "", ""
         c.execute("UPDATE auth_nonces SET consumed = 1 WHERE nonce = %s", (nonce,))
         return True, "", row["message"], row["issued_via"]
 

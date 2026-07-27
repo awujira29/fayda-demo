@@ -77,6 +77,8 @@ existing wallet must keep working. Do not simplify this into an instant swap.
 | backend/app.py | OIDC client, session middleware, binding endpoints, registry API |
 | backend/store.py | Schema and queries (psycopg / Supabase Postgres). Unique indexes, RLS policies, and the conn()/user_conn() split live here. |
 | backend/chain.py | Read-only on-chain lookup (R4). Cached with a TTL, never persisted, never fabricated. |
+| backend/ratelimit.py | Token buckets per (client IP, route tier) (R6). In-process — bounds one instance, not a cluster. |
+| backend/screening.py | Sanctions screening (R6). Screens against a list you supply; a hit is a signal for a human, never a determination, and nothing here blocks a binding. |
 | frontend/src/passkey.js | WebAuthn base64url↔ArrayBuffer seam. The only module that touches navigator.credentials. |
 | frontend/src/components/OperatorPanel.jsx | The compliance view (R4). Rendered only for operators; every route it calls re-checks server-side. |
 | backend/verify.py | secp256k1 recovery (EVM), ed25519 verification (Solana) |
@@ -160,8 +162,11 @@ deploy must set SUPABASE_DB_URL or the app refuses to start.
 
 ## Testing
 
-APP_ENV=dev python backend/app.py in one shell (PUBLIC_URL unset — the tests
-drive the backend origin directly), APP_ENV=dev python backend/t.py in another.
+RATE_LIMIT=off APP_ENV=dev python backend/app.py in one shell (PUBLIC_URL unset
+— the tests drive the backend origin directly), APP_ENV=dev python backend/t.py
+in another. RATE_LIMIT=off because the suite's deliberate bursts — racing
+binds, ten-round loops — are exactly what a limiter refuses; test 46 spawns its
+own instance with limiting ON and verifies it there.
 All checks pass before anything is done. Add to t.py rather than creating
 parallel test files. For UI states: cd frontend && npm run shots regenerates
 screenshots/.
