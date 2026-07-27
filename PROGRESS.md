@@ -840,6 +840,43 @@ plus one code check:
 - L11: the mock's `redirect_uri` check is path-only. It disappears with the
   mock, but the real IdP's registered redirect URI must be the full origin.
 
+### R6 / R7 — NOT STARTED, because R5 is blocked
+
+The brief for this run was explicit: work R1→R7 in order, and *"if you cannot
+verify an item, STOP, commit what safely works, mark the item blocked with the
+reason, and do not proceed to the next."* R5 cannot be completed here — the
+partner credentials do not exist in this environment — so the sequence stops at
+R5 rather than skipping past it.
+
+Worth saying plainly, for whoever picks this up: **R6 and R7 do not actually
+depend on R5.** Hardening and a custom domain are orthogonal to which identity
+provider is wired in. If the stop rule was meant for "I broke something and
+cannot verify it" rather than "an external party has not issued credentials
+yet", then R6 is the right next item and nothing is blocking it.
+
+What R6 already has waiting, gathered from the audits along the way rather than
+guessed at — each one was found and deliberately deferred, not overlooked:
+
+- **Rate limiting. Nothing anywhere has any.** This is the biggest single gap.
+  The access log's `count(*)` runs on every `GET /api/me/access-log`, which any
+  authenticated session can hit in a loop; `/login` mints session rows; the
+  sweep bounds tables at arrival-rate x TTL and only TTL has been fixed.
+- **Connection pool saturation.** ~30 concurrent authenticated reads gave p50
+  22 s against a 30 s pool timeout. It recovers and never wedges, but each
+  request takes several checkouts and each checkout is a network round trip.
+  The fix is fewer checkouts per request plus M6 (the session write-on-read).
+- **`sslmode=require` encrypts without authenticating the server.** `verify-full`
+  needs Supabase's root certificate shipped with the image — measured as
+  failing against the public CA bundle, so this is a real task, not a flag flip.
+- **A nonce is not bound to the issuing identity**, so a durable `proof_message`
+  can name a person other than the binding's owner. Cosmetic today; it is
+  stored evidence, so it should be right.
+- **Access-log retention** — deliberately unimplemented. A log that prunes
+  itself contradicts its own purpose, and the retention period is a legal
+  answer (B4), not an engineering one.
+- The older deferred set: M5/M6/M7, L1-L11.
+- AML/sanctions screening and structured logging/monitoring, per the roadmap.
+
 ### R6 - Production hardening
 AML/sanctions screening layer (the Sumsub-style compliance piece), rate limiting on
 all endpoints, the deferred audit mediums (unbounded tables, mock /authorize XSS,
