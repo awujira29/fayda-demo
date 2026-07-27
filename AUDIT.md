@@ -5,6 +5,288 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Fix review — capture flow, 2026-07-27 (C1, H1(b), M1, M3, M4)
+
+**Scope.** The fix deltas only: `_valid_redirect` exact-match + `REGISTERED_REDIRECT`
+injection, `KNOWN_PROBE` gating of `/authorize/known`, fixed `kebele`/`woreda`
+placeholders, `_expire()` + `MAX_PENDING`, the `state.told` relabel, and tests 20,
+60, 61.
+
+**Method.** Two fresh uvicorn instances, both terminated: :8097 (`APP_ENV=dev`,
+self-consistent `BASE_URL`/`PUBLIC_URL`) and :8096 in the shipped posture
+(`APP_ENV=production DEMO_MODE=1`, `RENDER_EXTERNAL_URL=https://demo.example.com`).
+Every previous attack re-driven. 28 redirect-target variants, ~6,700 requests
+against the confirm endpoint, a threaded in-process harness for `_expire()`, and a
+200,000-run Monte Carlo over test 61's assertions. `t.py` not run (test 32 resets
+the shared database). No project file modified except this one.
+
+**Status: C1 RESOLVED, H1(b) RESOLVED, M1 RESOLVED, M3 RESOLVED, M4 RESOLVED.
+6 new findings, all low. No new critical, high or medium.**
+
+### C1 — RESOLVED
+
+The exact match holds against everything I could think to throw at it. Only the
+registered string passes, at **both** `/authorize` and `/authorize/confirm`:
+
+```
+http://127.0.0.1:8097/callback              authorize=200 confirm=303   <- registered
+http://127.0.0.1:8097/callback/             400 400      HTTP://…/CALLBACK        400 400
+http://127.0.0.1:8097/CALLBACK              400 400      http://…/callback␠       400 400
+␠http://127.0.0.1:8097/callback             400 400      …/callback?x=1           400 400
+…/callback#x                                400 400      …:8097:80/callback       400 400
+http://user:pw@127.0.0.1:8097/callback      400 400      …/./callback             400 400
+…/x/../callback                             400 400      …/%63allback             400 400
+http://127.0.0.1%3A8097/callback            400 400      …/callback%00            400 400
+…/callback\t   …/callback\n                 400 400      http://127。0。0。1:…      400 400
+http://xn--127.0.0.1:8097/callback          400 400      //evil.example.com/…     400 400
+https://evil.example.com/callback           400 400      http://evil.example.com/ 400 400
+http://127.0.0.1:9999/callback              400 400      http://localhost:8097/…  400 400
+http://[::1]:8097/callback                  400 400      http://0177.0.0.1:…      400 400
+/callback                                   400 400      (empty)                  400 422
+```
+
+Case, trailing and leading whitespace, trailing slash, query, fragment, userinfo,
+port confusion, dot-segments, percent-encoded path and colon, NUL, tab, newline,
+fullwidth-dot and punycode-shaped hosts, protocol-relative, a different loopback
+port, `localhost` vs `127.0.0.1`, IPv6 and octal forms of the same host: all
+refused. Exact string equality leaves no normalisation seam to attack, which is
+the right shape for this.
+
+**No split between what is validated and what is used.** Duplicate
+`redirect_uri` form fields bind the *last* value for both the check and the
+redirect: `evil,registered` → 303 to the registered URI; `registered,evil` → 400.
+There is one variable and one read.
+
+**`REGISTERED_REDIRECT` is not request-influenced.** Assigned once, at
+`backend/app.py:242`, from `REDIRECT_URI`; `grep` finds no other writer. Unset →
+`_valid_redirect` returns False for everything (`mock_esignet.py:152-156`), so a
+mock that does not know where it may send a code sends none.
+
+**The attack is dead at the first hop.** The victim never reaches a capture page
+pointed at a foreign origin — `/authorize` itself 400s, so there is no page to
+complete:
+
+```
+victim's capture page with a foreign redirect_uri: 400
+confirm with a foreign redirect_uri:               400
+attacker still anonymous:                          True
+```
+
+**Bonus fix worth recording:** `backToRegistry()` (`:516-520`) builds its target
+from the same `redirect_uri`, so the "return to the registry" hop can no longer be
+aimed at an attacker origin either. That was a second phishing hop in the old page
+and it closed with the same change.
+
+**One residual, filed as N4 below:** the *only* thing binding a code to a session
+is now this string comparison. `token()` accepts `redirect_uri`
+(`mock_esignet.py:756-757`) and never compares it to the authorization request,
+there is no PKCE, and a code remains bearer-grade — I confirmed that a code handed
+over out of band still authenticates a different session. That is acceptable for a
+mock; it is worth knowing that the defence is one comparison deep.
+
+### H1(b) — RESOLVED (the person-oracle is gone; one new low on how)
+
+Against the production+`DEMO_MODE` instance, every probe carrying both a name and a
+date of birth 404s:
+
+```
+{"full_name":"Someone Real","birthdate":"1990-01-01"}  -> 404 {"detail":"not found"}
+```
+
+There is no remaining way to ask whether a person is registered. I checked the
+alternatives: `/api/passkey/login/begin` uses discoverable credentials and takes no
+username; `/api/registry` and every `/api/operator/*` route are behind
+`require_operator`; `/authorize/confirm` returns an identical 303 for a known and
+an unknown person (no status, body or branch difference); `/api/me` says nothing
+about anyone else when unauthenticated. The unconditional passkey link on step 1
+(`:355-359`) removes the reason the probe existed, which is the better fix.
+
+The one blemish is ordering — see **N1**.
+
+### M1 — RESOLVED
+
+`address` no longer derives from `sub`. Verified against a live login and the row
+Postgres actually holds:
+
+```
+sub for the identity          = 846097330772
+stored claims: {"address": {"zone":"Harari","kebele":"00","region":"Harari","woreda":"00"}, …}
+whole sub present: False | four-digit fragments present: []
+```
+
+`phone` still carries `sub[:7]`, which is correct and deliberate — it is outside
+`SAFE_CLAIMS` and is what makes the whitelist testable. Nothing whitelisted derives
+from the identifier now.
+
+### M3 — RESOLVED (memory), with the trade named
+
+`_expire()` does what it claims. Direct check: a live code and a live token survive
+50 consecutive calls, an expired code is dropped, and the ceiling evicts from the
+front (oldest) while keeping the newest — `size after = 5000`, `c0` gone, `c5009`
+kept. A full login still succeeds after I pushed ~6,700 codes through the endpoint.
+
+The trade is now a bounded availability cost rather than an unbounded memory one:
+at the ceiling, FIFO eviction drops pending codes an honest user may be about to
+redeem. Reaching it needs sustained >41 req/s (codes expire in 120 s, so a
+single-IP login-tier attacker holds only ~120), i.e. a distributed source. That is
+the right trade, and it is worth a line in the docstring rather than a fix.
+
+Two new lows fall out: **N2** (the sweep is not thread-safe) and **N3** (test 61).
+
+### M4 — RESOLVED
+
+`alreadyVerified()` (`:523-536`) no longer hides the button: `state.told` is set,
+the label becomes "Verify again instead", and the next click short-circuits to
+`show(1); startCamera()` before the fetch. I confirmed on the served page that
+`go1").classList.add("hidden")` is gone. No double-submit path: the `told` branch
+returns, and the handoff form is submitted only from `#finish`. A returning person
+with no passkey can now proceed, which is what the dead end cost them.
+
+Residual: **N6**.
+
+### H1(a) — still open, and my read on your reasoning
+
+**I agree with the mechanism and disagree with "docs only".** You are right that a
+mock with no biometric and no register can only believe what it is told, and that
+the persona picker had the same property. I would not block on it, and I am
+downgrading it from High to **Medium, accepted** — the two things that made it
+dangerous are gone: an attacker can no longer *confirm* a name+DOB pair before
+trying it (H1(b)), and can no longer harvest a code from someone who does the
+typing (C1). What remains needs a correct guess about a specific person.
+
+Where I would push back is the disposition. The persona picker differed in one
+respect that is not cosmetic: its identities were fictional and shared *by
+construction*, so nobody could believe a persona was theirs. Capture asks a real
+visitor for their real name and date of birth, shows them "Identity verified", and
+then persists a row that anyone typing the same two strings lands on — with their
+wallet binding, their passkeys, their access log, their operator visibility.
+That is a representation problem, and CLAUDE.md is not where the affected person
+looks. `render.yaml` still ships `DEMO_MODE=1`.
+
+Concretely: put one sentence where the person can see it, alongside the "simulated
+match" disclosure that is already there — *"anyone who enters the same name and
+date of birth reaches this same demo record; do not put anything private here."*
+That costs a line and converts an implicit vulnerability into an informed one. The
+docs entry is right and insufficient on its own.
+
+### M2, M5 — still open, acknowledged
+
+`identity_exists` still reads the `identities` table through the privileged
+`conn()` with no operator check and no access-log entry; the reachable surface is
+now dev only, which is a real reduction. The retention story for the names and
+birthdates the demo collects is going into the docs. Both noted as accepted, not
+re-argued. Previous lows L1-L6 are unchanged and untouched by this delta.
+
+### New findings — 6, all low
+
+- **N1 — `/authorize/known` answers before it checks whether it exists.**
+  `mock_esignet.py:700-701` returns `{"known": false}` for an empty name or date
+  *before* the `KNOWN_PROBE` guard at `:704`. In the shipped demo posture:
+  `POST /authorize/known {}` → **200**, `{"full_name":"X"}` → **200**, a non-JSON
+  body → **400**, while a genuinely absent path (`/authorize/nope`) → 404. So the
+  comment "Absent outside dev… a route that answers is a route that can be
+  measured" is not true of the route it is attached to: it is present and
+  fingerprintable. No person data leaks (every probe with both fields 404s), so
+  this is only a guard in the wrong place — but it is the ordering that becomes a
+  leak the first time someone adds a branch above it. Move the guard to the top of
+  the handler. *Confidence: certain.*
+
+- **N2 — `_expire()` is not thread-safe.** `mock_esignet.py:189` builds
+  `[k for k, v in m.items() if v["exp"] < now]` while other request threads mutate
+  the same dict — FastAPI runs these `def` handlers in a threadpool, so
+  `/authorize/confirm` (insert) and `/v1/…/token` (pop) genuinely run in parallel
+  with it. In-process I produced the exact failure on both sides:
+  `RuntimeError('dictionary changed size during iteration')` for a concurrent
+  insert and for a concurrent pop. **I could not trigger it under natural
+  scheduling**: 0 failures in 3,200 concurrent HTTP confirms across 16 threads with
+  the map at its 5,000 ceiling, and 0 in 59,356 in-process inserts without forced
+  yields — the error needs a GIL switch to land inside the ~0.3 ms comprehension.
+  So: certain defect, unobserved in practice, and it would surface as a 500 on
+  someone's login. One-line fix (`list(m.items())`). *Confidence: certain on the
+  defect, worth checking on the live trigger.*
+
+- **N3 — test 61 has two coincidence-dependent assertions.** (a) `:2582-2585`
+  asserts `part not in probe_sub` for any all-digit address field. The field is the
+  fixed placeholder `"00"`, so this passes only because the pinned subject's sub
+  happens not to contain `00` (it is `241415972865`). Measured over 20,000 random
+  subjects, **9.5%** of subs contain `"00"` — change the probe's name or birthdate
+  and there is a one-in-ten chance the test fails for a reason unrelated to any
+  leak. The assertion is also backwards: it tests whether the placeholder appears
+  in the sub, when the property is "the field was not derived from the sub". (b)
+  `:2592-2595` sweeps all nine four-digit fragments of the sub against the session
+  row, which contains a random UUID, a unix epoch and random microseconds. Monte
+  Carlo over 200,000 simulated rows: **0.85%** of runs collide — about one false
+  "a four-digit fragment of the sub is in the session" alarm every 118 runs, which
+  is exactly the kind of failure that gets a real regression waved through next
+  time. Also: the fragment sweep runs against the session row only, not against
+  `/api/me` (which gets the whole-value check), so the coverage claim is narrower
+  than described. *Confidence: certain; both numbers measured.*
+
+- **N4 — `state` is still appended to the redirect URL unencoded, and `/callback`
+  prefers the LAST `code`.** `mock_esignet.py:751` interpolates the caller's
+  `state` raw; `&` and `#` are in `RedirectResponse`'s safe set, so
+  `state=S&code=BOGUS` yields
+  `…/callback?code=<real>&state=S&code=BOGUS`, and Starlette's query parsing
+  returns the **last** value — I drove it and the injected code was the one used
+  (502, "invalid or expired authorization code"). Inert today: `app.py:615` checks
+  `state` *before* the code is exchanged, and an attacker who can set `state`
+  cannot make it match the victim's session. It is the residue of C1, and it goes
+  live the moment anyone relaxes that check — the "sign-in took too long and
+  expired" branch is exactly the kind of thing that gets softened for UX. URL-encode
+  `state` (and `code`). *Confidence: certain on the mechanism, certain that it is
+  currently inert.*
+
+- **N5 — the mock's token endpoint ignores `redirect_uri`.** `:756-757` accepts the
+  field and never compares it to the one the code was issued for; a real OIDC
+  provider must. Harmless here (one registered URI) but this file is the template
+  the real integration is written against, and the check it omits is one of the two
+  that make authorization codes safe. *Confidence: certain.*
+
+- **N6 — a double-click on "Continue to photo" orphans a camera stream.** `go1`
+  is not disabled while the `/authorize/known` fetch is in flight (`:496-514`), so
+  two rapid clicks start `getUserMedia` twice; `state.stream` (`:542`) keeps only
+  the second, and `stopCamera()` can never stop the first — the camera light stays
+  on after capture, on the one page whose whole promise is camera hygiene.
+  Pre-existing, but the relabelled button invites a second press. Disable `go1`
+  until the fetch settles, or guard `startCamera` on `state.stream`.
+  *Confidence: likely — read from the source, not driven with a real camera.*
+
+### Verified safe (this round)
+
+- The C1 chain re-driven in three shapes (foreign host, protocol-relative, foreign
+  port) — refused at the capture page, so no code is ever minted.
+- 28 redirect variants; duplicate `redirect_uri` fields; unset `REGISTERED_REDIRECT`
+  fails closed.
+- The person-oracle is closed, and no other route substitutes for it.
+- **The image guarantee still holds after the page edits.** Re-parsed the served
+  document: still exactly one form (`action=/authorize/confirm`, eight hidden text
+  inputs), the two file inputs still unnamed and outside it, still one `fetch`
+  (`/authorize/known`), and still **zero** occurrences of `toDataURL`, `toBlob`,
+  `getImageData`, `FormData`, `XMLHttpRequest`, `sendBeacon`, `WebSocket` or
+  dynamic `import(`. A hostile multipart POST with two real image parts at the
+  now-pinned confirm endpoint: 303, parts dropped, nothing stored.
+- `_expire()` keeps live codes and live tokens, drops only expired ones, evicts
+  oldest-first at the ceiling, and a full login still works after ~6,700 codes.
+- Tests 20, 60 and 61 all assert real properties — 60 in particular reproduces the
+  attack shape rather than a proxy for it, and I independently confirmed 23 targets
+  beyond the five it fires. Test 61 is sound in intent; see N3 for its two
+  coincidence-dependent assertions.
+- `M4`'s relabel has no path that skips capture or double-submits.
+- Operational note, not a finding: the exact match means `t.py` now hard-fails at
+  step 2 against a backend started with `PUBLIC_URL=http://localhost:5173`. The
+  instance on :8000 has it unset, which is what CLAUDE.md already prescribes, and
+  the new failure is loud rather than a subtle cookie problem — an improvement, but
+  it will surprise someone once.
+
+**Verdict: safe to build on — yes.** The identity takeover is closed at its first
+hop and the enumeration oracle is gone from every posture but a developer's own
+machine; nothing new above low came out of the fixes, and the image guarantee
+survived the edits intact. The one thing I would still do before this demo is
+shared is put the name-and-birthday property on the page itself rather than only in
+the docs.
+
+---
+
 ## Audit - 2026-07-27 — capture flow (Sumsub-style mock IdP), working tree at 0da04c3
 
 **Scope.** The uncommitted diff: `backend/mock_esignet.py` (rewritten),

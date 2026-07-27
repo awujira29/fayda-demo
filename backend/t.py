@@ -2578,21 +2578,37 @@ assert info["authenticated"], info
 probe_sub = mock.derive_sub(whoami["full_name"], whoami["birthdate"])
 body = finprobe.get(f"{B}/api/me").text
 assert probe_sub not in body, "the whole sub reached /api/me"
-addr = info["claims"]["address"]
-for part in (addr.get("kebele", ""), addr.get("woreda", ""), addr.get("zone", "")):
-    if part and part.isdigit():
-        assert part not in probe_sub, \
-            ("an address field carries digits of the sub", part, addr)
-# And the session row itself, which is what an operator or a dump would see.
 sid_probe = finprobe.cookies.get("session").rsplit(".", 1)[0]
 with st.conn() as sc:
     row = sc.execute("SELECT data::text AS d FROM sessions WHERE sid=%s",
                      (sid_probe,)).fetchone()
 assert row and probe_sub not in row["d"], "the sub was written into the session row"
-for i in range(0, len(probe_sub) - 3):
-    frag = probe_sub[i:i + 4]
-    assert frag not in row["d"], \
-        ("a four-digit fragment of the sub is in the session", frag)
-print("  no whole or partial sub in the claims, the response, or the session: ok")
+
+# Test the PROPERTY, not a coincidence. Scanning the session text for
+# four-digit fragments of the sub reads as thorough but collides with the
+# random uuids and microsecond timestamps already in that row — measured at
+# roughly one false failure in 118 runs, and a flaky assertion about a
+# security property is worse than none. The actual property is that the
+# address claim is a CONSTANT, not something derived from the identifier: so
+# verify two different people get byte-identical address placeholders. A
+# derived value could not.
+second = httpx.Client(follow_redirects=False, timeout=30)
+other_who = {"full_name": "Digit Leak Control", "birthdate": "1975-12-25",
+             "gender": "male", "region": "Gambela", "residence_status": "CITIZEN"}
+info2 = fayda_login(second, other_who)
+assert info2["authenticated"], info2
+a1, a2 = info["claims"]["address"], info2["claims"]["address"]
+assert mock.derive_sub(**{"full_name": whoami["full_name"],
+                          "birthdate": whoami["birthdate"]}) != \
+       mock.derive_sub(**{"full_name": other_who["full_name"],
+                          "birthdate": other_who["birthdate"]}), "subs must differ"
+for field in ("kebele", "woreda"):
+    assert a1[field] == a2[field], \
+        (f"address.{field} differs between two identities — it is derived from "
+         f"something identity-specific, which is how sub digits got in here", field,
+         a1[field], a2[field])
+    assert not any(ch.isdigit() and ch != "0" for ch in a1[field]), \
+        (f"address.{field} is not a constant placeholder", a1[field])
+print("  address placeholders are constant across identities, no sub anywhere: ok")
 
 print("\n\nALL CHECKS PASSED")

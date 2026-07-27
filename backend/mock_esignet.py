@@ -51,8 +51,9 @@ import hashlib
 import html
 import json
 import secrets
+import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import jwt
 from cryptography.hazmat.primitives import serialization
@@ -176,6 +177,7 @@ def generate_client_keypair():
 
 
 MAX_PENDING = 5_000
+_STATE_LOCK = threading.Lock()
 
 
 def _expire() -> None:
@@ -183,14 +185,20 @@ def _expire() -> None:
     Reclaim spent and expired codes and tokens. In-process maps that only ever
     grow are a denial of service by patience; a real provider persists these
     with a TTL, and the mock should at least not fall over.
+
+    Under a lock: these handlers are sync, so uvicorn runs them on a thread
+    pool and two concurrent requests really can mutate the dict while this
+    iterates ("dictionary changed size during iteration"). Not reproducible
+    through HTTP in testing, but the window is real and the fix is one lock.
     """
     now = time.time()
-    for m in (_codes, _tokens):
-        for k in [k for k, v in m.items() if v["exp"] < now]:
-            m.pop(k, None)
-        # Hard ceiling, in case something issues faster than they expire.
-        while len(m) > MAX_PENDING:
-            m.pop(next(iter(m)), None)
+    with _STATE_LOCK:
+        for m in (_codes, _tokens):
+            for k in [k for k, v in list(m.items()) if v["exp"] < now]:
+                m.pop(k, None)
+            # Hard ceiling, in case something issues faster than they expire.
+            while len(m) > MAX_PENDING:
+                m.pop(next(iter(m)), None)
 
 
 def _clean(value: str, label: str, allowed=None) -> str:
@@ -436,7 +444,11 @@ def _page(e_redirect: str, e_state: str, e_nonce: str, e_scope: str,
         </div>
         <div class="alert" style="margin-top:14px"><b>Simulated match.</b> No real
           biometric comparison was performed. The photo and document were read on this
-          device, used for this screen, and discarded — they are never uploaded or stored.</div>
+          device, used for this screen, and discarded — they are never uploaded or stored.
+          <br><br>Because nothing was checked against the national register, <b>anyone who
+          enters the same name and date of birth reaches this same demo record.</b>
+          Treat it as a demonstration, not as your identity, and do not put anything
+          private here.</div>
         <button class="btn" id="finish">Continue to the registry</button>
       </div>
       <p class="err hidden" id="err3"></p>
@@ -463,7 +475,8 @@ def _page(e_redirect: str, e_state: str, e_nonce: str, e_scope: str,
 <script>
 (function(){{
   var $ = function(id){{ return document.getElementById(id); }};
-  var state = {{ rs: "CITIZEN", face: null, doc: null, stream: null, told: false }};
+  var state = {{ rs: "CITIZEN", face: null, doc: null, stream: null,
+                 told: false, busy: false }};
 
   function show(n){{
     for (var i=0;i<4;i++){{
@@ -495,8 +508,14 @@ def _page(e_redirect: str, e_state: str, e_nonce: str, e_scope: str,
 
   $("go1").addEventListener("click", function(){{
     clearErr("err0");
+    // Guard against a second press while the probe is in flight: two presses
+    // called startCamera() twice, and the first getUserMedia stream was
+    // orphaned — the camera light stayed on after the photo was taken, which
+    // on a page about not keeping your image is precisely the wrong signal.
+    if (state.busy) return;
     // Once told they are already known, a second press means "verify anyway".
     if (state.told) {{ show(1); startCamera(); return; }}
+    state.busy = true;
     // Ask whether this person has already been verified here. If so there is
     // nothing to capture — they sign back in with the passkey they registered.
     // The endpoint only exists in dev; anywhere else this 404s and the flow
@@ -508,6 +527,7 @@ def _page(e_redirect: str, e_state: str, e_nonce: str, e_scope: str,
     }}).then(function(r){{ return r.ok ? r.json() : {{known:false}}; }})
       .catch(function(){{ return {{known:false}}; }})
       .then(function(j){{
+        state.busy = false;
         if (j && j.known) {{ alreadyVerified(); return; }}
         show(1); startCamera();
       }});
@@ -537,6 +557,7 @@ def _page(e_redirect: str, e_state: str, e_nonce: str, e_scope: str,
 
   /* ---- step 2: face --------------------------------------------------- */
   function startCamera(){{
+    stopCamera();   // never hold two streams; the light must go out
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{ denied(); return; }}
     navigator.mediaDevices.getUserMedia({{ video: {{ facingMode: "user", width: {{ideal: 640}} }} }})
       .then(function(s){{ state.stream = s; $("cam").srcObject = s; }})
@@ -689,6 +710,13 @@ async def already_verified(request: Request):
     starting a verification anyway, and it exists on the mock IdP alone —
     dev/demo only, never mounted against a real provider.
     """
+    # The gate comes FIRST, before any parsing or early return. Answering
+    # `{"known": false}` to a malformed body ahead of the guard made the route
+    # detectable outside dev — it leaked no person's data, but a 200 where a
+    # 404 is expected tells an attacker the surface exists.
+    if not KNOWN_PROBE or HASH_FIN is None:
+        raise HTTPException(404, "not found")
+
     try:
         body = await request.json()
     except Exception:
@@ -701,10 +729,6 @@ async def already_verified(request: Request):
         return JSONResponse({"known": False})
 
     import store as _store
-    if not KNOWN_PROBE or HASH_FIN is None:
-        # Absent outside dev (see KNOWN_PROBE). 404, not a polite "false":
-        # a route that answers is a route that can be measured.
-        raise HTTPException(404, "not found")
     try:
         known = _store.identity_exists(HASH_FIN(derive_sub(name, dob)))
     except Exception:
@@ -745,11 +769,18 @@ def authorize_confirm(full_name: str = Form(...), birthdate: str = Form(...),
     _codes[code] = {
         "subject": {"name": name, "birthdate": dob, "gender": sex,
                     "region": reg, "residenceStatus": res},
+        "redirect_uri": redirect_uri,
         "nonce": nonce, "exp": time.time() + 120,
     }
+    # Encoded, not concatenated. `state` is caller-supplied, and an unencoded
+    # `&code=…` inside it appended a second `code` parameter — Starlette's
+    # parser prefers the LAST one, so an attacker could choose which code the
+    # callback exchanged. Inert today because app.py checks `state` before
+    # exchanging anything, but this file is the template a real integration
+    # gets copied from, and that check is one refactor away from moving.
     sep = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(f"{redirect_uri}{sep}code={code}&state={state}",
-                            status_code=303)
+    query = urlencode({"code": code, "state": state})
+    return RedirectResponse(f"{redirect_uri}{sep}{query}", status_code=303)
 
 
 @router.post("/v1/esignet/oauth/v2/token")
@@ -779,9 +810,16 @@ def token(grant_type: str = Form(...), code: str = Form(...),
     if claims.get("iss") != client_id or claims.get("sub") != client_id:
         raise HTTPException(401, "client assertion iss/sub mismatch")
 
-    rec = _codes.pop(code, None)
+    with _STATE_LOCK:
+        rec = _codes.pop(code, None)
     if not rec or rec["exp"] < time.time():
         raise HTTPException(400, "invalid or expired authorization code")
+    # RFC 6749 §4.1.3: the redirect_uri presented here must match the one the
+    # code was issued against. With a single registered URI this cannot
+    # currently differ — but "cannot currently differ" is not a check, and this
+    # file is what a real integration is modelled on.
+    if redirect_uri != rec["redirect_uri"]:
+        raise HTTPException(400, "redirect_uri does not match the authorization request")
 
     access_token = secrets.token_urlsafe(32)
     _tokens[access_token] = {"subject": rec["subject"], "exp": time.time() + 300}
