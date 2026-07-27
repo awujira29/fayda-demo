@@ -95,7 +95,11 @@ def verify(chain: str, message: str, signature: str, address: str) -> tuple[bool
 
 def looks_like_address(chain: str, address: str) -> bool:
     if chain == "evm":
-        return address.startswith("0x") and len(address) == 42
+        # Hex, not merely "0x plus 40 characters". Without the hex check any
+        # 40 characters passed — including markup — and reached anything that
+        # records or displays an address, such as R4's audit-log detail.
+        return (len(address) == 42 and address.startswith("0x")
+                and all(ch in "0123456789abcdefABCDEF" for ch in address[2:]))
     # Length gate BEFORE decoding: b58decode is quadratic in input size, so an
     # unbounded address is attacker-priced CPU on a sync endpoint, not a
     # validation question. A 32-byte ed25519 key is 32-44 base58 characters.

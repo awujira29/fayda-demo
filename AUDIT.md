@@ -5,6 +5,861 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Audit - 2026-07-27 — R4/F1 fix review (re-audit of the 2026-07-26 findings)
+
+**Scope:** only the fix deltas on top of the previous run. `git diff` vs `0f9a9ef`
+(`backend/app.py` +108, `backend/store.py` +63, `backend/t.py` +278,
+`frontend/src/App.jsx` +5, CLAUDE.md / DEPLOY.md / render.yaml) plus the untracked
+`backend/chain.py` and `frontend/src/components/OperatorPanel.jsx`. Each of C1,
+H1, H2, M1–M4 was re-attacked on its own terms; the previous run's Lows were
+re-checked only where a fix touched them.
+
+**Method.** A fresh `uvicorn` on `127.0.0.1:8123` (`APP_ENV=dev`, no reload) so the
+existing `:8000` process and `t.py`'s `store.reset()` were never involved. Route
+ordering re-enumerated programmatically over `app.app.routes` with
+`inspect.getsource`, comparing the first-authorization line index to the first
+`store.*`/`chain.*` line index. No third-party API was contacted: every explorer
+test ran against local stubs on ephemeral loopback ports (gzip/deflate bombs of
+16 MB–1 GB, a 302 to `169.254.169.254`, four stall shapes, a query-echoing server,
+and exotic schemes). `tracemalloc` for heap peaks. Concurrency kept to ≤12 sockets.
+One temporary operator grant was made and **revoked** (`492eb15a-…`, revoked
+`2026-07-27T14:10:57Z`); the ~20 `access_log` rows those probes wrote carry
+reasons beginning "audit re-verification" and one deliberate `"framing …"` row —
+they are audit artefacts, not real activity, and the table is append-only. No code
+was modified.
+
+**Counts: 0 critical / 0 high / 1 medium / 8 low (all new). Previous run: 1
+critical, 2 high, 4 medium — 6 RESOLVED, 1 PARTIAL.**
+
+---
+
+### Fix status, per previous finding
+
+| # | Was | Status | One-line evidence |
+|---|---|---|---|
+| C1 | Critical | **RESOLVED** | 7 anonymous probe shapes → 1 byte-identical answer, 0 log rows, no DB query |
+| H1 | High | **RESOLVED** | drip provider cut off at 15.02 s; ceiling ≈ 20 s, finite and operator-gated |
+| H2 | High | **RESOLVED** | 302 / list / null / string / non-JSON / `{"result":{}}` / `[1,2,"three"]` all → a status |
+| M1 | Medium | **PARTIAL** | `detail` reaches the API but `AccessLedger` never renders it |
+| M2 | Medium | **RESOLVED** | cancelled → 404, archived → 200, active → 200, wrong-chain → 404 |
+| M3 | Medium | **RESOLVED** | peak heap flat at ~48 MB for bombs 16 MB → 1 GB (was 134.6 MB) |
+| M4 | Medium | **RESOLVED** | `?chainid=1` and a URL `apikey` both survive; env key wins; no test though |
+
+#### C1 — RESOLVED
+
+`require_operator` at `backend/app.py:988` is the first statement that can produce
+a data-dependent answer. Seven anonymous probe shapes — bound-active,
+bound-archived, bound-cancelled, real-identity-unbound, nonexistent-identity ×2,
+and empty-reason — collapse to **one** distinct `(status, body, non-volatile
+headers)` tuple:
+
+```
+bound-active / bound-archived / bound-cancelled /
+real-id-unbound / nonexistent-id / nonexistent-id-unbound / empty-reason
+  -> 401 {"detail":"not authenticated with Fayda"}     (1 distinct answer)
+access_log rows written by these probes: 0
+median latency  bound-active 0.76 ms | real-id-unbound 0.66 ms | nonexistent-id 0.58 ms
+```
+
+The anonymous path executes no database query at all — `current()` raises before
+`store.is_operator()` — so there is no timing channel to find. An authenticated
+non-operator is equally uniform (4 shapes → one `403 "this view is restricted to
+compliance operators"`, 0 log rows), and a short reason does not change it: the
+role check precedes the reason check. Post-revocation → 403 immediately.
+
+**The shape checks that still run before `require_operator` are not an oracle.**
+`iid` length/NUL, the chain enum, `_clean_token(address)`, `looks_like_address`
+and Pydantic's 422 are all pure functions of the request body. Probed each
+against a real identity and a nonexistent one: identical answers
+(`400 malformed identity id`, `400 chain must be evm or solana`, `400 that does
+not look like a valid address for this chain`, `400 malformed address`, `422
+…Field required`). None of them reads storage, so none can distinguish a bound
+address from an unbound one — which is the join being protected. Leaving them
+above the authorization is correct: it keeps a malformed request from being
+written to the permanent log as a real lookup.
+
+Route enumeration over all routes confirms no regression elsewhere. The only rows
+that flag are the ones the previous run already cleared (`/callback`, the
+`/api/passkey/*` flows, and `/api/me/access-log` where `current(request)` is an
+argument to the store call). Operator routes:
+
+```
+operator_onchain    require_operator@22  data-calls@[29,40,41,48]  ok
+operator_timeline   require_operator@6   data-calls@[7,12,13]      ok
+operator_identity   require_operator@9   data-calls@[10]           ok
+operator_search     require_operator@6   data-calls@[7,15]         ok
+operator_access_log require_operator@5   data-calls@[7,9]          ok
+```
+
+#### H1 — RESOLVED (the bound is real; the constant's name overstates it — see NEW-3)
+
+`_read_bounded` terminates every stall shape I could build:
+
+```
+stall before the status line     ->  8.00 s   provider_unreachable / ReadTimeout
+headers sent, body never starts  ->  8.01 s   provider_unreachable / ReadTimeout
+one chunk at 7.5 s, then stall   -> 15.51 s   provider_unreachable / ReadTimeout
+1 byte every 7.5 s, forever      -> 15.02 s   provider_unreachable / TimeoutError
+```
+
+The last is the case that previously ran past 30 s with no exception. The
+`chain.transactions()` call is the only outbound work `/api/operator/onchain`
+does after authorization, and it is now finite, so a slow explorer can no longer
+hold an anyio worker indefinitely. It is also now reachable only with the
+operator role and only after a log write, which removes the unauthenticated
+amplifier entirely.
+
+#### H2 — RESOLVED
+
+`json.loads`, the `isinstance(body, dict)` guard, the `result`-is-a-list guard and
+the per-entry `isinstance(t, dict)` guard are all inside the one `try` at
+`backend/chain.py:142-188`. Every hostile shape degrades:
+
+```
+302 -> link-local metadata   provider_error         "explorer returned HTTP 302"
+top-level list / null / string / number, non-JSON, {"result":{...}}, [1,2,"three"]
+                             provider_error / provider_unreachable, transactions: []
+```
+
+Nothing raised; no 500; `transactions` is `[]` in every failure case. `t.py`
+42(f) now covers six of these and — importantly — the non-dict-entry case would
+have **passed as `status: "ok"` with 0 transactions** before the fix, so the test
+can now fail.
+
+#### M1 — PARTIAL
+
+Backend resolved: `backend/store.py:998` selects `detail`, `id` is stripped from
+what is returned, and the subject's own `view_onchain` rows carry
+`detail: "evm:0x…"`. `t.py` 42(h) asserts it.
+
+**Not resolved in the product.** `AccessLedger`
+(`frontend/src/components/Ledgers.jsx:56-96`) renders three columns — When,
+Action, Stated reason. `detail` is never displayed, and `view_onchain` is absent
+from the action label map at `Ledgers.jsx:72-76`, so a subject sees the raw string
+`view_onchain` and no wallet. The finding was "the subject can never learn which
+of their wallets was investigated"; through the UI they still cannot. See also
+NEW-1: the value they would be shown is not guaranteed to name a wallet that was
+actually traced, or one that is theirs.
+
+#### M2 — RESOLVED
+
+Verified against a live subject holding one active, one archived and one
+cancelled binding:
+
+```
+active            -> 200        archived          -> 200
+cancelled         -> 404        unbound           -> 404
+ACTIVE uppercased -> 200        mixed case        -> 200
+solana address claimed against an EVM-only identity -> 404
+```
+
+`normalize_address` is applied to both sides, and `b["chain"] == req.chain` is
+evaluated before it, so an EVM lowercase fold is never applied to a Solana row.
+The reasoning in the comment at `backend/app.py:995-1000` is the right one.
+
+One inconsistency survives, in the safe direction: `/api/operator/timeline` still
+offers `wallets` filtered to `status == "active"`
+(`backend/app.py:930-933`), so an archived binding is reviewable by
+`/api/operator/onchain` but is never offered by the panel. Not a hole; the two
+endpoints simply disagree about what is askable, in the opposite direction from
+last time.
+
+#### M3 — RESOLVED
+
+The 1 MB cap is enforced while streaming and **before** the chunk is appended.
+The cap counts *decompressed* bytes (`iter_bytes()` decodes), which is the
+correct side to count. Peak heap for one request, measured with `tracemalloc`
+against gzip bombs:
+
+```
+   16 MB uncompressed /   16.0 KB on the wire -> peak  51.7 MB, status=failure
+   64 MB uncompressed /   63.7 KB on the wire -> peak  47.8 MB, status=failure
+  256 MB uncompressed /  254.8 KB on the wire -> peak  47.8 MB, status=failure
+ 1024 MB uncompressed / 1019.2 KB on the wire -> peak  47.8 MB, status=failure
+```
+
+Flat — previously 134.6 MB for a 200k-transaction response. Residual amplification
+is NEW-4.
+
+#### M4 — RESOLVED
+
+Verified against a query-echoing local stub. The effective request URL:
+
+```
+config /api?chainid=1                 -> ?chainid=1&module=account&…&address=0xabab…
+config /api?chainid=1&apikey=URLKEY   -> ?chainid=1&apikey=URLKEY&module=…
+config /api?apikey=URLKEY + env key   -> ?apikey=ENVKEY&…            (env wins — correct)
+config /api?address=0xVICTIM&module=stats
+                                      -> ?address=0xabab…&module=account&…
+                                         (config cannot redirect the lookup)
+```
+
+Parameter pollution via the operator's address is not reachable — every hostile
+address is percent-encoded into the `address` value:
+
+```
+0x&apikey=X&address=0xdead&z…  -> address=0x%26apikey%3DX%26address%3D0xdead%26z…
+0x#?/../evil…                  -> address=0x%23%3F%2F..%2Fevil…
+0xa\n\rHost: x…                -> address=0xa%0A%0DHost%3A+x…      (no header injection)
+```
+
+Two config-shape residuals, both Low and both listed below (NEW-8 covers the
+absence of any test for this fix): `parse_qsl` runs without `keep_blank_values`,
+so a configured `?chainid=` (blank value) is silently dropped; and
+`dict(parse_qsl(...))` collapses duplicate keys to the last one
+(`?tag=a&tag=b` → `tag=b`).
+
+---
+
+### Medium
+
+#### NEW-1 — the C1 reorder plus the M1 disclosure let an operator write a false, permanent, subject-visible record naming a wallet that is not the subject's
+
+`backend/app.py:988-990` writes the access-log row — including
+`detail=f"{req.chain}:{req.address}"` — **before** `store.identity_full()` and
+before the ownership check at `backend/app.py:998-1003`. That ordering is right;
+it is what closed C1. The consequence is that a `view_onchain` row is written for
+every *attempt*, including refused ones, and there is no field recording the
+outcome. M1 then makes `detail` visible to the subject.
+
+Measured on one subject: **8 `view_onchain` rows for 4 lookups that actually
+happened.** The refused attempts — a cancelled address, an unbound address, a
+Solana address against an EVM-only identity, and deliberate junk — produced rows
+the subject cannot distinguish from real traces.
+
+The junk case is the sharp edge. `looks_like_address` for EVM
+(`backend/verify.py:96-97`) is:
+
+```python
+if chain == "evm":
+    return address.startswith("0x") and len(address) == 42
+```
+
+No hex check. So 40 characters of arbitrary operator-chosen text pass. Row
+actually written and read back through `access_log_about`:
+
+```json
+{"action":"view_onchain","actor_id":"492eb15a-715e-4cdf-b551-23dccb66380f",
+ "reason":"framing d86d028d-3b19-4960-a29e-c07067f72562",
+ "detail":"evm:0x<script>alert(1)</script>zzzzzzzzzzzzzzz"}
+```
+
+**Attack.** An operator who wants to manufacture suspicion against a person posts
+`/api/operator/onchain` with that person's `identity_id` and the address of a
+sanctioned or notorious wallet, with any plausible reason. The response is
+`404 "that wallet is not bound to this identity"` — no data is disclosed — but the
+append-only log now permanently records that this operator traced that wallet
+under that identity, and the subject's own view says the same. Nothing in the
+schema or the API can later distinguish it from a genuine trace. Repeat for as
+many addresses as desired; nothing rate-limits it.
+
+- **Invariant strained:** R4 claim 3, which says the ownership check exists so
+  "the log entry cannot name an unrelated subject" — it can now name an unrelated
+  *address*, which for `view_onchain` is the whole content of the entry. Also
+  CLAUDE.md's framing of `/api/me/access-log` as "the only counterweight to a
+  capability that otherwise points one way": a counterweight that can be loaded
+  with fiction by the party it constrains is a weaker instrument than it appears.
+- **Not an XSS today:** `AccessLedger` does not render `detail` (M1 PARTIAL) and
+  React escapes; `access_log_all`'s `SELECT *` reaches no rendered surface either.
+  That is luck, not a control.
+- **Confidence: certain** (reproduced end to end; rows are in the table).
+- Direction, not applied: keep the pre-authorization write, then record the
+  outcome — a distinct action (`view_onchain_refused`) or an outcome column — so
+  an attempt is legible as an attempt; and make the EVM shape check verify hex.
+
+---
+
+### Low
+
+- **NEW-2 — M1 is invisible in the UI.** `Ledgers.jsx:56-96` renders When /
+  Action / Stated reason only; `detail` is dropped and `view_onchain` has no label
+  case. The person the log exists for still cannot see which wallet was traced
+  without reading `/api/me/access-log` by hand.
+- **NEW-3 — the effective bound is ~20 s, not `TOTAL_BUDGET_SECONDS = 12`.** The
+  deadline at `backend/chain.py:107` is evaluated only after a chunk is yielded, so
+  a chunk landing at t=11.9 s buys another full 8 s read timeout. Measured 15.51 s
+  for the "one chunk then stall" shape. The ceiling is `TOTAL_BUDGET + read` ≈ 20 s
+  (connect is inside the budget — the deadline is set before the client is built).
+  Finite and adequate; the constant name and the comment ("absolute wall-clock
+  budget … connect through last byte") claim more than the code delivers.
+- **NEW-4 — gzip amplification: ~48 MB peak heap per request despite a 1 MB cap.**
+  One 64 KB network read decompresses to as much as ~48 MB before the cap can
+  observe it (measured flat at 47.8–51.7 MB for bombs from 16 MB to 1 GB). Bounded
+  because httpx advertises only `gzip, deflate` here — brotli and zstandard are not
+  installed, and installing either would raise this ceiling silently. Worth a
+  comment naming the assumption.
+- **NEW-5 — a size-cap trip is reported as `provider_unreachable / ValueError`.**
+  The provider was reached; it sent too much. Same for the deadline
+  (`TimeoutError`). `chain.py` rule 2 is that an operator must be able to tell what
+  happened, and `type(e).__name__` is not that. `provider_error` with "response
+  exceeded the size cap" costs nothing and leaks nothing.
+- **NEW-6 — `/api/me`'s `operator` flag ignores `auth_method`.**
+  `backend/app.py:1121` is `store.is_operator(iid)`; `require_operator`
+  additionally demands `auth_method == "fayda"` (`backend/app.py:838-841`). An
+  operator on a passkey session therefore gets `operator: true`, is shown
+  `OperatorPanel`, and every button returns 403. No privilege is granted — verified
+  that revocation flips the flag immediately with no caching — but the hint
+  disagrees with the server for exactly the case R3 introduced.
+- **NEW-7 — `OperatorPanel.jsx` ships to every visitor.** Static import at
+  `frontend/src/App.jsx:25`, gated only at render. The three operator paths and
+  their exact request bodies are readable in the public bundle by anyone. The
+  backend deliberately keeps `/docs` and `/openapi.json` dev-only
+  (`backend/app.py:292`) so those routes are not enumerable; the bundle now
+  enumerates them anyway. No authorization consequence (all three refuse anonymous
+  and non-operator callers), but a dynamic `import()` behind `me.operator` would
+  restore the stated posture.
+- **NEW-8 — the M4 fix has no test.** `grep` over `backend/t.py`: zero references to
+  `chainid`, `parse_qsl`, `MAX_RESPONSE_BYTES` or `_read_bounded`. The
+  query-merge behaviour is one refactor back to `httpx.get(url, params=…)` away
+  from silently reverting to "we looked at another chain and reported it as this
+  one", which is the state M4 described. CLAUDE.md: "New invariants get a test in
+  t.py."
+- **NEW-9 — no single-flight, and failures are still never cached.** 12 concurrent
+  misses on one key produced 12 provider calls. Combined with NEW-3's ~20 s
+  ceiling and the deliberate no-cache-on-failure rule, a dead explorer costs one
+  worker thread for up to 20 s per click with no backoff. Operator-gated and
+  logged, so not the H1 hazard, but the H1 fix is a bound rather than a budget.
+
+### Still open from the previous run (not claimed fixed; re-confirmed)
+
+- **L2** — `backend/t.py:1360`, `assert ats == sorted(ats, reverse=True)` applied to
+  the output of a function whose last statement is that sort. Unchanged tautology.
+- **L3** — 42(d)'s "nothing is persisted" check still tests `pg_tables` name
+  substrings.
+- **L4** — 42(b) still asserts `status == "not_configured"`, so the suite fails for
+  any developer with `CHAIN_EXPLORER_URL` set, and `real_url` is only captured
+  later at (c) — too late to help.
+- **L5 — re-confirmed live, and now demonstrated.** `backend/chain.py:199` builds
+  `f"{chain}:{address.lower()}"` while `store.normalize_address` leaves base58
+  untouched. With `_fetch` returning `ok` for solana (i.e. the day Solana is
+  wired), two distinct base58 addresses differing only in case shared one entry —
+  the provider was called once and the second caller got the **first address's**
+  history with `cached: true`. Inert today only because `_fetch` returns
+  `unsupported_chain` for non-EVM and failures are not cached.
+- **L6, L7, L8, L9, L10** — not addressed by these fixes; not re-ploughed this run
+  beyond L7, which the cache probes re-confirm (the cache is global and keyed on
+  `chain:address`, so `cached: true` still discloses another operator's recent
+  activity).
+- **L11 — half fixed.** CLAUDE.md now carries `chain.py` and `OperatorPanel.jsx`
+  rows and the "No blockchain connection anywhere" line is corrected; DEPLOY.md and
+  render.yaml document both explorer variables, and DEPLOY.md's example is the
+  `?chainid=1` shape M4 now preserves. Still open:
+  `CACHE_TTL_SECONDS = int(os.getenv("CHAIN_CACHE_TTL", "300"))` runs at import and
+  `app.py:44` imports `chain` unconditionally, so `CHAIN_CACHE_TTL=abc` is a boot
+  crash of the entire application (verified: `ValueError` at `chain.py:48`), and a
+  negative value silently disables the cache (verified: `cached` never becomes
+  true).
+
+---
+
+### Verified safe
+
+Actively attacked this run and could not break. Do not re-plough.
+
+**Authorization**
+- Every C1 probe shape, anonymous and authenticated-non-operator, byte-identical
+  including headers; zero log rows; no DB query on the anonymous path so no timing
+  channel. Malformed-input answers (400/422) are pure functions of the request and
+  identical whether the named identity exists or not.
+- Route re-enumeration: no operator route reads storage before authorizing. The
+  three routes flagged are the pre-existing auth flows.
+- Revocation is immediate on `/api/operator/onchain`, `/api/operator/timeline` and
+  the new `/api/me` flag — `store.is_operator` is queried per request, uncached.
+- `operator: true` grants nothing: it is computed after the authenticated guard,
+  is scoped to the caller's own session, and every route it enables re-checks the
+  role *and* `auth_method == "fayda"` server-side.
+- `OperatorPanel.jsx` calls only `/api/operator/search`, `/api/operator/timeline`
+  and `/api/operator/onchain`; it holds no secret, derives `identity_id` from the
+  server's own response, and renders nothing the server did not return. `api.js`
+  surfaces only `detail` from an error body — no stack traces.
+
+**Egress / SSRF**
+- `follow_redirects=False` confirmed behaviourally, not by reading the signature:
+  a 302 to `http://169.254.169.254/latest/meta-data/` returns
+  `provider_error / "explorer returned HTTP 302"` and issues no second request.
+- `file://`, `ftp://`, a non-URL and `http://[::1]:1/` all degrade to
+  `provider_unreachable`; none raises.
+- No parameter pollution reachable from the operator-controlled address (see M4
+  above); config-supplied `address`/`module` are overridden by code.
+
+**Cache**
+- 8 threads × 400 lookups over 2000 keys held the cache at exactly
+  `_CACHE_MAX = 512` with no exceptions; `_cache_get` and `_cache_put` both hold
+  `_CACHE_LOCK`, and eviction is `min()` inside it.
+- A failure after a success does not evict (`status: "ok"`, `cached: true`).
+- An entry past its TTL is never served as `cached: true`; the expired entry is
+  popped and the live failure is returned with `cached: false`.
+- Keys are chain-scoped: the same address under `evm` and `solana` produces two
+  entries. No cross-identity bleed is constructible — the payload holds only
+  `status`/`detail`/`transactions` for a public address, and `wallet` is added by
+  the endpoint from the request, outside the cache.
+
+**Parsing**
+- Seven hostile response shapes and four stall shapes all become a status; nothing
+  raised out of `_fetch` in any test this run.
+- The byte cap fires before the chunk is appended, so the accumulated buffer never
+  exceeds 1 MB.
+
+**Tests**
+- Test 41 is now a real test: three probe shapes, byte-identical answers required,
+  and the access-log total pinned. It would fail on the pre-fix ordering.
+- 42(e) (cancelled refused / archived reviewable), 42(f) (six hostile shapes),
+  42(g) (flood) and 42(g2) (slow drip) all exercise behaviour that did not exist
+  before the fixes, and 42(f)'s non-dict-entry case would have passed as
+  `status: "ok"` under the old code.
+
+---
+
+**Verdict: yes — safe to build on.** The critical linkage oracle is closed at both
+the anonymous and the authenticated-non-operator boundary with no residual
+variation I could find, and the two Highs are genuinely bounded rather than
+papered over. The one Medium is an integrity defect in the audit trail rather than
+a disclosure — it costs an operator role to exploit and leaks nothing — but it
+should be fixed before the access log is ever relied on as evidence, because
+nothing in the schema can distinguish a fabricated entry from a real one after
+the fact.
+
+---
+## Audit - 2026-07-26 — R4/F1 (operator timeline + on-chain history)
+
+**Scope:** only what is uncommitted on top of `0f9a9ef`. That is `git diff`
+(`backend/app.py` +88, `backend/store.py` +55, `backend/t.py` +135) plus the new
+untracked `backend/chain.py`. Concretely: `store.identity_timeline()`,
+`POST /api/operator/timeline`, `POST /api/operator/onchain`, all of `chain.py`,
+and t.py tests 40-42.
+
+**Method:** routes enumerated programmatically by walking `app.app.routes` and
+running `inspect.getsource` on every endpoint, comparing the source line index of
+the first authorization call (`require_operator` / `current(`) against the first
+`store.*` call — not by grep. A fresh `python app.py` (`APP_ENV=dev`, no reload)
+on `127.0.0.1:8000`, rebooted between configurations because `chain.py` reads its
+env at import. No third-party API was contacted: `CHAIN_EXPLORER_URL` was pointed
+at a local hostile stub on `127.0.0.1:8899` serving ten adversarial response
+shapes (non-object JSON top levels, 200k-element arrays, 200k-character fields,
+NUL-bearing strings, 2000-deep nesting, and a chunked slow-drip). No code was
+modified; the four probe operator grants were revoked and the server was restored
+to its unconfigured state.
+
+**Counts: 1 critical / 2 high / 4 medium / 11 low.**
+
+---
+
+### Critical
+
+#### C1 — `/api/operator/onchain` is an unauthenticated, unlogged oracle that maps a wallet address to a Fayda identity
+
+`backend/app.py:978-986` (the check) versus `backend/app.py:988` (the
+authorization). `store.identity_full()` and the identity↔address binding test run
+**before** `require_operator()`. Every branch above line 988 is reachable with no
+session at all.
+
+The three outcomes are distinguishable, which is the entire oracle:
+
+```
+anon POST /api/operator/onchain {identity_id, chain, address, reason}
+  401 "not authenticated with Fayda"          -> identity exists AND address is bound to it
+  404 "that wallet is not bound to this identity" -> identity exists, address is not bound
+  404 "no such identity"                      -> identity does not exist
+```
+
+Verified against a fresh server:
+
+```
+anon bound pair        -> 401 {"detail":"not authenticated with Fayda"}
+anon real id, unbound  -> 404 {"detail":"that wallet is not bound to this identity"}
+anon bogus id          -> 404 {"detail":"no such identity"}
+revoked-op bound       -> 403 {"detail":"this view is restricted to compliance operators"}
+revoked-op unbound     -> 404 {"detail":"that wallet is not bound to this identity"}
+log entries produced by ALL of the above probes: 0
+```
+
+**Attack.** An operator whose grant was revoked (or who never had one, or who is
+simply logged out) keeps any `identity_id` they ever saw — from
+`/api/operator/search` results, a `/api/registry` listing, a case file, a
+screenshot. For each retained id they replay one POST per candidate address taken
+from public chain data. A 401 confirms that this specific Ethiopian national
+identity controls that specific wallet. The `reason` is never validated on this
+path either, so `reason: ""` works. Nothing is written to `access_log` — verified
+by counting rows about the subject before and after six probes: delta 0. There is
+no rate limit; measured 3.1 req/s serially against managed Postgres, and each
+probe runs `store.identity_full()`, two privileged queries, for an anonymous
+caller.
+
+This is precisely the join the registry exists to protect, obtained by the one
+route that leaves no trace. It also inverts R3's own stated rule, which is written
+out 70 lines earlier in the same file at `backend/app.py:899-901` on
+`/api/operator/identity`: *"Logged BEFORE the read, and logged even when the
+record turns out not to exist: an operator probing for which identities are
+present is itself something a reviewer should be able to see."* `/api/operator/onchain`
+does the opposite, and probes at a finer grain than the case R3 guarded.
+
+- **Invariants broken:** #8 (no cross-user read without an operator check AND an
+  access-log entry — here there is neither), and #9 (the privileged
+  `store.conn()` path is executed on behalf of an unauthenticated caller).
+- **Note:** R4's own claim 3 says the binding check exists so "the log entry
+  cannot name an unrelated subject". Running it before the log is what makes it
+  an oracle; the check is right, its position is wrong.
+- **Confidence: certain** (reproduced end to end on a fresh server).
+
+---
+
+### High
+
+#### H1 — the on-chain timeout is not a bound; a slow explorer takes the whole application down
+
+`backend/chain.py:38,89-90`. `REQUEST_TIMEOUT_SECONDS = 8` is passed to
+`httpx.get` as a scalar, which httpx expands to `Timeout(connect=8, read=8,
+write=8, pool=8)`. Those are **per-operation**, not total. A provider that emits
+one byte every three seconds resets the read timer forever; httpx has no overall
+deadline. Measured directly against the stub: still running after 30 s, no
+exception, no return.
+
+Every endpoint in this app is `def`, not `async def`, so each in-flight lookup
+holds one anyio worker thread (default limiter: 40).
+
+```
+firing 45 concurrent /api/operator/onchain calls against a slow-drip explorer...
+   GET  /api/me       -> *** ReadTimeout after 20.0s
+   GET  /config.js    -> *** ReadTimeout after 20.0s
+   GET  /login        -> *** ReadTimeout after 20.0s
+access-log rows about the subject: 40
+```
+
+The registry stops serving entirely — not just the compliance panel. Login and a
+static JS file both stall. Failures are deliberately not cached
+(`backend/chain.py:141`), so retries re-open the connection every time rather than
+backing off.
+
+The trigger does not require a malicious explorer, only a degraded one under load,
+or anyone able to sit on that TLS connection. It is the exact failure `chain.py`'s
+docstring rule 3 says cannot happen: *"Never block on it. Every call is
+timeout-bounded."* Note also the 40 access-log rows: each says the operator was
+served, and none of them were.
+
+- **Invariant broken:** R4 claim 2 / `chain.py` rule 3. Availability of the whole
+  service, from a third-party dependency the module says it does not trust.
+- **Confidence: certain** (reproduced end to end).
+
+#### H2 — any non-object JSON from the explorer escapes as an unhandled exception (500), after the access has already been logged
+
+`backend/chain.py:104`. `result = body.get("result")` sits **outside** the
+`try/except` that ends at line 100. If the explorer's JSON top level is anything
+other than an object, `.get` raises `AttributeError` and nothing catches it. Four
+of ten hostile shapes reach it:
+
+```
+toplevel_list      *** RAISED AttributeError: 'list' object has no attribute 'get'
+toplevel_null      *** RAISED AttributeError: 'NoneType' object has no attribute 'get'
+toplevel_string    *** RAISED AttributeError: 'str' object has no attribute 'get'
+toplevel_number    *** RAISED AttributeError: 'int' object has no attribute 'get'
+deep_nest          *** RAISED AttributeError: 'list' object has no attribute 'get'
+```
+
+End to end through the endpoint:
+
+```
+HTTP 500 | body: 'Internal Server Error'
+leaks traceback: False
+access-log entries written by the FAILED lookup: 1
+```
+
+A bare JSON array or `null` is what many API gateways, rate limiters and error
+proxies return. `backend/app.py:990-991` asserts inline that this cannot happen
+(*"Never raises: a slow or broken explorer comes back as a status the panel
+renders, not a 500"*) — the comment is wrong about its own code.
+
+Two consequences. The panel breaks on provider misbehaviour instead of degrading,
+which is the failure mode R4 was split into two endpoints to avoid. And the
+`access_log` row is written at line 988 before the call, so the permanent audit
+trail records a successful lookup of that subject's wallet that never returned
+anything — the log over-reports, which is the safe direction but is still a false
+entry in an append-only table that cannot be corrected.
+
+- **Invariant broken:** R4 claim 2 / `chain.py` rule 3 ("All failures become a
+  status, never an exception").
+- **Confidence: certain** (reproduced end to end; stack trace captured in the
+  server log at `chain.py:104`).
+
+---
+
+### Medium
+
+#### M1 — the subject can never learn which of their wallets was investigated
+
+`backend/store.py:977` sets `cols = "id, at, actor_id, action, reason"` in
+`access_log_about()` — the query behind `GET /api/me/access-log`. `detail` is not
+selected. `access_log_all()` at `backend/store.py:955-959` uses `SELECT *`, so the
+operator console sees it.
+
+R4's claim 5 is that the on-chain entry "names subject_id + the chain:address in
+`detail`". It does — into a column only operators can read. Verified: entries
+returned to the subject carry exactly `{action, reason, at, actor_id}` and no
+`detail` key at all.
+
+CLAUDE.md calls `/api/me/access-log` *"the only counterweight to a capability that
+otherwise points one way"*. For R3's actions the omission was arguable (`detail`
+held the operator's search string). For `view_onchain` it is not: `detail` holds
+*which of the subject's own wallets was traced*, and a person told only that
+"someone ran view_onchain about you" cannot tell whether their active wallet, a
+wallet they cancelled during a cooling period, or an address they abandoned years
+ago was the one pulled into a financial-history file.
+
+- **Invariant strained:** #8's counterweight. The log is written truthfully and
+  then shown asymmetrically.
+- **Confidence: certain.**
+
+#### M2 — the binding check accepts archived and cancelled bindings, and cancelled is the wrong answer
+
+`backend/app.py:981-984` iterates `record["bindings"]` with no status filter.
+Verified on a subject with one active, one archived and one cancelled binding:
+
+```
+active   w2    -> 200
+archived w1    -> 200
+cancelled w3   -> 200
+unbound        -> 404
+```
+
+Meanwhile `/api/operator/timeline` at `backend/app.py:955-958` offers only
+`status == "active"` wallets, with the comment *"Which wallets the caller may then
+ask about on-chain"*. The two endpoints disagree about what is askable.
+
+**Archived should stay.** An archived binding is an address the person genuinely
+proved control of and later replaced; a compliance review of past activity needs
+it, and excluding it would make the feature answer only the present tense.
+
+**Cancelled should not.** Per CLAUDE.md, the cooling period exists *for session
+compromise*: "If an attacker with a live session swaps the wallet, the real user
+needs a window to cancel." A `cancelled` row is therefore, in the exact scenario
+the mechanism was built for, **the attacker's address, which the victim
+explicitly repudiated**. R4 currently lets an operator pull that address's full
+transaction history, return it under the victim's name in a case file, and write
+`view_onchain / <victim> / evm:<attacker address>` into an append-only log that
+cannot be amended. The registry never asserted that person controlled it — the
+cancellation is the assertion that they did not.
+
+`promote_due` also writes `status='cancelled'` when a pending row loses the sybil
+race (`backend/store.py:1414-1418`), so a cancelled address can be one that
+**belongs to somebody else entirely**, now queryable under the loser's identity.
+
+Recommendation: accept `active` and `archived`; refuse `cancelled` and `pending`,
+or at minimum carry the status in both the response and the `detail`.
+
+- **Confidence: certain** on the behaviour; the active-only argument is a judgement
+  call, stated above.
+
+#### M3 — the explorer response is fully buffered and parsed before `MAX_TX` is applied
+
+`backend/chain.py:89-111`. `httpx.get` without `stream=`, no `Content-Length`
+ceiling, no byte cap; `r.json()` materialises the whole document, and
+`result[:MAX_TX]` truncates only afterwards. Measured with a 200k-transaction
+response: **134.6 MB peak Python allocation for one request**, to return 25 rows.
+
+Combined with H1 (workers are held) and the fact that failures are not cached, a
+degraded or hostile provider drives repeated multi-hundred-megabyte allocations
+across up to 40 concurrent threads. Per-field truncation (H-verified: 80/64/40/20)
+protects the *response*, not the *heap*.
+
+- **Invariant strained:** `chain.py` rule 3 and CLAUDE.md's general posture on
+  attacker-priced CPU/memory (`verify.py:99-101` gets this right for base58; this
+  module does not).
+- **Confidence: certain** (measured with `tracemalloc`).
+
+#### M4 — any query string in `CHAIN_EXPLORER_URL` is silently discarded, so the panel can confidently report another chain's history
+
+`backend/chain.py:89`. httpx's `params=` **replaces** the URL's query rather than
+merging it. Verified:
+
+```
+httpx.Request('GET','http://x/api?chainid=1&apikey=SECRET', params={...}).url
+  -> http://x/api?module=account&address=0xab
+=> query params baked into CHAIN_EXPLORER_URL are DISCARDED
+```
+
+This is not hypothetical: Etherscan's current V2 multichain endpoint selects the
+network with `?chainid=`. Deploying
+`CHAIN_EXPLORER_URL=https://api.etherscan.io/v2/api?chainid=1` silently drops
+`chainid`, and a URL-embedded `apikey` likewise vanishes. The response still comes
+back `status: "ok"` with `cached: false` and a list of transactions.
+
+`chain.py`'s rule 2 is *"Never fabricate… an operator reading a compliance screen
+must be able to tell 'no transactions' from 'we did not look'."* This produces a
+third state the module has no vocabulary for: *we looked somewhere else*, rendered
+as a confident answer. There is no startup validation of `EXPLORER_URL` and no
+echo of the effective URL anywhere in the payload, so nothing surfaces the
+mistake.
+
+- **Confidence: certain** on the httpx behaviour; **likely** on the deployment
+  shape (no explorer is configured yet, which is why this is catchable now).
+
+---
+
+### Low
+
+- **L1 — test 41's anonymous probe picks the one input that hides C1.**
+  `backend/t.py` test 41 asserts `anon.post(.../onchain, address=w2) == 401`, and
+  `w2` is *bound* to `tl_id`. That is the single branch that reaches
+  `require_operator`. Any unbound address returns 404 to an anonymous caller and
+  the test would have failed. The check that exists to prove the endpoint is
+  closed to anonymous callers passes because it avoids the hole.
+- **L2 — test 40's ordering assertion is a tautology.** `assert ats == sorted(ats,
+  reverse=True)` is applied to the output of a function whose last statement is
+  `events.sort(..., reverse=True)`. It cannot fail, and it cannot detect an event
+  carrying the wrong `at`.
+- **L3 — test 42's "nothing is persisted" check tests table names.** It asserts no
+  `pg_tables` row contains the substrings `tx`/`transaction`/`onchain`. It would
+  not notice on-chain data written into a new column on `wallet_bindings`, into
+  `access_log.detail`, or into a table called anything else.
+- **L4 — test 42(b) asserts on the environment, not the code.** It requires
+  `status == "not_configured"`, so the suite fails for any developer who has
+  `CHAIN_EXPLORER_URL` set — and passes for the wrong reason (no provider) rather
+  than because the not-configured branch was exercised deliberately.
+- **L5 — the cache key lowercases Solana addresses, contradicting
+  `store.normalize_address`.** `backend/chain.py:134` builds
+  `f"{chain}:{address.lower()}"`, while `backend/store.py:472` deliberately leaves
+  base58 untouched because Solana addresses are case-sensitive. Verified: two
+  distinct Solana addresses differing only in case produce an identical cache key.
+  Inert today (`_fetch` returns `unsupported_chain` for non-EVM and failures are
+  not cached), so this is a mine, not a wound: it becomes one wallet's history
+  served for another the day Solana is wired.
+- **L6 — the timeline states a cause it cannot know.** `backend/store.py:1039-1041`
+  emits `"cancelled during the cooling period"` for any `status == 'cancelled'`
+  row. `promote_due` writes that status when a pending row loses the sybil race
+  (`backend/store.py:1414-1418`) — reachable when a second identity gets a nonce
+  for the address before the first identity's pending row exists, then binds it
+  with no incumbent. The case file then reads "this person requested wallet X and
+  withdrew" when the truth is "this person requested wallet X and someone else took
+  it". An attacker who wins that race writes a false event into a stranger's
+  compliance record.
+- **L7 — `cached: true` discloses another operator's activity without a log read.**
+  The cache is global and keyed on address alone, so the flag at
+  `backend/chain.py:137` tells operator B that *somebody* queried that address
+  within `CACHE_TTL_SECONDS`. Marginal (operators can read the full log anyway) but
+  it is investigative metadata leaking outside the audited path.
+- **L8 — the timeline is unbounded.** `identity_timeline` has no `LIMIT` and emits
+  up to three events per binding plus one. A user can grow their own
+  `wallet_bindings` without bound by cycling request→cancel (each cycle needs one
+  signature; trivial via `/api/dev/test-wallet`), so opening that case file becomes
+  an arbitrarily large privileged query and response. `identity_full` shares the
+  shape; R4 triples the event count on top of it.
+- **L9 — NUL bytes from the provider reach the API response.** Verified:
+  `{'hash': 'a\x00b', 'counterparty': '0x\x00', ...}`. Harmless to storage (nothing
+  on-chain is persisted, which is why this is Low) but it is the exact class
+  `_clean_token` at `backend/app.py:727-736` exists to keep out of this service.
+- **L10 — the timeline sort inherits a hazard this codebase already documented.**
+  `events.sort(key=lambda e: e["at"] or "")` compares ISO strings bytewise, and
+  `datetime.isoformat()` omits `.ffffff` when microseconds are zero. `'+'` (0x2B)
+  sorts before `'.'` (0x2E), so a whole-second event sorts ahead of a sub-second
+  one in the same second. `promote_due` guards exactly this with `COLLATE "C"` and
+  a Python re-check (`backend/store.py:1375-1379`); the new sort does not. One in
+  10^6, and only within a single second.
+- **L11 — docs and boot-time config.** CLAUDE.md still asserts *"No blockchain
+  connection anywhere"* and its architecture table has no row for `chain.py`,
+  which is now imported unconditionally at `backend/app.py:44`. Separately,
+  `CACHE_TTL_SECONDS = int(os.getenv("CHAIN_CACHE_TTL", "300"))` runs at import, so
+  a malformed value is a boot crash rather than a config error. (No new dependency
+  was added — `httpx` was already pinned for OIDC. Correct.)
+
+---
+
+### Verified safe
+
+Actively attacked and could not break. Do not re-plough these.
+
+**Authorization boundary**
+- `/api/operator/timeline` orders correctly: `require_operator` at
+  `backend/app.py:940` precedes every `store.*` call, and it logs even when the
+  identity does not exist (404 comes after the log). Non-operator with a valid
+  session → 403; the log row is still written.
+- Route enumeration over `app.app.routes` with `inspect.getsource`, comparing the
+  first-authorization-call index to the first-`store.*`-call index across all 30
+  routes: `/api/operator/onchain` is the **only** route in the application whose
+  store access precedes its authorization. The other flagged routes are the auth
+  flows themselves (`/callback`, `/api/passkey/*`), and `/api/me/access-log`
+  evaluates `current(request)` as an argument to the store call.
+- Operator revocation is immediate on both new routes. `require_operator` calls
+  `store.is_operator()` per request with no caching; after
+  `revoke_operator`, `/api/operator/timeline` and `/api/operator/onchain` both
+  return 403 on an otherwise-live session.
+- Passkey-only sessions are refused: `require_operator` checks
+  `auth_method != "fayda"` before the role check. (Reachability of C1's oracle by
+  such a session is covered by C1, not a separate issue.)
+- No R4 data reaches `/api/me`, `/api/registry` or `/config.js`. `/config.js`
+  emits only `PRIVY_APP_ID`. `/docs` and `/openapi.json`, which would enumerate the
+  two new routes and their request shapes, are `DEV_MODE`-only
+  (`backend/app.py:292`).
+
+**Data minimisation**
+- `identity_timeline` selects `proof_method` only. Grepped the raw response bodies
+  of `/api/operator/timeline` for `fin_hmac`, `proof_sig`, `proof_message`,
+  `proof_nonce` — all four absent. `identity_full`'s explicit column list still
+  holds under R4.
+- No on-chain data is written to Postgres. The only DB work on the `/onchain` path
+  is the pre-existing `identity_full` read plus the `access_log` insert.
+- `CHAIN_EXPLORER_KEY` does not leak into any response. Error details carry only
+  `f"explorer returned HTTP {status}"` or `type(e).__name__` — never the URL, the
+  params, or an exception message.
+- No stack trace reaches the client on the H2 500 (body is the bare
+  `Internal Server Error`).
+
+**SSRF / egress**
+- `httpx.get` in 0.28.1 defaults to `follow_redirects=False` (signature confirmed
+  in the installed package). A redirecting or compromised explorer cannot pivot
+  the fetch to another host or to link-local metadata.
+- The operator-controlled `address` cannot smuggle query parameters or alter the
+  destination: `params=` percent-encodes, and `looks_like_address` gates EVM input
+  to exactly 42 characters starting `0x` before it is used. Tried `&`- and
+  `?`-bearing values; all rejected upstream or encoded.
+
+**Hostile response parsing** (ten shapes through the local stub)
+- Field truncation is real and per-field: 200k-character values came back as
+  `hash` 80, `counterparty` 64, `value_wei` 40, `timestamp` 20, `direction` 2.
+- Non-dict entries inside `result` are skipped, not crashed on
+  (`[1, "two", null, [3], {...}]` → one transaction, no error).
+- A string or dict `result` becomes `provider_error` with a 200-char detail.
+- 2000-deep nesting parses without a `RecursionError`; deeper input raises inside
+  the `try` and is caught. (It still reaches H2's `AttributeError` because the top
+  level is a list — that is H2, not a parsing failure.)
+
+**Cache**
+- `cached: true` never accompanies stale-beyond-TTL data. Shortened
+  `CACHE_TTL_SECONDS` to 1, slept past it, re-queried with a failing `_fetch`: the
+  expired entry was popped and the caller got `cached: false` and the live status.
+- Failure statuses are never cached, and a provider blip after a success does not
+  evict the good entry (t.py 42(d) is correct about this, and it reproduces).
+- Cross-identity cache confusion is not reachable: the key is `chain:address`, and
+  the same address resolves to the same public data regardless of which identity's
+  case file requested it. Eviction is `min()` over ≤512 entries under
+  `_CACHE_LOCK`; both `_cache_get` and `_cache_put` hold it.
+
+**Timeline correctness**
+- The `activated_at == requested_at` immediate-bind heuristic is sound *in
+  practice*: `create_binding` (`backend/store.py:1296-1298`) writes both from the
+  same `t`, so the strings are byte-identical for a first bind, and `promote_due`
+  always writes a strictly later `activated_at`. Fragile — it couples a lifecycle
+  decision to timestamp-formatting equality — but I could not produce a
+  misclassification.
+- Full lifecycle (immediate bind → replacement → promotion → archive → replacement
+  → cancel) produced exactly seven events, newest first, each naming its wallet,
+  with no duplication and nothing omitted. Unknown identity returns `[]`.
+- Case variance on the address is handled correctly by the ownership check
+  (uppercase and mixed-case spellings of a bound address both resolve via
+  `normalize_address`), and the logged `detail` matches the address actually sent
+  to the explorer — the operator's own casing, byte for byte, in both places. No
+  log/lookup mismatch was reachable.
+
+---
+
+**Verdict: no — not safe to build on.** C1 makes the flagship privacy join
+(national identity ↔ wallet address) confirmable by an unauthenticated caller with
+no access-log entry, which is the single failure R3 was built to prevent and
+invariant #8 forbids in both of its clauses; H1 lets one slow third party stop the
+whole service. C1 is a two-line move of `require_operator` above the lookup, and
+H2 is a `try` boundary — the design is right and the ordering is wrong. Re-audit
+after those move.
+
+---
+
 ## Fix review — R3, 2026-07-26 (operator-gated registry, keyset paging, per-result search logging, ALWAYS triggers, Fayda-gated operators, operator tombstones)
 
 **Scope:** only the deltas applied on top of the R3 audit immediately below —

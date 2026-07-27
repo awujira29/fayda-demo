@@ -1335,4 +1335,369 @@ assert entry["actor_id"].startswith("cli:") and len(entry["actor_id"]) > 5, entr
 st.revoke_operator(who["id"], revoked_by=st.cli_actor())
 print(f"  a CLI grant records who ran it ({entry['actor_id'][:28]}…): ok")
 
+step("40. R4/F1: the in-app timeline is assembled from the bindings themselves")
+# The timeline is derived from binding timestamps rather than kept in a
+# parallel event table, so it cannot drift out of sync with what it describes.
+# Build a full lifecycle and check every transition appears exactly once.
+tl_id = st.upsert_identity(secrets.token_hex(16), "Timeline Subject", "1988-03-03")
+w1, w2, w3 = rnd_addr(), rnd_addr(), rnd_addr()
+st.create_binding(tl_id["id"], "evm", w1, secrets.token_hex(8), "s", "m", 72)  # immediate
+st.create_binding(tl_id["id"], "evm", w2, secrets.token_hex(8), "s", "m", 72)  # pending
+st.force_due(tl_id["id"], "evm")
+st.promote_due(tl_id["id"])                                        # w2 activates, w1 archived
+st.create_binding(tl_id["id"], "evm", w3, secrets.token_hex(8), "s", "m", 72)  # pending
+st.cancel_pending(tl_id["id"], "evm")                              # w3 cancelled
+
+tl = st.identity_timeline(tl_id["id"])
+kinds = [e["kind"] for e in tl]
+assert kinds.count("identity_verified") == 1, kinds
+assert "wallet_bound" in kinds, kinds
+assert "replacement_requested" in kinds and "replacement_activated" in kinds, kinds
+assert "binding_archived" in kinds, ("the replaced wallet is not in the timeline", kinds)
+assert "binding_cancelled" in kinds, ("the cancelled replacement is missing", kinds)
+# Newest first, and every event timestamped.
+ats = [e["at"] for e in tl]
+assert all(ats) and ats == sorted(ats, reverse=True), ("timeline is not ordered", ats)
+# Events name the wallet they concern, so a reviewer can follow one address.
+assert {e["address"] for e in tl if e["address"]} == {w1, w2, w3}, \
+    "timeline events do not identify their wallet"
+assert st.identity_timeline(str(uuid.uuid4())) == [], "unknown identity produced events"
+print(f"  {len(tl)} events across bind/replace/promote/cancel, ordered: ok")
+
+step("41. R4: history is operator-only, logged, and absent from every user view")
+# c2 is an ordinary signed-in user (its earlier session died with test 32's
+# reset). It must be refused for lack of the ROLE, not for lack of a session —
+# 401 would pass this assertion for the wrong reason.
+assert fayda_login(c2, fins[2])["authenticated"], "could not re-establish c2"
+assert not st.is_operator(c2.get(f"{B}/api/me").json()["identity"]["id"])
+r = c2.post(f"{B}/api/operator/timeline",
+            json={"identity_id": tl_id["id"], "reason": "AML case 5001"})
+assert r.status_code == 403, ("timeline served a non-operator", r.status_code)
+# The anonymous probe must use the inputs that DON'T reach authorization if the
+# checks are ordered wrongly. An earlier version of this assertion passed a
+# BOUND address — the one input that reached require_operator — so it passed
+# while an unauthenticated caller could still distinguish "no such identity"
+# from "not bound to this identity" and thereby confirm that a public wallet
+# belongs to a specific Fayda identity. Probe all three shapes and require the
+# SAME answer to each: any variation is the oracle.
+probes = [
+    {"identity_id": tl_id["id"], "chain": "evm", "address": w2},        # bound
+    {"identity_id": tl_id["id"], "chain": "evm", "address": rnd_addr()},  # not bound
+    {"identity_id": str(uuid.uuid4()), "chain": "evm", "address": w2},  # no identity
+]
+log_before = st.access_log_all(limit=1)["total"]
+answers = set()
+for p in probes:
+    r = anon.post(f"{B}/api/operator/onchain", json={**p, "reason": "AML case 5001"})
+    assert r.status_code == 401, ("on-chain answered an anonymous caller", p, r.status_code)
+    answers.add((r.status_code, r.text))
+assert len(answers) == 1, \
+    ("an anonymous caller can distinguish bound from unbound — a linkage oracle",
+     answers)
+# Nothing was authorized, so nothing may have been written either — an
+# unauthenticated caller must not be able to grow the append-only log.
+assert st.access_log_all(limit=1)["total"] == log_before, \
+    "unauthenticated probes wrote to the access log"
+print("  anonymous probes are indistinguishable across bound/unbound/unknown: ok")
+
+n = st.access_log_about(tl_id["id"], limit=1)["total"]
+r = c.post(f"{B}/api/operator/timeline",
+           json={"identity_id": tl_id["id"], "reason": "AML case 5001"})
+assert r.status_code == 200, (r.status_code, r.text[:200])
+body = r.json()
+assert body["timeline"] and body["identity"]["display_name"] == "Timeline Subject"
+assert st.access_log_about(tl_id["id"], limit=1)["total"] == n + 1, \
+    "opening a case file went unlogged"
+# The most sensitive join must never appear in a user-facing view.
+mine = c.get(f"{B}/api/me").text
+assert "timeline" not in mine and "transactions" not in mine, \
+    "transaction history leaked into the user view"
+print("  timeline is operator-only, logged, and not in /api/me: ok")
+
+step("42. R4: the on-chain path is bound to the identity, cached, and degrades")
+# (a) An address that is NOT bound to the named identity must be refused —
+# otherwise this is a general chain proxy that happens to need an operator,
+# and the log entry would name a subject unconnected to the address queried.
+r = c.post(f"{B}/api/operator/onchain",
+           json={"identity_id": tl_id["id"], "chain": "evm", "address": rnd_addr(),
+                 "reason": "AML case 5002"})
+assert r.status_code == 404, ("an unbound address was queried", r.status_code)
+print("  an address not bound to this identity is refused: ok")
+
+# (b) With no provider configured the answer must say so — never an empty list
+# that reads as "this wallet has never transacted", and never sample data.
+import chain as ch
+from verify import looks_like_address as vf_looks
+ch.clear_cache()
+r = c.post(f"{B}/api/operator/onchain",
+           json={"identity_id": tl_id["id"], "chain": "evm", "address": w2,
+                 "reason": "AML case 5003"})
+assert r.status_code == 200, (r.status_code, r.text[:200])
+j = r.json()
+assert j["status"] == "not_configured", ("unconfigured provider did not say so", j)
+assert j["transactions"] == [], j
+assert "no lookup was attempted" in j["detail"], j
+print("  unconfigured provider reports it rather than faking an empty history: ok")
+
+# (c) Provider failures degrade to a status, never a 500 and never an
+# exception. Point the module at a URL that cannot answer and let the real
+# _fetch handle it — mocking _fetch itself here would test the mock.
+real_url = ch.EXPLORER_URL
+ch.EXPLORER_URL = "http://127.0.0.1:9/explorer"      # port 9 discards
+try:
+    ch.clear_cache()
+    out = ch.transactions("evm", w2)
+    assert out["status"] == "provider_unreachable", out
+    assert out["transactions"] == [], out
+except Exception as exc:
+    raise AssertionError(f"a provider failure escaped as an exception: {exc!r}")
+finally:
+    ch.EXPLORER_URL = real_url
+print("  an unreachable provider degrades to a status, not an exception: ok")
+
+# (d) Cached with a TTL, and never persisted as source of truth. The provider
+# call is the seam replaced here — the point is the caching behaviour around
+# it, not the HTTP parsing exercised above.
+ch.clear_cache()
+real_fetch = ch._fetch
+served = {"n": 0}
+def fake_ok(chain_, addr):
+    served["n"] += 1
+    return {"status": "ok", "detail": "",
+            "transactions": [{"hash": "0xabc", "timestamp": "1700000000",
+                              "direction": "in", "counterparty": "0xdead",
+                              "value_wei": "1000"}]}
+def always_down(chain_, addr):
+    return {"status": "provider_unreachable", "detail": "down", "transactions": []}
+try:
+    ch._fetch = fake_ok
+    first = ch.transactions("evm", w2)
+    second = ch.transactions("evm", w2)
+    assert served["n"] == 1, ("the cache did not serve the second call", served["n"])
+    assert first["cached"] is False and second["cached"] is True, first["cached"]
+    assert second["transactions"] == first["transactions"]
+    # A blip after a success must not replace a good entry with an error —
+    # caching the failure would hide a recovered provider for the whole TTL.
+    ch._fetch = always_down
+    third = ch.transactions("evm", w2)
+    assert third["status"] == "ok" and third["cached"] is True, \
+        ("a provider blip evicted a good cache entry", third)
+finally:
+    ch._fetch = real_fetch
+    ch.clear_cache()
+# On-chain data is public and refetchable; it must not become a record here.
+with st.conn() as sc:
+    tables = {r["tablename"] for r in sc.execute(
+        "SELECT tablename FROM pg_tables WHERE schemaname='public'").fetchall()}
+    assert not any("tx" in t or "transaction" in t or "onchain" in t for t in tables), \
+        ("on-chain data is being persisted as source of truth", tables)
+print("  cached with a TTL, blips do not evict, nothing persisted: ok")
+
+# (e) A CANCELLED binding is a repudiated claim — cancellation is exactly how a
+# user kills a swap they did not authorise. Treating it as theirs would pull an
+# attacker's address into the victim's case file and write it to a log that
+# cannot be corrected. Archived bindings ARE theirs: they were live once.
+cancelled_addr = w3          # cancelled during cooling, above
+archived_addr = w1           # replaced by w2, archived
+assert any(b["address"] == cancelled_addr and b["status"] == "cancelled"
+           for b in st.history(tl_id["id"])), "test setup: w3 should be cancelled"
+r = c.post(f"{B}/api/operator/onchain",
+           json={"identity_id": tl_id["id"], "chain": "evm",
+                 "address": cancelled_addr, "reason": "AML case 5004"})
+assert r.status_code == 404, \
+    ("a repudiated (cancelled) binding was treated as this identity's wallet",
+     r.status_code)
+r = c.post(f"{B}/api/operator/onchain",
+           json={"identity_id": tl_id["id"], "chain": "evm",
+                 "address": archived_addr, "reason": "AML case 5005"})
+assert r.status_code == 200, ("a previously-active wallet should be reviewable",
+                              r.status_code, r.text[:120])
+print("  cancelled bindings refused, archived ones reviewable: ok")
+
+# (f) A hostile or broken provider must degrade, never 500 — the parse used to
+# sit outside the try, so a top-level list came back as an AttributeError
+# AFTER the access-log row had been written.
+import http.server, socketserver, threading as _th
+class Hostile(http.server.BaseHTTPRequestHandler):
+    payload = b'[]'
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Type","application/json")
+        self.end_headers(); self.wfile.write(self.payload)
+    def log_message(self, *a): pass
+
+for name, payload in (("top-level list", b"[]"),
+                      ("null", b"null"),
+                      ("bare string", b'"hello"'),
+                      ("not json", b"<html>nope</html>"),
+                      ("result not a list", b'{"result": {"a": 1}}'),
+                      ("non-dict entries", b'{"result": [1, 2, "three"]}')):
+    Hostile.payload = payload
+    srv2 = socketserver.TCPServer(("127.0.0.1", 0), Hostile)
+    port2 = srv2.server_address[1]
+    th = _th.Thread(target=srv2.serve_forever, daemon=True); th.start()
+    try:
+        ch.EXPLORER_URL = f"http://127.0.0.1:{port2}/api"
+        ch.clear_cache()
+        out = ch.transactions("evm", archived_addr)
+        assert out["status"] in ("provider_error", "provider_unreachable"), (name, out)
+        assert out["transactions"] == [], (name, out)
+    finally:
+        ch.EXPLORER_URL = real_url
+        srv2.shutdown(); srv2.server_close()
+print("  six hostile provider responses all degrade to a status: ok")
+
+# (g) An oversized response must be cut off rather than materialised.
+class Flood(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Type","application/json")
+        self.end_headers()
+        try:
+            for _ in range(400):
+                self.wfile.write(b'{"result":[' + b'{"x":"' + b'y'*50_000 + b'"},' )
+        except Exception:
+            pass
+    def log_message(self, *a): pass
+srv3 = socketserver.TCPServer(("127.0.0.1", 0), Flood)
+port3 = srv3.server_address[1]
+_th.Thread(target=srv3.serve_forever, daemon=True).start()
+try:
+    ch.EXPLORER_URL = f"http://127.0.0.1:{port3}/api"
+    ch.clear_cache()
+    t0 = time.time()
+    out = ch.transactions("evm", archived_addr)
+    took = time.time() - t0
+    assert out["status"] != "ok", ("a 20MB flood was accepted as an answer", out)
+    assert took < ch.TOTAL_BUDGET_SECONDS + 5, f"the size cap did not stop it ({took:.1f}s)"
+finally:
+    ch.EXPLORER_URL = real_url
+    ch.clear_cache()
+    srv3.shutdown(); srv3.server_close()
+print(f"  an oversized response is cut off in {took:.1f}s, not buffered: ok")
+
+# (g2) The slow-drip case, which per-operation timeouts do NOT catch: a
+# provider that sends one byte just inside the read timeout, forever. These
+# endpoints are sync, so each such request pins a worker thread until the whole
+# service stops answering. Only an absolute wall-clock budget bounds it.
+class Drip(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length","100000"); self.end_headers()
+        try:
+            for _ in range(100000):
+                self.wfile.write(b"x"); self.wfile.flush(); time.sleep(0.05)
+        except Exception:
+            pass
+    def log_message(self, *a): pass
+srv4 = socketserver.TCPServer(("127.0.0.1", 0), Drip)
+_th.Thread(target=srv4.serve_forever, daemon=True).start()
+try:
+    ch.EXPLORER_URL = f"http://127.0.0.1:{srv4.server_address[1]}/api"
+    ch.clear_cache()
+    t0 = time.time()
+    out = ch.transactions("evm", archived_addr)
+    drip_took = time.time() - t0
+    assert out["status"] == "provider_unreachable", out
+    assert drip_took < ch.TOTAL_BUDGET_SECONDS + 4, \
+        (f"a slow-drip provider was not bounded ({drip_took:.1f}s) — it would "
+         f"pin a worker thread")
+finally:
+    ch.EXPLORER_URL = real_url
+    ch.clear_cache()
+    srv4.shutdown(); srv4.server_close()
+print(f"  a slow-drip provider is cut off at {drip_took:.1f}s, not left to pin a worker: ok")
+
+# (h) The subject must learn WHICH wallet was traced, not merely that one was.
+traced = st.access_log_about(tl_id["id"], limit=50)["entries"]
+onchain_entries = [e for e in traced if e["action"] == "view_onchain"]
+assert onchain_entries, "no on-chain access reached the subject's view"
+assert any(archived_addr in (e.get("detail") or "") for e in onchain_entries), \
+    ("the subject cannot tell which of their wallets was traced", onchain_entries[:2])
+print("  the subject sees which wallet was traced: ok")
+
+step("43. R4 audit integrity: an attempt is not a trace, and junk is not an address")
+# Authorization has to be logged BEFORE the ownership check (that is what
+# closed the anonymous oracle), but recording it as a completed trace let an
+# operator write a permanent, subject-visible entry claiming they traced any
+# address they named — indistinguishable afterwards from a real one. An
+# attempt and a completion must be different actions.
+before = st.access_log_about(tl_id["id"], limit=1000)["entries"]
+n_attempt = sum(1 for e in before if e["action"] == "view_onchain_attempted")
+n_done = sum(1 for e in before if e["action"] == "view_onchain")
+r = c.post(f"{B}/api/operator/onchain",
+           json={"identity_id": tl_id["id"], "chain": "evm",
+                 "address": rnd_addr(), "reason": "AML case 5006"})
+assert r.status_code == 404, r.status_code
+after = st.access_log_about(tl_id["id"], limit=1000)["entries"]
+assert sum(1 for e in after if e["action"] == "view_onchain_attempted") == n_attempt + 1, \
+    "a refused lookup left no trace at all"
+assert sum(1 for e in after if e["action"] == "view_onchain") == n_done, \
+    ("a refused lookup was recorded as a completed trace", n_done)
+# ... and a real one records both.
+r = c.post(f"{B}/api/operator/onchain",
+           json={"identity_id": tl_id["id"], "chain": "evm",
+                 "address": archived_addr, "reason": "AML case 5007"})
+assert r.status_code == 200, r.text[:160]
+final = st.access_log_about(tl_id["id"], limit=1000)["entries"]
+assert sum(1 for e in final if e["action"] == "view_onchain") == n_done + 1, \
+    "a completed trace was not recorded as one"
+print("  refused attempts and completed traces are distinguishable: ok")
+
+# EVM validation was '0x' + any 40 characters, with no hex check, so arbitrary
+# text — markup included — reached the permanent log's detail field.
+for junk in ("0x" + "<script>alert(1)</script>zzzzzzzzzzzzzzz",
+             "0x" + "g" * 40, "0x" + "!" * 40):
+    assert not vf_looks("evm", junk), f"non-hex accepted as an EVM address: {junk[:24]}"
+    r = c.post(f"{B}/api/operator/onchain",
+               json={"identity_id": tl_id["id"], "chain": "evm",
+                     "address": junk, "reason": "AML case 5008"})
+    assert r.status_code == 400, ("junk reached the log", junk[:24], r.status_code)
+assert vf_looks("evm", "0x" + "aF09" * 10), \
+    "a legitimate checksummed address was rejected"
+logged = " ".join((e.get("detail") or "") for e in
+                  st.access_log_about(tl_id["id"], limit=1000)["entries"])
+assert "<script>" not in logged, "markup was written to the permanent log"
+print("  non-hex addresses refused before anything is written: ok")
+
+step("44. R4: cache keys respect per-chain canonicalisation")
+# A blanket .lower() collapsed two DIFFERENT Solana public keys onto one cache
+# entry — base58 is case-sensitive — so the second caller was served the first
+# address's transactions, marked cached. On a compliance screen that is one
+# person's history shown under another's name.
+sol_a = "So11111111111111111111111111111111111111112"
+sol_b = "so11111111111111111111111111111111111111112"
+assert sol_a != sol_b
+ch.clear_cache()
+seen_addrs = []
+def per_addr(chain_, addr):
+    seen_addrs.append(addr)
+    return {"status": "ok", "detail": "",
+            "transactions": [{"hash": f"0x{len(seen_addrs):064x}", "timestamp": "1",
+                              "direction": "in", "counterparty": "0x0", "value_wei": "1"}]}
+real_fetch2 = ch._fetch
+ch._fetch = per_addr
+try:
+    ra = ch.transactions("solana", sol_a)
+    rb = ch.transactions("solana", sol_b)
+    assert rb["cached"] is False, "two distinct base58 keys shared one cache entry"
+    assert ra["transactions"] != rb["transactions"], \
+        "one address's history was served for another"
+    # EVM must still share, since hex case is not part of the identifier.
+    evm_lower = "0x" + "ab" * 20
+    ch.transactions("evm", evm_lower)
+    again = ch.transactions("evm", evm_lower.upper().replace("0X", "0x"))
+    assert again["cached"] is True, "EVM case variants should share a cache entry"
+finally:
+    ch._fetch = real_fetch2
+    ch.clear_cache()
+print("  Solana keys stay distinct, EVM case variants share: ok")
+
+# A malformed optional tuning value must not stop the app booting.
+assert ch._int_env("CHAIN_CACHE_TTL_NOPE", 300) == 300
+os.environ["T44_TTL"] = "not-a-number"
+assert ch._int_env("T44_TTL", 300) == 300, "a malformed TTL was not defaulted"
+os.environ["T44_TTL"] = "-5"
+assert ch._int_env("T44_TTL", 300) == 300, "a negative TTL was accepted"
+del os.environ["T44_TTL"]
+print("  a malformed cache TTL falls back instead of crashing the boot: ok")
+
 print("\n\nALL CHECKS PASSED")

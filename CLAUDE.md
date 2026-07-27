@@ -76,7 +76,9 @@ existing wallet must keep working. Do not simplify this into an instant swap.
 |---|---|
 | backend/app.py | OIDC client, session middleware, binding endpoints, registry API |
 | backend/store.py | Schema and queries (psycopg / Supabase Postgres). Unique indexes, RLS policies, and the conn()/user_conn() split live here. |
+| backend/chain.py | Read-only on-chain lookup (R4). Cached with a TTL, never persisted, never fabricated. |
 | frontend/src/passkey.js | WebAuthn base64url↔ArrayBuffer seam. The only module that touches navigator.credentials. |
+| frontend/src/components/OperatorPanel.jsx | The compliance view (R4). Rendered only for operators; every route it calls re-checks server-side. |
 | backend/verify.py | secp256k1 recovery (EVM), ed25519 verification (Solana) |
 | backend/mock_esignet.py | Throwaway. Deleted in production. |
 | backend/t.py | End-to-end tests |
@@ -100,8 +102,11 @@ Solana wallet connection is intentionally disabled (SOLANA_WALLETS_ENABLED in
 frontend/src/wallet/index.jsx) until external-wallet support in the connector
 is verified — never fake a chain.
 
-No blockchain connection anywhere. Signature verification is pure cryptography. No RPC,
-no gas, no testnet. Keep it that way absent a specific reason to read chain state.
+Signature verification is pure cryptography — no RPC, no gas, no testnet, and no
+key material anywhere near a chain. The one chain connection is backend/chain.py
+(R4): READ-ONLY transaction history for an already-bound wallet, from a public
+explorer, cached in memory with a TTL and never written to the database. It can
+only ever GET. Keep it that way: nothing here should acquire the ability to send.
 
 ## Conventions
 

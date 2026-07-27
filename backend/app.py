@@ -41,6 +41,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import Headers, MutableHeaders
 
+import chain
 import mock_esignet
 import store
 import verify as vf
@@ -905,6 +906,125 @@ def operator_identity(req: OperatorView, request: Request):
     return {"identity": record}
 
 
+# ------------------------------------------- transaction history (R4 / F1)
+#
+# The payoff feature and the most sensitive thing here: a verified national
+# identity joined to on-chain activity. It lives entirely behind the operator
+# role, is logged per access like everything else in R3, and appears in no user
+# or public view.
+#
+# Split into two calls on purpose. The in-app timeline is local and exact and
+# answers immediately; the on-chain lookup crosses the network to a third-party
+# explorer that may be slow or down. One combined endpoint would make every
+# case-file open as slow as the worst explorer day.
+#
+# LAWFUL BASIS: unresolved. Binding a national ID to persistent, queryable
+# financial history is a surveillance capability, and Ethiopian data-protection
+# review by NBE/NIDP has not happened. Tracked in PROGRESS.md; this code exists
+# so the question can be asked about something concrete, not because the answer
+# is assumed.
+
+
+class OperatorTimeline(BaseModel):
+    identity_id: str
+    reason: str
+
+
+@app.post("/api/operator/timeline")
+def operator_timeline(req: OperatorTimeline, request: Request):
+    iid = (req.identity_id or "").strip()
+    if not iid or len(iid) > 64:
+        raise HTTPException(400, "malformed identity id")
+    _clean_token(iid, "identity id")
+    require_operator(request, req.reason, "view_timeline", subject_id=iid)
+    record = store.identity_full(iid)
+    if not record:
+        raise HTTPException(404, "no such identity")
+    return {
+        "identity": record,
+        "timeline": store.identity_timeline(iid),
+        # Which wallets the caller may then ask about on-chain. Only ever this
+        # identity's own bindings — the on-chain endpoint re-checks it.
+        "wallets": [{"chain": b["chain"], "address": b["address"],
+                     "status": b["status"]}
+                    for b in record["bindings"] if b["status"] == "active"],
+    }
+
+
+class OperatorOnchain(BaseModel):
+    identity_id: str
+    chain: str
+    address: str
+    reason: str
+
+
+@app.post("/api/operator/onchain")
+def operator_onchain(req: OperatorOnchain, request: Request):
+    iid = (req.identity_id or "").strip()
+    if not iid or len(iid) > 64:
+        raise HTTPException(400, "malformed identity id")
+    _clean_token(iid, "identity id")
+    if req.chain not in ("evm", "solana"):
+        raise HTTPException(400, "chain must be evm or solana")
+    _clean_token(req.address, "address")
+    if not vf.looks_like_address(req.chain, req.address):
+        raise HTTPException(400, "that does not look like a valid address for this chain")
+
+    # AUTHORIZE AND LOG FIRST — before any database lookup, and before any
+    # answer that varies with the data.
+    #
+    # An earlier cut ran the ownership check above this line, and the distinct
+    # replies it produced ("no such identity" vs "not bound to this identity"
+    # vs the authorization error) let an UNAUTHENTICATED caller confirm whether
+    # a given public wallet belongs to a given Fayda identity — the exact
+    # linkage this whole feature is gated to protect — with no operator, no
+    # reason, and no access-log row. Ordering, not design, but the effect was a
+    # public oracle on the most sensitive join in the system.
+    # Logged as an ATTEMPT, not as a completed trace. Authorization has to come
+    # first (see above), but at this point nothing has been checked against
+    # stored data — so recording "view_onchain" here would let an operator
+    # write a permanent, subject-visible entry claiming they traced any address
+    # they cared to name, for any identity, with no way for a later reviewer to
+    # tell it from a real one. The completed trace is appended separately below
+    # once the address is known to be this identity's.
+    operator_id = require_operator(request, req.reason, "view_onchain_attempted",
+                                   subject_id=iid,
+                                   detail=f"{req.chain}:{req.address}")
+
+    # Only now may the answer depend on stored data. The address must actually
+    # be bound to the identity named in the request: otherwise this is a
+    # general-purpose chain proxy that happens to need an operator, and the log
+    # entry would name a subject unconnected to the address queried.
+    record = store.identity_full(iid)
+    if not record:
+        raise HTTPException(404, "no such identity")
+    # Active and archived only. An archived binding is real history — it was
+    # verified and live once. A CANCELLED one never activated, and cancellation
+    # is specifically how a user repudiates a swap they did not authorise, so
+    # treating it as theirs would pull an attacker's address into the victim's
+    # case file and write it to an append-only log. Pending is likewise not yet
+    # theirs.
+    owned = any(b["status"] in ("active", "archived")
+                and b["chain"] == req.chain
+                and store.normalize_address(req.chain, b["address"])
+                == store.normalize_address(req.chain, req.address)
+                for b in record["bindings"])
+    if not owned:
+        raise HTTPException(404, "that wallet is not bound to this identity")
+
+    # The trace really is happening, against an address really bound to this
+    # identity. Appended rather than updating the attempt row, because the log
+    # is append-only: a reviewer reads the pair, and an attempt with no
+    # matching completion is exactly the thing worth noticing.
+    store.log_access(actor_id=operator_id, action="view_onchain",
+                     reason=req.reason.strip(), subject_id=iid,
+                     detail=f"{req.chain}:{req.address}")
+    # Never raises: a slow or broken explorer comes back as a status the panel
+    # renders, not a 500 and not an empty list pretending to be an answer.
+    return {"wallet": {"chain": req.chain, "address": req.address},
+            **chain.transactions(req.chain, req.address)}
+
+
 @app.post("/api/operator/access-log")
 def operator_access_log(request: Request, before: str | None = None):
     # Reading the log is itself an access, and is itself logged. Otherwise the
@@ -1011,6 +1131,13 @@ def api_me(request: Request):
         # not a fresh Fayda check, and the UI says so rather than implying the
         # national-ID verification just happened.
         "auth_method": request.session.get("auth_method", "unknown"),
+        # Whether to offer the compliance panel at all. Purely a UI hint —
+        # every operator route re-checks both conditions server-side, so this
+        # flag grants nothing. It mirrors BOTH of them (role and Fayda-session)
+        # because showing the panel to a passkey-session operator produced a
+        # screen on which every button 403s.
+        "operator": (store.is_operator(iid)
+                     and request.session.get("auth_method") == "fayda"),
     }
 
 

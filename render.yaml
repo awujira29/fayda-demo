@@ -35,6 +35,13 @@ services:
       # would be worse than failing loudly.
       - key: SUPABASE_DB_URL
         sync: false
+      # R4 on-chain history. Optional: unset means the compliance panel says
+      # "no explorer configured" rather than showing an empty history, which
+      # would read as "this wallet never transacted" — a different claim.
+      - key: CHAIN_EXPLORER_URL
+        sync: false
+      - key: CHAIN_EXPLORER_KEY
+        sync: false
       # The public origin (PUBLIC_URL) is NOT set here on purpose: app.py
       # derives it from RENDER_EXTERNAL_URL, which Render injects
       # automatically. Set PUBLIC_URL only for a custom domain.

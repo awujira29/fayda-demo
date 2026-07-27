@@ -39,6 +39,8 @@ returned 404 (`backend/t.py` test 20 pins this).
    | `PRIVY_APP_ID` | your app id (set manually) | Wallet connector. Runtime config via `/config.js` — set or change it without rebuilding. Leave unset and the UI shows a designed "connector not configured" state; personas still work |
    | `PUBLIC_URL` | *(leave unset)* | The app derives the public origin from `RENDER_EXTERNAL_URL`, which Render injects (e.g. `https://fayda-wallet-registry.onrender.com`). Set `PUBLIC_URL` only for a custom domain |
    | `SUPABASE_DB_URL` | your Supabase connection string (set manually) | Postgres storage (R1). Session-pooler string from the Supabase dashboard. Required — the app refuses to start without it |
+   | `CHAIN_EXPLORER_URL` | *(optional)* | Block-explorer endpoint for R4's on-chain history, Etherscan-shaped (`https://api.etherscan.io/v2/api?chainid=1`). Leave unset and the compliance panel reports "no explorer configured" rather than showing an empty history — a distinction it must not blur |
+   | `CHAIN_EXPLORER_KEY` | *(optional)* | API key for the above, if the provider needs one |
 
 4. **Privy dashboard step** (for real wallet connections): at
    [dashboard.privy.io](https://dashboard.privy.io) create an app (free under

@@ -15,13 +15,19 @@
  * FORM: brief-pinned (financial-grade civil registry) — no tournament run;
  *   the brief beats the roll.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
 import { signEvm, currentNetwork, useWalletConnection, PRIVY_CONFIGURED } from './wallet/index.jsx'
 import { RecordHeader } from './components/RecordHeader.jsx'
 import { IdentityRecord } from './components/IdentityRecord.jsx'
 import { VerifyGate, BackendDown, OriginMismatch } from './components/VerifyGate.jsx'
 import { loginWithPasskey, registerPasskey, passkeysSupported } from './passkey.js'
+// Lazily loaded so the compliance panel is a separate chunk fetched only by an
+// operator. A static import shipped it to every visitor, enumerating the
+// operator routes and their request shapes in the main bundle — the same
+// disclosure the API docs are disabled outside dev to avoid.
+const OperatorPanel = lazy(() =>
+  import('./components/OperatorPanel.jsx').then((m) => ({ default: m.OperatorPanel })))
 import { SetupConnector } from './components/SetupConnector.jsx'
 import { EvmRecord, SolanaRecord, CHAINS } from './components/ChainRecord.jsx'
 import { AttestationDialog } from './components/AttestationDialog.jsx'
@@ -291,6 +297,18 @@ export default function App() {
                   can read other people's records; this is how the person read
                   about finds out. A one-directional capability that nobody
                   can see is the thing worth being afraid of. */}
+              {/* Only for the compliance role, and only as an affordance —
+                  every operator route re-checks the role server-side. */}
+              {me.operator && (
+                <Suspense fallback={
+                  <p className="mt-8 text-[0.8125rem] text-muted">
+                    Loading the compliance panel…
+                  </p>
+                }>
+                  <OperatorPanel />
+                </Suspense>
+              )}
+
               <h2 className="doc-section">Who has accessed your record</h2>
               <AccessLedger
                 entries={accessLog ? accessLog.entries : []}

@@ -147,6 +147,31 @@ for this distinction. It is whitelisted, surfaced in the UI, and exercised by a
 FOREIGN_NATIONAL mock persona (Daniel Otieno). Its value set is UNCONFIRMED — must be
 checked with NIDP before any feature branches on it.
 
+### B4 - Lawful basis for the identity-to-financial-history join (R4/F1)
+**Status:** OPEN — recorded, not assumed resolved. Required by F1's own brief.
+
+R4 shipped the capability: an operator can pull a Fayda-verified identity's
+in-app history and the on-chain activity of the wallets bound to it. That is
+the most sensitive thing this system does, and it has no documented legal
+basis. The technical controls are real — operator-only, per-access logging that
+the subject can read, append-only at the database, on-chain data cached rather
+than stored — but controls are not a basis.
+
+Questions for NBE and NIDP, before this is used against real people:
+- Under what authority may a national identity be joined to financial history,
+  and by whom? Is a compliance operator inside this system such a body?
+- What retention applies to the access log itself? (Deliberately unimplemented:
+  a log that prunes itself contradicts its purpose, and the retention period is
+  a legal answer, not an engineering one.)
+- Must the subject be notified of an access, or is after-the-fact visibility
+  (/api/me/access-log) sufficient?
+- Does pulling a public chain address's full transaction history, once that
+  address is linked to a named person, constitute processing personal data
+  under Ethiopian rules?
+
+Until these are answered, treat the operator role as demo-only. Do not grant it
+to anyone against a database holding real identities.
+
 ### B3 - Privy data residency
 Privy is US-hosted and Stripe-owned since June 2025. Binding a Fayda-verified identity
 to a wallet whose keys are partly held abroad is a question for NBE and NIDP under
@@ -155,6 +180,96 @@ Ethiopian data-protection rules. Unanswered. Do not integrate before it is.
 ---
 
 ## Done
+
+### R4 / F1 - Transaction history behind the operator role - done 2026-07-26
+
+The payoff feature and the most sensitive thing this system does: a
+Fayda-verified identity joined to on-chain activity. It lives entirely behind
+R3's operator role, is logged per access, and appears in no user or public view.
+
+**In-app timeline** is derived from the binding rows themselves — each
+binding's timestamps ARE its history — rather than from a parallel event
+table, so it cannot drift out of sync with what it describes. Bind, replace,
+promote, cancel and archive all produce distinct events (t.py 40).
+
+**On-chain** (`backend/chain.py`) is read-only, cached in memory with a TTL,
+and never written to the database: the data is public and refetchable, so
+caching it is the most it may be. Four rules, each of which turned out to
+matter: never fabricate (with no provider configured the answer is
+`not_configured`, not an empty list that reads as "this wallet has never
+transacted"), never block (absolute wall-clock budget, not just per-operation
+timeouts), never write, never raise.
+
+**Split into two endpoints** so a slow third-party explorer cannot make every
+case file open at the speed of the worst explorer day.
+
+**Auditor: 1 critical, 2 highs, all resolved.** The critical is the one worth
+remembering:
+
+- **CRITICAL — an unauthenticated linkage oracle.** The ownership check ran
+  BEFORE `require_operator`, so an anonymous caller got three distinguishable
+  answers ("no such identity" / "not bound to this identity" / the auth error)
+  and could confirm whether a given public wallet belongs to a given Fayda
+  identity — the exact linkage the whole feature is gated to protect — with no
+  operator, no reason, and no log entry. An ordering mistake, not a design one,
+  but it made the flagship privacy join publicly queryable. Authorization and
+  logging now precede any answer that varies with stored data. Worse: the test
+  written to prove the endpoint was closed to anonymous callers probed with a
+  *bound* address, the one input that reached the auth check — so it passed
+  precisely by avoiding the bug. It now fires all three shapes and requires the
+  answers to be byte-identical.
+- **HIGH — a slow-drip provider could stop the service.** httpx timeouts are
+  per-operation; a provider sending one byte just inside the read timeout,
+  forever, never trips them, and these endpoints are sync, so each such request
+  pinned a worker thread. Measured: 45 concurrent lookups took down `/api/me`,
+  `/login` and `/config.js`. Now bounded by an absolute deadline checked per
+  chunk (verified: terminates at 12.1s against a dribbling server) plus a 1 MB
+  cap while streaming, which also fixed a 134 MB buffer for a 25-row answer.
+- **HIGH — the JSON parse sat outside the try**, so any non-object top level
+  escaped as a 500 *after* the log row was written. Six hostile payloads now
+  degrade to a status.
+
+Four mediums fixed too. The one with a real judgement in it: the ownership
+check accepted **cancelled** bindings. Cancellation is precisely how a user
+repudiates a swap they did not authorise, so honouring it would pull an
+attacker's address into the victim's case file and write it to a log that
+cannot be corrected. Now active and archived only — archived bindings were
+genuinely live once and are that person's history. Also: the subject's own view
+now includes `detail`, so a person can see WHICH of their wallets was traced,
+not merely that one was.
+
+A second audit round then found an **audit-integrity** flaw worth recording:
+the access entry was written before the ownership check (which is what closed
+the critical) but recorded as a COMPLETED trace, so an operator could write a
+permanent, subject-visible entry claiming they traced any address they cared to
+name — indistinguishable afterwards from a real one, and uncorrectable in an
+append-only log. Attempts and completions are now separate actions
+(`view_onchain_attempted` / `view_onchain`); an attempt with no matching
+completion is exactly what a reviewer should notice. In the same round:
+`looks_like_address` accepted `0x` plus any 40 characters with no hex check, so
+arbitrary text — markup included — reached that permanent log field; and the
+on-chain cache keyed on a blanket `.lower()`, which collapsed two DIFFERENT
+Solana public keys onto one entry, serving one person's transactions under
+another's name on a compliance screen. Both fixed with tests (43, 44).
+
+Smaller: the `operator` flag in /api/me now mirrors BOTH server-side conditions
+(role and Fayda session), so a passkey-session operator is not shown a panel
+where every button 403s; OperatorPanel is lazily loaded, so it is no longer
+shipped to every visitor enumerating the operator routes in the main bundle;
+a size-cap trip reports `provider_error` rather than falsely claiming the
+provider was unreachable; and a malformed `CHAIN_CACHE_TTL` falls back instead
+of crashing the boot of the whole registry over an optional cache setting.
+
+**Verification:** all 60 checks pass; tests 40-44 are new, and the on-chain
+path is exercised against local stub servers (hostile shapes, oversized flood,
+slow drip) rather than a real API. The full flow was also driven in a real
+browser against a stub explorer: search with a mandatory reason → case file →
+7-event timeline → per-wallet on-chain trace, with the failure states rendered
+as failures.
+
+**Lawful basis: OPEN, recorded as B4.** The controls are real; controls are not
+a basis. Do not grant the operator role against a database of real identities
+until NBE/NIDP have answered.
 
 ### R3 - Operator role + append-only access log - done 2026-07-26
 
@@ -659,9 +774,7 @@ one platform, which collapses persistence, the login layer, and RLS into one dec
 
 ### R3 - Operator role + immutable access logging - DONE 2026-07-26 (see Done)
 
-### R4 - Transaction history (F1), behind the operator role
-Combined in-app event timeline + on-chain tx history per bound wallet. Operator-only.
-Never public, never in the user view. Needs R1 (Postgres) and R3 (operator + logging).
+### R4 - Transaction history (F1), behind the operator role - DONE 2026-07-26 (see Done)
 
 ### R5 - Real Fayda credentials
 Replace the mock IdP with live partner.fayda.et integration. External dependency:

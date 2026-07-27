@@ -972,9 +972,11 @@ def access_log_about(subject_id: str, limit: int = LOG_PAGE,
     cur = _cursor_parts(before)
     with user_conn(subject_id) as c:
         total = c.execute("SELECT count(*) AS n FROM access_log").fetchone()["n"]
-        # id is selected so the caller can page, but it is not part of what a
-        # subject learns about the access itself.
-        cols = "id, at, actor_id, action, reason"
+        # detail included: without it a person could see THAT one of their
+        # wallets was traced on-chain but never WHICH — the single fact that
+        # makes the entry actionable to them. id is selected so the caller can
+        # page, and stripped from what is returned.
+        cols = "id, at, actor_id, action, reason, detail"
         if cur:
             rows = c.execute(
                 f"SELECT {cols} FROM access_log WHERE {_KEYSET} {_ORDER} LIMIT %s",
@@ -987,6 +989,61 @@ def access_log_about(subject_id: str, limit: int = LOG_PAGE,
     for e in entries:
         e.pop("id", None)
     return {"entries": entries, "total": total, "next_before": nxt}
+
+
+def identity_timeline(identity_id: str) -> list[dict]:
+    """
+    Every in-app event for one identity, newest first (R4).
+
+    Derived from the rows themselves rather than kept as a separate event
+    table: each binding's timestamps ARE its history, so a timeline built from
+    them cannot drift out of sync with the bindings it describes. Privileged —
+    the caller is an operator and must have logged the access.
+    """
+    events: list[dict] = []
+    with conn() as c:
+        ident = c.execute(
+            "SELECT display_name, verified_at, last_seen_at FROM identities "
+            "WHERE id = %s", (identity_id,)
+        ).fetchone()
+        if not ident:
+            return []
+        events.append({"at": ident["verified_at"], "kind": "identity_verified",
+                       "detail": "Fayda verification established this identity",
+                       "chain": None, "address": None})
+        rows = c.execute(
+            """SELECT chain, address, status, proof_method, requested_at,
+                      activates_at, activated_at, archived_at
+               FROM wallet_bindings WHERE identity_id = %s""",
+            (identity_id,),
+        ).fetchall()
+
+    for b in rows:
+        where = {"chain": b["chain"], "address": b["address"]}
+        # A first binding activates immediately; a replacement is requested,
+        # cools, then either activates or is cancelled. Emitting requested and
+        # activated separately would double-count the immediate case.
+        immediate = b["activated_at"] and b["activated_at"] == b["requested_at"]
+        events.append({
+            "at": b["requested_at"],
+            "kind": "wallet_bound" if immediate else "replacement_requested",
+            "detail": ("bound immediately (no incumbent)" if immediate else
+                       f"replacement requested, cooling until {b['activates_at']}"),
+            "proof_method": b["proof_method"], **where})
+        if b["activated_at"] and not immediate:
+            events.append({"at": b["activated_at"], "kind": "replacement_activated",
+                           "detail": "cooling period elapsed", **where})
+        if b["archived_at"]:
+            events.append({
+                "at": b["archived_at"],
+                "kind": "binding_cancelled" if b["status"] == "cancelled"
+                        else "binding_archived",
+                "detail": ("cancelled during the cooling period"
+                           if b["status"] == "cancelled"
+                           else "replaced by a newer binding"), **where})
+
+    events.sort(key=lambda e: e["at"] or "", reverse=True)
+    return events
 
 
 def registry_ids() -> list[str]:
