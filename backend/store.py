@@ -763,6 +763,21 @@ def upsert_identity(fin_hmac: str, display_name: str, birthdate: str) -> dict:
         return dict(row)
 
 
+def identity_exists(fin_hmac: str) -> bool:
+    """
+    Whether a verified identity already exists for this peppered FIN hash.
+
+    Read-only, and returns a bare boolean rather than the row: the caller is
+    the mock IdP's capture flow, deciding whether to send a returning person to
+    their passkey instead of making them photograph themselves again. It has no
+    business seeing the identity itself.
+    """
+    with conn() as c:
+        return bool(c.execute(
+            "SELECT 1 FROM identities WHERE fin_hmac = %s", (fin_hmac,)
+        ).fetchone())
+
+
 def get_identity(identity_id: str) -> dict | None:
     # RLS-scoped: the policy alone would restrict this to the one row, and the
     # WHERE clause is kept as the belt to its braces.

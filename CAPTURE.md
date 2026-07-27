@@ -49,6 +49,28 @@ login instead of re-verifying.
   camera-loading, permission-denied, capturing, verifying, pass, retake,
   already-verified->passkey.
 
+## Two properties of this mock, stated rather than assumed
+
+**Whatever the person types IS the identity claim.** `sub` is a hash of name +
+birthdate with no secret, so two people entering the same name and date of
+birth land on the same identity row. That is not a bug introduced here — the
+persona picker it replaces had the identical property, only cruder: anyone
+could click "Meseret Alemu" and become her. What prevents it in the real system
+is the biometric match against the national register, which is precisely the
+step this mock simulates. It follows that **this flow is not an authentication
+mechanism** and must never be reachable with a real provider configured; the
+`MOCK_IDP`/`DEMO_MODE` gate and the boot refusal when real `FAYDA_*` variables
+are present are what enforce that.
+
+**The demo now collects real personal data.** The persona picker invented its
+people; capture asks a live visitor for their actual name, date of birth,
+gender, region and residence status, and persists them. The face and the ID do
+not persist — that is the hard constraint above and it is tested — but the
+typed details do, in a database with no retention policy, on a deploy anyone
+can reach. Before this is shown to real users rather than colleagues, it needs
+the same NBE/NIDP answer that B4 already asks for, plus a retention period and
+a way for someone to have their record deleted. Recorded, not solved.
+
 ## Done when
 - persona picker gone; capture drives first-time demo verification
 - mock match always passes, looks like a real KYC check

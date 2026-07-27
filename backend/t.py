@@ -47,16 +47,41 @@ def wait_up(port, tries=100):
         except Exception: time.sleep(0.1)
     return False
 
+# The persona picker is gone: the mock IdP now captures a face and a document
+# and mocks only the comparison. These are the details a person would type into
+# that form. The derived `sub` is a stable hash of name+birthdate, so the same
+# entries always resolve to the same identity — which is what makes "verify
+# once, return by passkey" true rather than aspirational.
+import mock_esignet as mock
+SUBJECTS = [
+    {"full_name": "Meseret Alemu", "birthdate": "1991-04-17", "gender": "female",
+     "region": "Addis Ababa", "residence_status": "CITIZEN"},
+    {"full_name": "Tesfaye Bekele", "birthdate": "1978-11-02", "gender": "male",
+     "region": "Oromia", "residence_status": "CITIZEN"},
+    {"full_name": "Hiwot Girma", "birthdate": "1996-07-25", "gender": "female",
+     "region": "Amhara", "residence_status": "CITIZEN"},
+    # Fayda is issued to legally resident foreign nationals too, so a valid
+    # Fayda authentication is NOT proof of citizenship (CLAUDE.md, B2).
+    {"full_name": "Daniel Otieno", "birthdate": "1985-02-11", "gender": "male",
+     "region": "Addis Ababa", "residence_status": "FOREIGN_NATIONAL"},
+]
+SUBS = [mock.derive_sub(s["full_name"], s["birthdate"]) for s in SUBJECTS]
+
 step("1. OIDC login redirect")
 r=c.get(f"{B}/login"); assert r.status_code==307, r.status_code
 pre_login_cookie=c.cookies.get("session")
 loc=r.headers["location"]; print("  -> /authorize", "client_id=" in loc)
 r=c.get(loc); assert r.status_code==200
-fins=re.findall(r'name="fin" value="(\d+)"', r.text); print("  personas:", fins)
+# The capture flow, not a list of people to click.
+assert 'name="fin"' not in r.text, "the persona picker is still being served"
+for marker in ("getUserMedia", "authorize/confirm", "residence_status",
+               "Identity <b>verification</b>"):
+    assert marker in r.text, ("capture page missing", marker)
+print("  capture page served (camera + document + form), no persona picker")
 state=re.search(r'name="state" value="([^"]*)"', r.text).group(1)
 
-step("2. persona -> code")
-r=c.post(f"{B}/authorize/confirm", data={"fin":fins[0],"redirect_uri":f"{B}/callback",
+step("2. capture result -> code")
+r=c.post(f"{B}/authorize/confirm", data={**SUBJECTS[0], "redirect_uri":f"{B}/callback",
         "state":state,"nonce":"n"})
 code=re.search(r"code=([^&]+)", r.headers["location"]).group(1); print("  code ok")
 
@@ -67,11 +92,11 @@ me=c.get(f"{B}/api/me").json()
 assert me["authenticated"]
 print("  identity:", me["identity"]["display_name"])
 print("  fin_hmac:", me["identity"]["fin_hmac"][:24], "...")
-assert "301884729166" not in str(me["identity"]), "RAW FIN LEAKED"
+assert SUBS[0] not in str(me["identity"]), "RAW FIN LEAKED"
 print("  raw FIN not in stored identity: ok")
 
 step("3b. C1: raw FIN must appear NOWHERE in /api/me nor the session cookie")
-raw_fin=fins[0]
+raw_fin=SUBS[0]
 full=c.get(f"{B}/api/me").text
 assert raw_fin not in full, "RAW FIN in /api/me response body"
 assert '"sub"' not in full, "raw sub (== FIN) in /api/me"
@@ -150,7 +175,7 @@ taken=me["active"]["evm"]["address"]
 c2=httpx.Client(follow_redirects=False, timeout=30)
 r=c2.get(f"{B}/login"); loc=r.headers["location"]
 r=c2.get(loc); state=re.search(r'name="state" value="([^"]*)"', r.text).group(1)
-r=c2.post(f"{B}/authorize/confirm", data={"fin":fins[2],"redirect_uri":f"{B}/callback",
+r=c2.post(f"{B}/authorize/confirm", data={**SUBJECTS[2],"redirect_uri":f"{B}/callback",
          "state":state,"nonce":"n"})
 code=re.search(r"code=([^&]+)", r.headers["location"]).group(1)
 c2.get(f"{B}/callback", params={"code":code,"state":state})
@@ -285,7 +310,7 @@ from eth_account.messages import encode_defunct
 c3=httpx.Client(follow_redirects=False, timeout=30)
 r=c3.get(f"{B}/login"); loc=r.headers["location"]
 r=c3.get(loc); state=re.search(r'name="state" value="([^"]*)"', r.text).group(1)
-r=c3.post(f"{B}/authorize/confirm", data={"fin":fins[1],"redirect_uri":f"{B}/callback",
+r=c3.post(f"{B}/authorize/confirm", data={**SUBJECTS[1],"redirect_uri":f"{B}/callback",
          "state":state,"nonce":"n"})
 code=re.search(r"code=([^&]+)", r.headers["location"]).group(1)
 c3.get(f"{B}/callback", params={"code":code,"state":state})
@@ -359,10 +384,21 @@ try:
     assert "Secure" in sc and "HttpOnly" in sc and "SameSite=Lax" in sc, sc
     assert r.headers["location"].startswith("https://demo.example.com/authorize"),         r.headers["location"]
     print("  Secure cookie set; authorize URL derives from RENDER_EXTERNAL_URL: ok")
+    # redirect_uri is now matched EXACTLY against the registered one, which in
+    # this posture derives from RENDER_EXTERNAL_URL.
     r=httpx.get(f"{pb}/authorize", params={"client_id":"fayda-wallet-demo",
-                "redirect_uri":f"{pb}/callback","state":"s","nonce":"n"}, timeout=5)
-    assert r.status_code==200 and 'name="fin"' in r.text, r.status_code
-    print("  mock IdP mounted in demo mode, personas served: ok")
+                "redirect_uri":"https://demo.example.com/callback",
+                "state":"s","nonce":"n"}, timeout=5)
+    assert r.status_code==200 and "getUserMedia" in r.text, r.status_code
+    assert 'name="fin"' not in r.text, "the persona picker reappeared in demo mode"
+    print("  mock IdP mounted in demo mode, capture flow served: ok")
+    # The already-verified probe is a dev-only convenience: published, it is an
+    # unauthenticated oracle over real people's names and dates of birth.
+    r=httpx.post(f"{pb}/authorize/known",
+                 json={"full_name":"Someone Real","birthdate":"1990-01-01"}, timeout=5)
+    assert r.status_code==404, ("the already-verified oracle is exposed in demo mode",
+                                r.status_code)
+    print("  /authorize/known absent outside dev: ok")
     for route in ("/api/dev/reset","/api/dev/fast-forward","/api/dev/test-wallet"):
         r=httpx.post(f"{pb}{route}", json={"chain":"evm"}, timeout=5)
         assert r.status_code==404, (route, r.status_code)
@@ -390,7 +426,7 @@ print("  reflected state/scope HTML-escaped: ok")
 r=c.get(f"{B}/authorize", params={"client_id":"fayda-wallet-demo",
         "redirect_uri":"https://evil.example.com/phish","state":"s","nonce":"n"})
 assert r.status_code==400, ("authorize accepted foreign redirect_uri", r.status_code)
-r=c.post(f"{B}/authorize/confirm", data={"fin":fins[0],
+r=c.post(f"{B}/authorize/confirm", data={**SUBJECTS[0],
         "redirect_uri":"https://evil.example.com/phish","state":"s","nonce":"n"})
 assert r.status_code==400, ("confirm accepted foreign redirect_uri", r.status_code)
 print("  redirect_uri outside /callback rejected at authorize and confirm: ok")
@@ -1032,18 +1068,19 @@ step("33. R3 operator role: no cross-user visibility without an operator")
 # Test 32 reset the schema, which drops sessions — everyone is signed out.
 # Sign back in through the real Fayda flow rather than reaching into the DB,
 # so the operator below holds a session the app actually issued.
-def fayda_login(cl, fin):
+def fayda_login(cl, subject):
+    """Drive the capture handoff the way the page does: text fields only."""
     loc = cl.get(f"{B}/login").headers["location"]
     page = cl.get(loc).text
     stt = re.search(r'name="state" value="([^"]*)"', page).group(1)
     rr = cl.post(f"{B}/authorize/confirm",
-                 data={"fin": fin, "redirect_uri": f"{B}/callback",
+                 data={**subject, "redirect_uri": f"{B}/callback",
                        "state": stt, "nonce": "n"})
     cd = re.search(r"code=([^&]+)", rr.headers["location"]).group(1)
     cl.get(f"{B}/callback", params={"code": cd, "state": stt})
     return cl.get(f"{B}/api/me").json()
 
-assert fayda_login(c, fins[0])["authenticated"], "could not re-establish a session"
+assert fayda_login(c, SUBJECTS[0])["authenticated"], "could not re-establish a session"
 
 # c is a signed-in ordinary user. Every operator route must refuse it — the
 # whole point of R3 is that "authenticated" is not "allowed to read other
@@ -1386,7 +1423,7 @@ step("41. R4: history is operator-only, logged, and absent from every user view"
 # c2 is an ordinary signed-in user (its earlier session died with test 32's
 # reset). It must be refused for lack of the ROLE, not for lack of a session —
 # 401 would pass this assertion for the wrong reason.
-assert fayda_login(c2, fins[2])["authenticated"], "could not re-establish c2"
+assert fayda_login(c2, SUBJECTS[2])["authenticated"], "could not re-establish c2"
 assert not st.is_operator(c2.get(f"{B}/api/me").json()["identity"]["id"])
 r = c2.post(f"{B}/api/operator/timeline",
             json={"identity_id": tl_id["id"], "reason": "AML case 5001"})
@@ -1982,7 +2019,7 @@ assert "set-cookie" not in {k.lower() for k in r2.headers}, \
 # ... but a request that genuinely CHANGES the session must still persist it,
 # or sign-in would not stick.
 probe = httpx.Client(follow_redirects=False, timeout=30)
-assert fayda_login(probe, fins[1])["authenticated"], "login no longer persists"
+assert fayda_login(probe, SUBJECTS[1])["authenticated"], "login no longer persists"
 assert probe.get(f"{B}/api/me").json()["authenticated"], \
     "the session did not survive the request that created it"
 print("  reads leave the row untouched; writes still persist: ok")
@@ -1995,7 +2032,7 @@ step("48. R6: a nonce is bound to the identity it was issued to")
 # and stored evidence must not be able to name the wrong person.
 victim = c            # holds a Fayda session
 other = httpx.Client(follow_redirects=False, timeout=30)
-assert fayda_login(other, fins[2])["authenticated"]
+assert fayda_login(other, SUBJECTS[2])["authenticated"]
 shared_addr = rnd_addr()
 n = victim.post(f"{B}/api/wallet/nonce",
                 json={"chain": "evm", "address": shared_addr}).json()
@@ -2029,7 +2066,7 @@ step("49. R6/M7: logout is not undone by a concurrent in-flight request")
 # demonstrably failed 5 times in 6.
 for attempt in range(6):
     victim_tab = httpx.Client(follow_redirects=False, timeout=30)
-    assert fayda_login(victim_tab, fins[0])["authenticated"]
+    assert fayda_login(victim_tab, SUBJECTS[0])["authenticated"]
     stolen = victim_tab.cookies.get("session")
     # The attacker holds the same cookie and keeps hitting an endpoint that
     # writes to the session (passkey login/begin stores a challenge).
@@ -2159,7 +2196,7 @@ step("52. R6: revoking a passkey kills its session and it STAYS killed")
 # Measured defeating revocation 5 times out of 5.
 for attempt in range(4):
     owner = httpx.Client(follow_redirects=False, timeout=30)
-    assert fayda_login(owner, fins[1])["authenticated"]
+    assert fayda_login(owner, SUBJECTS[1])["authenticated"]
     key = SoftAuthenticator()
     opts = owner.post(f"{B}/api/passkey/register/begin").json()
     assert owner.post(f"{B}/api/passkey/register/complete",
@@ -2224,7 +2261,7 @@ print("  duplicate/forged headers cannot choose the bucket or the exemption: ok"
 # A revoked session's row must not park for its original TTL — that is the
 # table growth the sweep exists to bound.
 tomb = httpx.Client(follow_redirects=False, timeout=30)
-assert fayda_login(tomb, fins[0])["authenticated"]
+assert fayda_login(tomb, SUBJECTS[0])["authenticated"]
 tomb_sid = tomb.cookies.get("session").rsplit(".", 1)[0]
 tomb.post(f"{B}/logout")
 with st.conn() as sc:
@@ -2364,5 +2401,198 @@ assert "is_new=fresh" in mw, \
 assert "fresh = sid is None" in mw, \
     "the freshness test is no longer 'this request minted the sid'"
 print("  --no-proxy-headers and the is_new=fresh gate are both asserted: ok")
+
+step("58. CAPTURE: no image byte reaches the session, a table, the log, or a response")
+# The face and the document are the most sensitive objects this system could
+# hold — special category data, inside the operator/transaction-history surface
+# built in R3/R4. They are meant to live only in the browser. This asserts the
+# server has no path that would keep them even if a client tried to push them:
+# the confirm handler declares text fields only, so extra parts are dropped.
+SENTINEL = "SENTINELFACE" + secrets.token_hex(8).upper()
+IMG = "data:image/jpeg;base64,/9j/4AAQSkZJRg" + SENTINEL
+
+img_client = httpx.Client(follow_redirects=False, timeout=30)
+loc = img_client.get(f"{B}/login").headers["location"]
+page = img_client.get(loc).text
+# The capture page must not itself post an image field anywhere.
+assert "face_image" not in page and "id_image" not in page, \
+    "the capture page declares an image field in its handoff form"
+stt = re.search(r'name="state" value="([^"]*)"', page).group(1)
+subject = {"full_name": "Imagetest Person", "birthdate": "1990-06-15",
+           "gender": "female", "region": "Sidama", "residence_status": "CITIZEN"}
+# Push image bytes at the handoff as hard as a hostile client could.
+rr = img_client.post(f"{B}/authorize/confirm",
+                     data={**subject, "redirect_uri": f"{B}/callback",
+                           "state": stt, "nonce": "n",
+                           "face_image": IMG, "id_image": IMG,
+                           "picture": IMG, "selfie": IMG})
+assert rr.status_code == 303, (rr.status_code, rr.text[:200])
+cd = re.search(r"code=([^&]+)", rr.headers["location"]).group(1)
+img_client.get(f"{B}/callback", params={"code": cd, "state": stt})
+me_img = img_client.get(f"{B}/api/me")
+assert me_img.json()["authenticated"], "the image-bearing capture did not sign in"
+img_id = me_img.json()["identity"]["id"]
+
+# (a) no response body carries it
+bodies = [me_img.text, img_client.get(f"{B}/api/me/access-log").text, page]
+for b in bodies:
+    assert SENTINEL not in b, "image bytes came back in an API response"
+# (b) no session row carries it
+with st.conn() as sc:
+    sess = sc.execute("SELECT data::text AS d FROM sessions").fetchall()
+assert not any(SENTINEL in (r["d"] or "") for r in sess), \
+    "image bytes were written into a session"
+# (c) no table anywhere carries it — every text-ish column, not a guessed list
+with st.conn() as sc:
+    cols = sc.execute(
+        """SELECT table_name, column_name FROM information_schema.columns
+           WHERE table_schema='public'
+             AND data_type IN ('text','character varying','jsonb','json')"""
+    ).fetchall()
+    hits = []
+    for col in cols:
+        t, cname = col["table_name"], col["column_name"]
+        n = sc.execute(
+            f'SELECT count(*) AS n FROM "{t}" WHERE "{cname}"::text LIKE %s',
+            (f"%{SENTINEL}%",)).fetchone()["n"]
+        if n:
+            hits.append(f"{t}.{cname}")
+assert not hits, ("image bytes are persisted in the database", hits)
+print(f"  probed {len(cols)} text/jsonb columns across every table: no image bytes: ok")
+# (d) the access log specifically — the surveillance surface
+with st.conn() as sc:
+    n = sc.execute("SELECT count(*) AS n FROM access_log WHERE "
+                   "detail LIKE %s OR reason LIKE %s",
+                   (f"%{SENTINEL}%", f"%{SENTINEL}%")).fetchone()["n"]
+assert n == 0, "image bytes reached the access log"
+# (e) and the claims the session did keep are the whitelisted ones only
+claims_img = me_img.json()["claims"]
+assert "picture" not in claims_img and "phone" not in claims_img, claims_img
+assert claims_img.get("residenceStatus") == "CITIZEN", claims_img
+print("  no image byte in any session, table, access-log row, or response: ok")
+
+step("59. CAPTURE: a returning user signs in by passkey and never re-captures")
+# "Verify once" is the whole point: the identity persists, so the second visit
+# is a passkey assertion, not another photograph.
+returner = httpx.Client(follow_redirects=False, timeout=30)
+who = {"full_name": "Returning Resident", "birthdate": "1988-09-09",
+       "gender": "male", "region": "Tigray", "residence_status": "FOREIGN_NATIONAL"}
+first = fayda_login(returner, who)
+assert first["authenticated"], "first-time capture did not sign in"
+returner_id = first["identity"]["id"]
+# The identity is built from what was entered, and persists.
+assert first["identity"]["display_name"] == "Returning Resident", first["identity"]
+assert first["claims"]["residenceStatus"] == "FOREIGN_NATIONAL", \
+    ("residenceStatus did not flow through to the user's own view", first["claims"])
+assert first["claims"]["address"]["region"] == "Tigray", first["claims"]
+with st.conn() as sc:
+    persisted = sc.execute("SELECT display_name FROM identities WHERE id=%s",
+                           (returner_id,)).fetchone()
+assert persisted and persisted["display_name"] == "Returning Resident", \
+    "the verified identity was not persisted"
+print("  first visit: captured, built from the form, persisted: ok")
+
+# Register a passkey, sign out, and come back with it — touching /authorize
+# never happens.
+pk = SoftAuthenticator()
+opts = returner.post(f"{B}/api/passkey/register/begin").json()
+assert returner.post(f"{B}/api/passkey/register/complete",
+                     json={"credential": pk.register(opts["challenge"]),
+                           "label": "returning device"}).status_code == 200
+returner.post(f"{B}/logout")
+back = httpx.Client(follow_redirects=False, timeout=30)
+o = back.post(f"{B}/api/passkey/login/begin").json()
+assert back.post(f"{B}/api/passkey/login/complete",
+                 json={"credential": pk.assert_(o["challenge"])}).status_code == 200
+me_back = back.get(f"{B}/api/me").json()
+assert me_back["authenticated"] and me_back["identity"]["id"] == returner_id, \
+    ("the returning user did not land on their existing identity", me_back.get("identity"))
+assert me_back["auth_method"] == "passkey", me_back["auth_method"]
+print("  second visit: passkey signed them straight in, no capture: ok")
+
+# And the capture flow itself recognises them, so it can route to the passkey
+# rather than asking for another photograph.
+k = httpx.post(f"{B}/authorize/known",
+               json={"full_name": "Returning Resident", "birthdate": "1988-09-09"},
+               timeout=30).json()
+assert k["known"] is True, ("capture does not recognise an already-verified person", k)
+k2 = httpx.post(f"{B}/authorize/known",
+                json={"full_name": "Nobody At All", "birthdate": "1970-01-01"},
+                timeout=30).json()
+assert k2["known"] is False, k2
+
+# The already-verified probe must not damage the process it runs in. An earlier
+# cut reached the registry with `import app` from inside the mock — and since
+# the server runs as __main__, that loaded a SECOND copy of app.py, regenerated
+# the client keypair, and overwrote the mock's registered public key. Every
+# token exchange afterwards failed "signature verification failed", so probing
+# once silently broke login for everyone. The dependency is injected now;
+# this asserts the handoff still works after the probe.
+after_probe = httpx.Client(follow_redirects=False, timeout=30)
+assert fayda_login(after_probe, SUBJECTS[3])["authenticated"], \
+    "the OIDC handoff broke after an /authorize/known probe"
+print("  probing does not disturb the OIDC client assertion: ok")
+# Re-running capture for the SAME details must land on the SAME identity, not
+# mint a duplicate — that is what a stable derived sub buys.
+again = httpx.Client(follow_redirects=False, timeout=30)
+assert fayda_login(again, who)["identity"]["id"] == returner_id, \
+    "re-verifying the same person created a second identity"
+print("  already-verified is recognised; re-verifying reuses the same identity: ok")
+
+step("60. CAPTURE: an authorization code can only be delivered to the registered URI")
+# The path-only redirect check was survivable while a code mapped to a public
+# persona anyone could pick. Capture changes what a code IS: a real person's
+# verified identity. An attacker who starts their own login, reads their own
+# state, and sends the victim a link with redirect_uri=https://evil/callback
+# receives the victim's code on their own server and replays it — landing
+# authenticated AS THE VICTIM. Demonstrated before this was tightened.
+for hostile in ("https://evil.example.com/callback",
+                "//evil.example.com/callback",
+                "http://127.0.0.1:9999/callback",
+                f"{B}/callback/../callback",
+                f"{B}/callback?next=https://evil.example.com"):
+    r = c.get(f"{B}/authorize", params={"client_id": "fayda-wallet-demo",
+              "redirect_uri": hostile, "state": "s", "nonce": "n"})
+    assert r.status_code == 400, ("authorize accepted a foreign redirect_uri",
+                                  hostile, r.status_code)
+    r = c.post(f"{B}/authorize/confirm",
+               data={**SUBJECTS[0], "redirect_uri": hostile, "state": "s", "nonce": "n"})
+    assert r.status_code == 400, ("confirm accepted a foreign redirect_uri",
+                                  hostile, r.status_code)
+# ... and the registered one still works, or the demo is simply broken.
+r = c.get(f"{B}/authorize", params={"client_id": "fayda-wallet-demo",
+          "redirect_uri": f"{B}/callback", "state": "s", "nonce": "n"})
+assert r.status_code == 200, ("the registered redirect_uri was rejected", r.status_code)
+print(f"  {5} hostile redirect targets refused at authorize and confirm: ok")
+
+step("61. CAPTURE: no part of the FIN-shaped sub reaches the claims")
+# The address claim is inside SAFE_CLAIMS, so anything put there lands in the
+# session and comes back from /api/me. kebele/woreda were briefly derived from
+# `sub` — four digits of the identifier that non-negotiable #1 says never
+# reaches the browser. A whole-value substring check would not have caught it.
+finprobe = httpx.Client(follow_redirects=False, timeout=30)
+whoami = {"full_name": "Digit Leak Probe", "birthdate": "1994-03-08",
+          "gender": "female", "region": "Gambela", "residence_status": "CITIZEN"}
+info = fayda_login(finprobe, whoami)
+assert info["authenticated"], info
+probe_sub = mock.derive_sub(whoami["full_name"], whoami["birthdate"])
+body = finprobe.get(f"{B}/api/me").text
+assert probe_sub not in body, "the whole sub reached /api/me"
+addr = info["claims"]["address"]
+for part in (addr.get("kebele", ""), addr.get("woreda", ""), addr.get("zone", "")):
+    if part and part.isdigit():
+        assert part not in probe_sub, \
+            ("an address field carries digits of the sub", part, addr)
+# And the session row itself, which is what an operator or a dump would see.
+sid_probe = finprobe.cookies.get("session").rsplit(".", 1)[0]
+with st.conn() as sc:
+    row = sc.execute("SELECT data::text AS d FROM sessions WHERE sid=%s",
+                     (sid_probe,)).fetchone()
+assert row and probe_sub not in row["d"], "the sub was written into the session row"
+for i in range(0, len(probe_sub) - 3):
+    frag = probe_sub[i:i + 4]
+    assert frag not in row["d"], \
+        ("a four-digit fragment of the sub is in the session", frag)
+print("  no whole or partial sub in the claims, the response, or the session: ok")
 
 print("\n\nALL CHECKS PASSED")

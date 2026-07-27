@@ -236,6 +236,13 @@ if MOCK_IDP:
     mock_esignet.CLIENT_PUBLIC_KEY = CLIENT_PUBLIC_KEY
     mock_esignet.TOKEN_ENDPOINT = TOKEN_URL
     mock_esignet.EXPECTED_CLIENT_ID = CLIENT_ID
+    # The single registered redirect URI. A real provider matches this exactly
+    # before handing over an authorization code; so does the mock, now that a
+    # code identifies a real captured person rather than a public persona.
+    mock_esignet.REGISTERED_REDIRECT = REDIRECT_URI
+    # The already-verified probe is a dev convenience and an enumeration
+    # oracle in public. Dev only — never DEMO_MODE.
+    mock_esignet.KNOWN_PROBE = DEV_MODE
 
 SESSION_TTL_HOURS = 12
 # A session that has not completed the Fayda round trip holds only oidc_state,
@@ -522,6 +529,17 @@ store.init()
 def hash_fin(fin: str) -> str:
     """Never store the raw FIN. HMAC with a server-side pepper, not a bare hash."""
     return hmac.new(FIN_PEPPER, fin.encode(), hashlib.sha256).hexdigest()
+
+
+if MOCK_IDP:
+    # Injected here rather than with the other mock wiring above, because
+    # hash_fin does not exist until this point. It lets the capture flow ask
+    # whether a person has already verified — so a returning user is sent to
+    # their passkey instead of photographing themselves again. Injection, not
+    # an `import app` inside the mock: that would load a second copy of this
+    # module when the server is started as `python app.py`, regenerating the
+    # client keypair and breaking every token exchange.
+    mock_esignet.HASH_FIN = hash_fin
 
 
 # Non-negotiable #1: the raw FIN never reaches the browser. In the confirmed

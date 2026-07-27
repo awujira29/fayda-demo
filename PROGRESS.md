@@ -180,6 +180,32 @@ Questions for NBE and NIDP, before this is used against real people:
 Until these are answered, treat the operator role as demo-only. Do not grant it
 to anyone against a database holding real identities.
 
+### B5 - The capture demo collects real personal data (2026-07-27)
+**Status:** OPEN — recorded, not solved.
+
+The mock IdP's persona picker was replaced by a Sumsub-style capture flow. The
+face photo and the ID image never leave the browser and are never persisted
+(tested — t.py 58 probes every text/jsonb column in every table, the session
+rows, the access log and the API responses). But the flow now asks a real
+visitor for their real name, date of birth, gender, region and residence
+status, and those DO persist, in a database with no retention policy, on a
+deploy anyone can reach.
+
+Needed before this is shown to anyone outside the team:
+- a retention period for identities created through the demo, and a way to
+  honour a deletion request (the access log is append-only by design, so
+  "delete my data" has a genuine tension with R3 that needs an answer, not a
+  workaround)
+- the same NBE/NIDP question B4 asks, extended to cover collection at capture
+- a plain-language notice at the point of capture saying what is kept
+
+Also inherent and stated in CAPTURE.md: `sub` is a hash of name + birthdate
+with no secret, so anyone entering another person's name and date of birth
+reaches that person's identity. The persona picker had the same property; the
+real system's defence is the biometric match this deliberately mocks. It is why
+the flow must never mount against a real provider — enforced by the MOCK_IDP
+gate and the boot refusal when real FAYDA_* variables are set.
+
 ### B3 - Privy data residency
 Privy is US-hosted and Stripe-owned since June 2025. Binding a Fayda-verified identity
 to a wallet whose keys are partly held abroad is a question for NBE and NIDP under

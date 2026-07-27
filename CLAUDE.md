@@ -37,13 +37,21 @@ Correctness properties, not preferences. Breaking any is a bug regardless of wha
    Registering one requires a Fayda-established session (auth_method == "fayda"), so
    a stolen session cannot convert itself into permanent access, and the owner can
    always revoke. Same reasoning as the cooling period: compromise stays recoverable.
-8. **No cross-user read without an operator check AND an access-log entry.** The
+8. **The capture flow's images never leave the browser.** backend/mock_esignet.py
+   serves a real camera capture and a real document upload; the match is mocked. The
+   handoff form declares five TEXT fields and there is no endpoint that accepts an
+   image, so a face or a document cannot be persisted even if a client tried to send
+   one (test 58 probes every text/jsonb column, the sessions, the access log and the
+   responses). The verification RESULT persists as an identity; the biometrics do not
+   survive the tab. A stored face would be the most sensitive object here — special
+   category data inside the operator surface built in R3/R4.
+9. **No cross-user read without an operator check AND an access-log entry.** The
    log write comes first and is allowed to fail the request: a lookup that answers
    without leaving a trace is the failure R3 exists to prevent. Operator membership
    is granted only by backend/store.py, never by an HTTP route. Adding an endpoint
    that returns another identity's data without going through require_operator()
    is the way this invariant gets broken.
-9. **Per-identity data is read and written through store.user_conn().** It switches to
+10. **Per-identity data is read and written through store.user_conn().** It switches to
    a NOBYPASSRLS role and binds app.identity_id for the transaction, so Postgres row
    policies — not a WHERE clause someone can forget — decide what is visible. The
    privileged store.conn() is for genuinely cross-identity work (the sybil check,
@@ -82,7 +90,7 @@ existing wallet must keep working. Do not simplify this into an instant swap.
 | frontend/src/passkey.js | WebAuthn base64url↔ArrayBuffer seam. The only module that touches navigator.credentials. |
 | frontend/src/components/OperatorPanel.jsx | The compliance view (R4). Rendered only for operators; every route it calls re-checks server-side. |
 | backend/verify.py | secp256k1 recovery (EVM), ed25519 verification (Solana) |
-| backend/mock_esignet.py | Throwaway. Genuinely deletable in production — app.py imports it only when the mock is mounted (test 45). |
+| backend/mock_esignet.py | Throwaway. Genuinely deletable in production — app.py imports it only when the mock is mounted (test 45). Serves the capture flow (face + ID, mocked match); images never leave the browser. |
 | backend/t.py | End-to-end tests |
 | frontend/src/wallet/ | THE Privy seam (R2). The only module that may import @privy-io. |
 | frontend/src/App.jsx | State machine + composition; direction contract in its header |

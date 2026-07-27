@@ -16,13 +16,15 @@ export function VerifyGate({ simulated, onPasskey, busy, passkeyError }) {
         <div className="px-5 py-5">
           <p className="max-w-[58ch]">
             Binding a wallet starts with your national identity. You will be
-            handed to <strong>Fayda eSignet</strong>, verify who you are, and
-            return here with a verified record. The registry never sees your
-            credentials — only signed claims.
+            handed to <strong>Fayda eSignet</strong>, photograph yourself and
+            your ID there, and return with a verified record. The registry
+            never sees your photograph or your document — only the claims Fayda
+            signs off on.
           </p>
           <ol className="mt-4 space-y-2 text-[0.875rem]">
             {[
-              ['1', 'Verify with Fayda', 'Biometric or OTP check against the national register.'],
+              ['1', 'Verify with Fayda',
+               'A live photo and your national ID, checked on Fayda’s own page. Once only — afterwards you return with a passkey.'],
               ['2', 'Connect your wallet', 'MetaMask or another wallet you already control.'],
               ['3', 'Sign one message', 'Proves control of the wallet. Moves no funds, grants no permissions.'],
             ].map(([n, title, sub]) => (
@@ -66,9 +68,11 @@ export function VerifyGate({ simulated, onPasskey, busy, passkeyError }) {
           <div className="border-t border-rule bg-surface px-5 py-3">
             <p className="text-[0.8125rem] text-muted">
               <span className="doc-label mr-2 !text-cooling-ink">Simulated environment</span>
-              The next screen is a mock that <strong>simulates biometric
-              capture</strong> — you pick a test resident instead of scanning a
-              fingerprint. It is not connected to the national register.
+              The next screen genuinely uses your camera and reads the document
+              you choose — but the <strong>match itself is simulated</strong>
+              and always passes, and nothing is connected to the national
+              register. Your photo and your ID stay on your device: they are
+              never uploaded, and this registry never receives them.
             </p>
           </div>
         )}
